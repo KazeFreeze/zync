@@ -8,7 +8,7 @@
   "dependencies": {
     "@hocuspocus/extension-logger": "^2.15.0",
     "@hocuspocus/provider": "^2.15.3",
-    "@hocuspocus/server": "^2.15.0",
+    "@hocuspocus/server": "^4.1.1",
     "ws": "^8.21.0",
     "yjs": "^13.6.31"
   },
