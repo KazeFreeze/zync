@@ -1,0 +1,18 @@
+{
+  "name": "@zync/server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts"
+  },
+  "dependencies": {
+    "@hocuspocus/extension-logger": "^2.15.0",
+    "@hocuspocus/provider": "^2.15.3",
+    "@hocuspocus/server": "^2.15.0",
+    "ws": "^8.21.0",
+    "yjs": "^13.6.31"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0"
+  }
+}

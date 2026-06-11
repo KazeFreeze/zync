@@ -1,0 +1,23 @@
+# dependencies / build
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+
+# logs / os
+*.log
+.DS_Store
+
+# editor / local / sandbox-mounted device dotfiles (not real project files)
+.claude/
+.idea
+.vscode
+.bashrc
+.bash_profile
+.profile
+.zshrc
+.zprofile
+.gitconfig
+.gitmodules
+.ripgreprc
+.mcp.json

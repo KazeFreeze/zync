@@ -1,0 +1,7 @@
+node_modules
+**/main.js
+pnpm-lock.yaml
+docs/
+*.md
+.github/workflows/*.yml
+.github/*.yml

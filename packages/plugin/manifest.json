@@ -1,0 +1,8 @@
+{
+  "id": "zync-spike",
+  "name": "Zync Spike",
+  "version": "0.0.1",
+  "minAppVersion": "1.5.0",
+  "description": "Phase-0a editor-binding viability spike. Throwaway.",
+  "isDesktopOnly": false
+}
