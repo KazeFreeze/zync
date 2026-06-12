@@ -10,7 +10,19 @@ export default tseslint.config(
       "packages/plugin/**",
     ],
   },
-  ...tseslint.configs.recommended,
+  ...tseslint.configs.strictTypeChecked,
+  ...tseslint.configs.stylisticTypeChecked,
+  {
+    languageOptions: {
+      parserOptions: {
+        projectService: {
+          allowDefaultProject: ["packages/server/smoke-test.mjs"],
+        },
+        tsconfigRootDir: import.meta.dirname,
+      },
+    },
+  },
+  // Core-purity firewall: packages/core must not import infrastructure deps
   {
     files: ["packages/core/src/**/*.ts"],
     rules: {
@@ -19,12 +31,50 @@ export default tseslint.config(
         {
           patterns: [
             {
-              group: ["obsidian", "yjs", "y-*", "@hocuspocus/*", "@codemirror/*", "node:*"],
+              group: [
+                "obsidian",
+                "yjs",
+                "y-*",
+                "loro-crdt",
+                "@hocuspocus/*",
+                "@codemirror/*",
+                "@aws-sdk/*",
+                "node:*",
+              ],
               message: "core is pure domain + ports — depend on a port.",
             },
           ],
         },
       ],
+    },
+  },
+  // Targeted relaxation for server package — Hocuspocus/yjs types aren't fully typed;
+  // server is an infrastructure adapter, not the core domain.
+  {
+    files: ["packages/server/**/*.ts", "packages/server/**/*.mjs"],
+    rules: {
+      "@typescript-eslint/no-unsafe-assignment": "off",
+      "@typescript-eslint/no-unsafe-member-access": "off",
+      "@typescript-eslint/no-unsafe-call": "off",
+      "@typescript-eslint/no-unsafe-argument": "off",
+      "@typescript-eslint/no-unsafe-return": "off",
+      "@typescript-eslint/require-await": "off",
+      "@typescript-eslint/no-floating-promises": "off",
+      "@typescript-eslint/restrict-template-expressions": "off",
+      "@typescript-eslint/no-base-to-string": "off",
+      "@typescript-eslint/use-unknown-in-catch-callback-variable": "off",
+      "@typescript-eslint/no-confusing-void-expression": "off",
+      "@typescript-eslint/no-unnecessary-condition": "off",
+    },
+  },
+  // Root tool-config files (eslint.config.mjs, commitlint.config.js, vitest.config.ts)
+  // are not source — relax type-aware rules that don't apply to loose JS/TS configs
+  {
+    files: ["*.mjs", "*.js", "*.ts"],
+    ignores: ["packages/**"],
+    rules: {
+      "@typescript-eslint/no-deprecated": "off",
+      "@typescript-eslint/no-unsafe-assignment": "off",
     },
   },
 );

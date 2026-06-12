@@ -36,6 +36,44 @@ importers:
         specifier: ^2.1.0
         version: 2.1.9(@types/node@25.9.3)
 
+  packages/core:
+    dependencies:
+      diff-match-patch:
+        specifier: ^1.0.5
+        version: 1.0.5
+      node-diff3:
+        specifier: ^3.1.2
+        version: 3.2.1
+    devDependencies:
+      '@types/diff-match-patch':
+        specifier: ^1.0.36
+        version: 1.0.36
+
+  packages/crdt-yjs:
+    dependencies:
+      '@hocuspocus/provider':
+        specifier: ^2.15.0
+        version: 2.15.3(y-protocols@1.0.7(yjs@13.6.31))(yjs@13.6.31)
+      '@zync/core':
+        specifier: workspace:*
+        version: link:../core
+      y-codemirror.next:
+        specifier: ^0.3.5
+        version: 0.3.5(@codemirror/state@6.6.0)(@codemirror/view@6.43.1)(yjs@13.6.31)
+      y-protocols:
+        specifier: ^1.0.6
+        version: 1.0.7(yjs@13.6.31)
+      yjs:
+        specifier: ^13.6.0
+        version: 13.6.31
+    devDependencies:
+      '@codemirror/state':
+        specifier: ^6.4.0
+        version: 6.6.0
+      '@codemirror/view':
+        specifier: ^6.30.0
+        version: 6.43.1
+
   packages/plugin:
     dependencies:
       '@hocuspocus/provider':
@@ -847,6 +885,9 @@ packages:
   '@types/conventional-commits-parser@5.0.2':
     resolution: {integrity: sha512-BgT2szDXnVypgpNxOK8aL5SGjUdaQbC++WZNjF1Qge3Og2+zhHj+RWhmehLhYyvQwqAmvezruVfOf8+3m74W+g==}
 
+  '@types/diff-match-patch@1.0.36':
+    resolution: {integrity: sha512-xFdR6tkm0MWvBfO8xXCSsinYxHcqkQUlcHeSpMC2ukzOb6lwQAfDmW+Qt0AvlGd8HpsS28qKsB+oPeJn9I39jg==}
+
   '@types/estree@1.0.9':
     resolution: {integrity: sha512-GhdPgy1el4/ImP05X05Uw4cw2/M93BCUmnEvWZNStlCzEKME4Fkk+YpoA5OiHNQmoS7Cafb8Xa3Pya8m1Qrzeg==}
 
@@ -1126,6 +1167,9 @@ packages:
 
   deep-is@0.1.4:
     resolution: {integrity: sha512-oIPzksmTg4/MriiaYGO+okXDT7ztn/w3Eptv/+gSIdMdKsJo0u4CfYNFJPy+4SKMuCqGw2wxnA+URMg3t8a/bQ==}
+
+  diff-match-patch@1.0.5:
+    resolution: {integrity: sha512-IayShXAgj/QMXgB0IWmKx+rOPuGMhqm5w6jvFxmVenXKIzRqTAAsbBPT3kWQeGANj3jGgvcvv4yK6SxqYmikgw==}
 
   dot-prop@5.3.0:
     resolution: {integrity: sha512-QM8q3zDe58hqUqjraQOmzZ1LIH9SWQJTlEKCH4kJ2oQvLZk7RbQXvtDM2XEq3fwkV9CCvvH4LA0AV+ogFsBM2Q==}
@@ -1500,6 +1544,10 @@ packages:
 
   natural-compare@1.4.0:
     resolution: {integrity: sha512-OWND8ei3VtNC9h7V60qff3SVobHr996CTwgxubgyQYEpg290h9J0buyECNNJexkFm5sOajh5G116RYA1c8ZMSw==}
+
+  node-diff3@3.2.1:
+    resolution: {integrity: sha512-eKZcJ8RtMQ3cIaA15EgmtwG927fYnRlhtdA4Q9HAcCpAZPQhhU2XptnTH9GeAkMiX2bAXxlJSAFa9shFbztPgw==}
+    engines: {bun: '>=1.3.10'}
 
   obsidian@1.13.1:
     resolution: {integrity: sha512-qtTEA2pmhJzhuhJqzbBFRYhpIOqvW+krDYjtFynv66KbxBbumHBlsJfWw3I4jtnK/6fZwbQhCrmmDdRwXmX56w==}
@@ -2450,6 +2498,8 @@ snapshots:
     dependencies:
       '@types/node': 25.9.3
 
+  '@types/diff-match-patch@1.0.36': {}
+
   '@types/estree@1.0.9': {}
 
   '@types/json-schema@7.0.15': {}
@@ -2754,6 +2804,8 @@ snapshots:
   deep-eql@5.0.2: {}
 
   deep-is@0.1.4: {}
+
+  diff-match-patch@1.0.5: {}
 
   dot-prop@5.3.0:
     dependencies:
@@ -3154,6 +3206,8 @@ snapshots:
   nanoid@3.3.12: {}
 
   natural-compare@1.4.0: {}
+
+  node-diff3@3.2.1: {}
 
   obsidian@1.13.1(@codemirror/state@6.6.0)(@codemirror/view@6.43.1):
     dependencies:
