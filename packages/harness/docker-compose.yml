@@ -1,0 +1,230 @@
+# Zync headless harness topology (project name: zync-harness).
+#
+# Run from the repo ROOT:
+#   docker compose -p zync-harness -f packages/harness/docker-compose.yml \
+#     up -d --build --wait
+#
+# BUILD CONTEXT — `${ZYNC_HARNESS_ROOT:-${PWD}}`, an ABSOLUTE path to the repo
+# root (default `${PWD}`, correct because the command above runs from the root).
+# DELIBERATELY absolute, NOT a relative `..`: BuildKit's local-context sync on
+# this host fails to checksum a directory reached via a relative PARENT context
+# (`COPY packages/server` → "/packages/server: not found"), while an absolute
+# context syncs fine. The `dockerfile:` paths are therefore relative to the repo
+# root (`packages/harness/<name>.Dockerfile`). Override `ZYNC_HARNESS_ROOT` to
+# run from another cwd. The `./fixtures` bind below stays relative to THIS file.
+#
+# Two networks:
+#   - controlnet : host <-> device control APIs (published ports). NEVER
+#     partitioned, so scenarios can always drive a device even while its sync
+#     traffic is cut.
+#   - syncnet    : device <-> server (relay + blob) + minio. PARTITIONABLE — the
+#     offline lever is `docker network disconnect zync-harness_syncnet <device>`;
+#     `docker network connect` heals.
+#
+# Healthchecks everywhere so `up -d --wait` blocks until the loop is ready.
+
+x-device-env: &device-env
+  ZYNC_SERVER_WS: ws://server:1234
+  ZYNC_SERVER_HTTP: http://server:8080
+  ZYNC_TOKEN: dev-static-token
+  ZYNC_VAULT_DIR: /vault
+  ZYNC_FIXTURES_DIR: /fixtures
+  ZYNC_PORT: "7070"
+
+x-device-healthcheck:
+  &device-healthcheck # node-only check (slim image has no curl/wget): GET /status on the loopback.
+  test:
+    [
+      "CMD",
+      "node",
+      "-e",
+      "fetch('http://127.0.0.1:7070/status').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+    ]
+  interval: 3s
+  timeout: 5s
+  retries: 20
+  start_period: 5s
+
+networks:
+  controlnet:
+  syncnet:
+
+# Named volumes for the CRASH-SAFETY scenarios. tmpfs (used by b/c/proj for
+# speed) is re-mounted EMPTY when a container restarts — it lives in the
+# container's mount namespace, torn down on stop/kill — so a crash-tested device
+# on tmpfs would come back with an EMPTY vault + EMPTY `.obsidian/zync` state
+# store, "losing" data for the WRONG reason (tmpfs, not the engine). A NAMED
+# volume persists across `docker kill` + `docker compose start` of the SAME
+# container, while `resetStack`'s `down -v` removes it between scenarios — giving
+# durable-yet-isolated crash storage. Empirically verified on this host
+# (Docker 29.4.3 / compose v5.1.3): tmpfs `/vault` is wiped on kill+start; a
+# named volume survives.
+volumes:
+  # device-a's vault. Holds BOTH the note content AND `/vault/.obsidian/zync`
+  # (engine-state.json dirty-set + synced-stamps, docstore, base records) —
+  # `configFromEnv` resolves all of those UNDER `ZYNC_VAULT_DIR`, so one volume
+  # at /vault makes the whole crash-survival store durable. This is the device
+  # under test in device-crash-recovery.
+  device-a-vault:
+  # The relay's Yjs snapshot dir (`ZYNC_SNAPSHOT_DIR=/data/snapshots`). Already
+  # durable across kill+start via the writable layer, but a named volume makes
+  # the durability intentional + explicit and is what server-crash-recovery
+  # relies on (`onLoadDocument` reloads these `.bin` snapshots).
+  server-snapshots:
+
+services:
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    networks: [syncnet]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  createbuckets:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks: [syncnet]
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set zync http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing zync/zync-blobs
+      "
+
+  server:
+    build:
+      context: ${ZYNC_HARNESS_ROOT:-${PWD}}
+      dockerfile: packages/harness/server.Dockerfile
+    depends_on:
+      minio:
+        condition: service_healthy
+      createbuckets:
+        condition: service_completed_successfully
+    environment:
+      ZYNC_PORT: "1234"
+      ZYNC_BLOB_PORT: "8080"
+      ZYNC_TOKEN: dev-static-token
+      ZYNC_SNAPSHOT_DIR: /data/snapshots
+      ZYNC_S3_ENDPOINT: http://minio:9000
+      ZYNC_S3_BUCKET: zync-blobs
+      ZYNC_S3_REGION: us-east-1
+      ZYNC_S3_ACCESS_KEY: minioadmin
+      ZYNC_S3_SECRET_KEY: minioadmin
+    networks: [syncnet]
+    # DURABLE snapshot storage so a server SIGKILL + compose-start reloads the
+    # persisted Yjs snapshots (`onLoadDocument`) instead of coming back empty.
+    volumes:
+      - server-snapshots:/data
+    # Publish the blob endpoint to the host so the blob-hash-on-write scenario can
+    # PUT a poisoned/malformed blob DIRECTLY at the real containerized server
+    # (mirrors the in-process file-endpoint.test.ts against a live container).
+    ports: ["18080:8080"]
+    healthcheck:
+      # TCP check on the relay port (1234) via node — blob endpoint has no
+      # liveness route and the relay is the gate the devices wait on.
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "require('net').connect(1234,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))",
+        ]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  device-a:
+    build:
+      context: ${ZYNC_HARNESS_ROOT:-${PWD}}
+      dockerfile: packages/harness/device.Dockerfile
+    depends_on:
+      server:
+        condition: service_healthy
+    environment:
+      <<: *device-env
+      ZYNC_DEVICE_ID: device-a
+      ZYNC_DEVICE_NAME: device-a
+    networks: [controlnet, syncnet]
+    ports: ["17070:7070"]
+    # DURABLE vault (NOT tmpfs): this is the device under test in
+    # device-crash-recovery. The named volume keeps `/vault` (note content) AND
+    # `/vault/.obsidian/zync` (the FsEngineStateStore dirty-set/synced-stamps +
+    # docstore + base records) across a SIGKILL + compose-start, so a re-pushed
+    # un-acked edit survives the crash for the RIGHT reason. b/c/proj stay on
+    # tmpfs for speed.
+    volumes:
+      - device-a-vault:/vault
+      - ./fixtures:/fixtures:ro
+    healthcheck: *device-healthcheck
+
+  device-b:
+    build:
+      context: ${ZYNC_HARNESS_ROOT:-${PWD}}
+      dockerfile: packages/harness/device.Dockerfile
+    depends_on:
+      server:
+        condition: service_healthy
+    environment:
+      <<: *device-env
+      ZYNC_DEVICE_ID: device-b
+      ZYNC_DEVICE_NAME: device-b
+    networks: [controlnet, syncnet]
+    ports: ["17071:7070"]
+    tmpfs: ["/vault"]
+    volumes:
+      - ./fixtures:/fixtures:ro
+    healthcheck: *device-healthcheck
+
+  device-c:
+    build:
+      context: ${ZYNC_HARNESS_ROOT:-${PWD}}
+      dockerfile: packages/harness/device.Dockerfile
+    depends_on:
+      server:
+        condition: service_healthy
+    environment:
+      <<: *device-env
+      ZYNC_DEVICE_ID: device-c
+      ZYNC_DEVICE_NAME: device-c
+    networks: [controlnet, syncnet]
+    ports: ["17072:7070"]
+    tmpfs: ["/vault"]
+    volumes:
+      - ./fixtures:/fixtures:ro
+    healthcheck: *device-healthcheck
+
+  # One-way PROJECTOR (0b-3 Part C): ZYNC_INGEST_DISABLED=true makes this device a
+  # read-only projection SINK — it applies remote→disk (and bootstrap-seeds), but the
+  # engine's onWrite early-returns so it NEVER ingests its own local writes. The key
+  # property the projector scenario asserts: a file written directly into its vault
+  # propagates to NO other device, so co-locating a projector is safe. Distinct
+  # deviceId/token-irrelevant (shares the static dev token), own /vault-proj tmpfs,
+  # own published control port 17073.
+  device-proj:
+    build:
+      context: ${ZYNC_HARNESS_ROOT:-${PWD}}
+      dockerfile: packages/harness/device.Dockerfile
+    depends_on:
+      server:
+        condition: service_healthy
+    environment:
+      <<: *device-env
+      ZYNC_DEVICE_ID: device-proj
+      ZYNC_DEVICE_NAME: device-proj
+      ZYNC_VAULT_DIR: /vault-proj
+      ZYNC_INGEST_DISABLED: "true"
+    networks: [controlnet, syncnet]
+    ports: ["17073:7070"]
+    tmpfs: ["/vault-proj"]
+    volumes:
+      - ./fixtures:/fixtures:ro
+    healthcheck: *device-healthcheck

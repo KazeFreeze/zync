@@ -56,11 +56,17 @@ export class OutboundPipeline {
     const newHash = await sha256OfText(newText);
 
     // 3. base BEFORE file (torn-pair recovery): persist the merge base + token first.
+    //    A REMOTE-origin update's content came FROM the relay, so it is — by definition —
+    //    relay-acked. Advance BOTH the working base AND the acked/recovery base to it (0b-3
+    //    crash-window no-loss): a crash after this leaves the recovery base at genuinely-acked
+    //    content, never at an unpushed local edit.
     await d.base.save(docId, {
       baseText: newText,
       fileHash: newHash,
       crdtToken: doc.encodeStateVector(),
       substrate: d.substrate,
+      ackedText: newText,
+      ackedHash: newHash,
     });
 
     // 4. Write to disk ONLY if it differs — and echo-record IMMEDIATELY before the write.

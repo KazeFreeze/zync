@@ -81,7 +81,17 @@ export async function recoverOrphan(
   // emits no spurious fs event for the base file either.
   const existingBase = await base.load(docId);
   if (existingBase?.fileHash !== hash) {
-    await base.save(docId, { baseText: text, fileHash: hash, crdtToken: null, substrate });
+    // The recovered orphan is a freshly-bound LOCAL content (like a seed) not yet relay-acked:
+    // working base = recovered text, acked/recovery base = empty (0b-3 crash-window no-loss) so a
+    // crash during recovery keeps the content rather than reverting it.
+    await base.save(docId, {
+      baseText: text,
+      fileHash: hash,
+      crdtToken: null,
+      substrate,
+      ackedText: "",
+      ackedHash: await sha256OfText(""),
+    });
   }
 
   // Idempotency: only write (and echo-record) when the bytes are not already on disk.

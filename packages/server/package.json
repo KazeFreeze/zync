@@ -2,10 +2,18 @@
   "name": "@zync/server",
   "private": true,
   "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./relay": "./src/relay.ts",
+    "./file-endpoint": "./src/file-endpoint.ts"
+  },
   "scripts": {
-    "dev": "tsx watch src/index.ts"
+    "dev": "tsx watch src/index.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.806.0",
     "@hocuspocus/extension-logger": "^2.15.0",
     "@hocuspocus/provider": "^2.15.3",
     "@hocuspocus/server": "^2.15.0",

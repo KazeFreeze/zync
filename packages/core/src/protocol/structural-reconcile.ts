@@ -33,6 +33,24 @@ export interface StructuralReconcileDeps {
   markDirty: (docId: DocId) => Promise<void>;
   /** Surface a resurrection notice to the user's inbox (Concern 2). */
   onInboxNotice: (notice: ResurrectedNotice) => void;
+  /**
+   * STABILITY GATE for divergent-rename resolution (0b-3, GPT-5.5 follow-up — torn-rename
+   * race). A rename re-keys the index as TWO independent LWW writes (tombstone the old key,
+   * set the new key live). They do NOT replicate atomically, so a RECEIVER can momentarily
+   * observe BOTH the old key (not yet tombstoned) AND the new key live for the same docId —
+   * a FALSE divergence. Resolving it (lexicographically) then tombstones the NEW path when
+   * `old < new` and that tombstone propagates IRREVERSIBLY, destroying the rename everywhere.
+   *
+   * So the engine gates resolution behind STABILITY: `confirmDivergence(docId, livePaths)`
+   * returns `true` only when the SAME divergence was observed on the PRIOR reconcile pass
+   * (the engine records it and confirms on the next pass). A torn rename dissolves before
+   * the next pass (the old-key tombstone arrives), so it is never resolved; a GENUINE
+   * concurrent divergent rename persists across passes and resolves deterministically.
+   * Omitted ⇒ resolve immediately (unit tests / single-pass callers that pass a settled
+   * index). The engine ALWAYS records the current divergence (via the same seam) so the
+   * NEXT pass can confirm it — recording is the seam's side effect.
+   */
+  confirmDivergence?: (docId: DocId, livePaths: VaultPath[]) => boolean;
 }
 
 /**
@@ -48,8 +66,17 @@ export interface StructuralReconcileDeps {
  * CONCERN 3 — RENAME PROPAGATION (M3). RUN FIRST. A docId whose LIVE index path
  * differs from where this device's file sits is a rename: a TOMBSTONED entry at
  * `oldPath` whose docId is ALSO bound LIVE at a different `newPath`, where the
- * device HAS a file at `oldPath` and NO file at `newPath`. Same docId = content
- * continuity (no content moves through the CRDT) → `vault.rename(oldPath, newPath)`.
+ * device HAS a file at `oldPath`. Same docId = content continuity (no content moves
+ * through the CRDT). Two cases by whether the live target is already on disk:
+ *   - NO file at `newPath` → `vault.rename(oldPath, newPath)` (move; the bytes carry).
+ *   - `newPath` ALREADY materialized → the canonical content reached the new home
+ *     INDEPENDENTLY (catch-up/`materializeLiveDiskContent` wrote it — the offline
+ *     edit-then-rename case: the renamed doc carried a concurrent edit, so its content
+ *     materialized at the new path BEFORE this pass, pre-empting the move). The file at
+ *     `oldPath` is then a stranded leftover whose home is now `newPath` → `vault.remove`.
+ *     Without this the old file lingers forever (rename finds no empty target → skips;
+ *     delete skips a live-elsewhere docId), hanging `waitConverged` on `pendingDocs`'s
+ *     tombstone-with-a-local-file clause.
  * After it runs, `oldPath` has no file, so the resurrect + delete passes skip it
  * (`localHashOf` → `null`). Divergent renames (one docId live at >1 path) are then
  * resolved DETERMINISTICALLY by {@link applyRenameConflictResolution}.
@@ -81,12 +108,15 @@ export interface StructuralReconcileDeps {
  * LOOP-SAFETY (rule D2). The DELETE concern issues `vault.remove` only and writes no
  * index/inbox — the engine's `onDelete` early-returns on an already-tombstoned
  * entry, so the fired "delete" event does not re-tombstone or relay. The RENAME
- * concern issues `vault.rename` only; its echoed "rename" event re-applies the move
- * that the index ALREADY reflects (new live + old tombstoned, same docId), which is
- * a no-op against that state — there is no content hash for a rename, so the
- * EchoLedger cannot suppress it; idempotency comes from the index state itself. The
- * divergent-rename resolver writes the index but is idempotent + convergent (D2):
- * once losers are tombstoned, ≤1 live → `null` → no-op.
+ * concern issues `vault.rename` (move) OR `vault.remove` (stranded-old-file case) only,
+ * never an index/inbox write. Its echoed "rename" event re-applies the move that the
+ * index ALREADY reflects (new live + old tombstoned, same docId), which is a no-op
+ * against that state (idempotency from the index state itself; no content hash, so the
+ * EchoLedger cannot suppress a rename). Its `vault.remove(oldPath)` fires a "delete"
+ * event on an ALREADY-tombstoned `oldPath`, so `onDelete` early-returns just as the
+ * delete concern's removal does — no re-tombstone, no relay. The divergent-rename
+ * resolver writes the index but is idempotent + convergent (D2): once losers are
+ * tombstoned, ≤1 live → `null` → no-op.
  *
  * The RESURRECT concern WRITES the index (`setStamp` LIVE). This is convergent +
  * idempotent + locally-authoritative: ONLY the device whose LOCAL content ≠ the
@@ -111,34 +141,64 @@ export async function runStructuralReconcile(deps: StructuralReconcileDeps): Pro
   const isLiveElsewhere = (docId: DocId): boolean => (liveByDocId.get(docId)?.length ?? 0) > 0;
 
   // CONCERN 3 — RENAME PROPAGATION FIRST. A tombstoned `oldPath` whose docId is bound
-  // LIVE at a DIFFERENT `newPath`, with a file at `oldPath` and none at `newPath`, is a
-  // rename: move the file (content continuity, same docId) rather than delete it. Runs
-  // before resurrect/delete so the old file is gone (→ skipped) by the time they run.
+  // LIVE at a DIFFERENT `newPath` is a MOVE (same docId = content continuity), not a
+  // deletion. The device has a file at `oldPath`; what to do with it depends on whether
+  // the live target is already materialized:
+  //   - target has NO file yet → MOVE: `vault.rename(oldPath, newPath)` (content
+  //     continuity carries the bytes; no CRDT round-trip needed).
+  //   - target ALREADY has a file → the canonical content reached `newPath`
+  //     INDEPENDENTLY (catch-up/materialize wrote it — the offline edit-then-rename
+  //     case: the renamed doc carried a concurrent edit, so its content materialized at
+  //     the new path before this pass, pre-empting the move). The file at `oldPath` is a
+  //     stranded leftover whose home is now `newPath` → REMOVE it. Without this the old
+  //     file lingers forever: the rename concern finds no empty target (skips) and the
+  //     delete concern skips it (docId live elsewhere) → `pendingDocs`'s tombstone-with-
+  //     file clause never clears → `waitConverged` hangs.
+  // Runs before resurrect/delete so the old file is gone (→ skipped) by the time they run.
   for (const [oldPath, entry] of index.entries()) {
     if (entry.deleted !== true) continue;
     const liveTargets = liveByDocId.get(entry.docId);
     if (liveTargets === undefined) continue; // docId fully tombstoned → a real delete.
     if ((await localHashOf(oldPath)) === null) continue; // no file to move.
-    // The rename TARGET: a live path for this docId that is NOT the old key and where
-    // the device has no file yet. (Divergent renames may bind >1 live path; the
-    // resolver below collapses them to one, then a later pass moves to the winner.)
-    let target: VaultPath | undefined;
+    // Find the rename TARGET: a live path for this docId that is NOT the old key. Prefer
+    // an EMPTY target (→ rename/move). If every live target is already materialized, the
+    // content reached the new home independently → the old file is removable.
+    // (Divergent renames may bind >1 live path; the resolver below collapses them to one,
+    // then a later pass settles to the winner.)
+    let emptyTarget: VaultPath | undefined;
+    let materializedTarget: VaultPath | undefined;
     for (const candidate of liveTargets) {
       if (candidate === oldPath) continue;
       if ((await localHashOf(candidate)) === null) {
-        target = candidate;
+        emptyTarget = candidate;
         break;
       }
+      materializedTarget ??= candidate;
     }
-    if (target === undefined) continue;
-    await vault.rename(oldPath, target);
+    if (emptyTarget !== undefined) {
+      await vault.rename(oldPath, emptyTarget);
+    } else if (materializedTarget !== undefined && (await localHashOf(oldPath)) !== null) {
+      // Live target already on disk → the old file is a stranded leftover → remove it.
+      // RE-CHECK the old file still exists immediately before removing: a CONCURRENT
+      // reconcile pass may have already moved it (the pure-move case where two passes
+      // both saw the old file, one renamed it away). Without this re-check we would fire
+      // a no-op `vault.remove` on an already-gone path — harmless to disk, but it makes a
+      // pure move spuriously look like a delete. Skipping when gone keeps a true rename a
+      // true rename (no remove) and only removes a genuinely-stranded leftover.
+      await vault.remove(oldPath);
+    }
   }
 
-  // DIVERGENT RENAME: any docId now LIVE at >1 path is a concurrent divergent rename.
-  // Resolve DETERMINISTICALLY (lexicographic winner kept live, losers tombstoned). Gated
-  // so it only writes when a conflict exists; idempotent + convergent (≤1 live → no-op).
+  // DIVERGENT RENAME: any docId now LIVE at >1 path is EITHER a genuine concurrent divergent
+  // rename OR the TORN-RENAME transient (old key not yet tombstoned + new key live; see
+  // `confirmDivergence`). Resolve DETERMINISTICALLY (lexicographic winner kept live, losers
+  // tombstoned) — but ONLY once the divergence is confirmed STABLE, so a torn rename (which
+  // dissolves before the next pass) is never wrongly collapsed onto the old path. Gated so it
+  // only writes when a conflict exists; idempotent + convergent (≤1 live → no-op).
+  const confirm = deps.confirmDivergence ?? ((): boolean => true);
   for (const [docId, paths] of liveByDocId) {
     if (paths.length <= 1) continue;
+    if (!confirm(docId, paths)) continue; // torn-rename transient — await stability.
     applyRenameConflictResolution(index, docId);
   }
 

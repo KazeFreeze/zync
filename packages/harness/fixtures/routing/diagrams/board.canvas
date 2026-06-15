@@ -1,0 +1,31 @@
+{
+  "nodes": [
+    {
+      "id": "n1",
+      "type": "text",
+      "text": "Synthetic canvas node A",
+      "x": 0,
+      "y": 0,
+      "width": 240,
+      "height": 80
+    },
+    {
+      "id": "n2",
+      "type": "text",
+      "text": "Synthetic canvas node B",
+      "x": 320,
+      "y": 0,
+      "width": 240,
+      "height": 80
+    }
+  ],
+  "edges": [
+    {
+      "id": "e1",
+      "fromNode": "n1",
+      "fromSide": "right",
+      "toNode": "n2",
+      "toSide": "left"
+    }
+  ]
+}

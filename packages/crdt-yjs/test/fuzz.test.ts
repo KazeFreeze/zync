@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { SyncEngine, type EnginePorts, type EngineConfig } from "@zync/core";
-import type { DeviceId, IdentityPort, VaultPath } from "@zync/core";
+import type { DeviceId, IdentityPort, VaultEvent, VaultPath } from "@zync/core";
 import {
   FakeVault,
   FakeClock,
@@ -73,19 +73,83 @@ function identity(id: string, name: string): IdentityPort {
   return { deviceId: () => id as DeviceId, deviceName: () => name };
 }
 
+/**
+ * A {@link FakeVault} whose `rename` ALSO emits the REORDERED post-rename watcher
+ * fallout a REAL recursive `fs.watch` produces after a physical move (0b-3 rename
+ * transaction, GPT-5.5 root cause). The plain FakeVault emits ONLY the synthetic
+ * `{type:"rename"}`, so the fuzzer would keep the SAME blind spot the in-process
+ * structural rename test had — a renamed file failing to materialize over a real
+ * watcher would never surface. Wiring the fallout here makes every RENAME op exercise
+ * the watcher-transaction path: both the INITIATING device (its own rename) and any
+ * RECEIVER whose structural reconcile issues `vault.rename` (which routes through this
+ * same override) fire the fallout identically.
+ *
+ * The fallout shape ROTATES DETERMINISTICALLY (an internal counter — NO wall-clock, NO
+ * Math.random) across the three shapes the real watcher can produce, INCLUDING the fatal
+ * `delete(new)` reordering the prior synchronous `delete(old)+modify(new)` model never
+ * exercised. Emitted synchronously (the worst-case race: the engine's onRename has
+ * re-keyed + opened the transaction, the fallout handlers queue immediately behind it),
+ * so the fuzzer stays deterministic while covering the reordered shapes.
+ */
+class WatcherVault extends FakeVault {
+  /** Deterministic fallout-shape rotation counter (no wall-clock, no Math.random). */
+  private falloutSeq = 0;
+
+  override async rename(from: VaultPath, to: VaultPath): Promise<void> {
+    const existed = (await this.read(from)) !== null;
+    await super.rename(from, to); // physical move + synthetic {type:"rename"}.
+    if (!existed) return;
+    // Rotate across the real watcher's fallout shapes — incl. a `delete(new)` (the
+    // coalesced target probe racing a transient absence) and a reordered delete-after-
+    // modify. The transaction must quarantine ALL of them; the renamed file must survive.
+    const shape = this.falloutSeq++ % 3;
+    const fallout: VaultEvent[] =
+      shape === 0
+        ? [
+            { type: "delete", path: from },
+            { type: "modify", path: to },
+          ]
+        : shape === 1
+          ? [
+              { type: "delete", path: to }, // the fatal delete(new).
+              { type: "delete", path: from },
+            ]
+          : [
+              { type: "modify", path: to },
+              { type: "delete", path: from }, // delete(old) AFTER modify(new).
+            ];
+    for (const e of fallout) this.emitRaw(e);
+  }
+
+  private emitRaw(e: VaultEvent): void {
+    for (const l of this.spuriousListeners) l(e);
+  }
+
+  private readonly spuriousListeners = new Set<(e: VaultEvent) => void>();
+
+  override onEvent(cb: (e: VaultEvent) => void): () => void {
+    this.spuriousListeners.add(cb);
+    const unsub = super.onEvent(cb);
+    return () => {
+      this.spuriousListeners.delete(cb);
+      unsub();
+    };
+  }
+}
+
 interface Device {
   id: string;
   engine: SyncEngine;
-  vault: FakeVault;
+  vault: WatcherVault;
   transport: InProcessTransport;
   online: boolean;
   created: number;
-  /** Live (not-yet-deleted) paths this peer created — the only notes it may delete. */
+  /** Live (not-yet-deleted, not-yet-renamed) paths this peer created — the only notes it may delete or rename. */
   liveCreated: string[];
 }
 
 function makeDevice(bus: InProcessBus, deviceId: string): Device {
-  const vault = new FakeVault();
+  const vault = new WatcherVault();
   const transport = bus.connect();
   const ports: EnginePorts = {
     vault,
@@ -102,6 +166,11 @@ function makeDevice(bus: InProcessBus, deviceId: string): Device {
     maxProseBytes: 1_000_000,
     substrate: "yjs",
     stampDebounceMs: 0,
+    // The fuzzer's WatcherVault emits its fallout SYNCHRONOUSLY (consumed before
+    // `vault.rename` returns, while the transaction is open), so the settle window need
+    // not bridge any async gap — a tiny window keeps the 200-op × 4-seed budget well
+    // under the 15s worker timeout while still exercising the full quarantine + settle.
+    renameSettleMs: 1,
   };
   return {
     id: deviceId,
@@ -249,15 +318,33 @@ describe("SyncEngine convergence fuzzer (deterministic, seeded)", () => {
       let edits = 0;
       let creates = 0;
       let deletes = 0;
+      let renames = 0;
       let partitions = 0;
       let heals = 0;
+      // RENAME tracking (0b-3 Fix 2). Each rename of an own-created note records the
+      // NEW path → its content, so the final byte-identical-vaults + identical-inboxes
+      // assertions catch a renamed file that fails to MATERIALIZE at the new path or is
+      // MIS-TOMBSTONED (the watcher-echo bug: a spurious delete(old)/modify(new) strands
+      // the old file or re-mints a new docId). A note may be renamed more than once, so
+      // we key by the FINAL new path and store its (unchanged) content. The OLD names are
+      // dropped from `liveCreated`, so the delete-propagation assertion already verifies
+      // each renamed-away old path is gone on EVERY peer.
+      const renamedNotes = new Map<string, string>();
+      // POST-start create-collisions (0b-3 Fix 1). Each collision op partitions ALL peers,
+      // then has EVERY peer create the SAME fresh `collide-post-<k>.md` path with distinct
+      // content (a genuine after-start concurrent create — the case the in-process
+      // engine-after-start-create test reproduces). On the final heal the index LWW binds
+      // one winner per path and the orphan sweep recovers the loser(s); the byte-identical
+      // vaults + identical-inboxes assertions below catch any lost loser.
+      let collisions = 0;
+      const postCollideContents = new Map<string, string[]>();
 
       for (let op = 0; op < OPS; op++) {
         const actorIdx = Math.floor(rnd() * NUM_PEERS);
         const actor = must(peers[actorIdx], "actor");
         const roll = rnd();
 
-        if (roll < 0.55) {
+        if (roll < 0.46) {
           // EDIT: actor mutates ITS OWN line of a random shared note (line-disjoint).
           const sp = must(shared[Math.floor(rnd() * NUM_SHARED)], "shared note");
           const bytes = await actor.vault.read(sp);
@@ -267,7 +354,7 @@ describe("SyncEngine convergence fuzzer (deterministic, seeded)", () => {
             await actor.vault.writeAtomic(sp, utf8(lines.join("\n")));
             edits++;
           }
-        } else if (roll < 0.73) {
+        } else if (roll < 0.64) {
           // CREATE: uniquely-named single-line note (no concurrent-create races).
           actor.created++;
           const name = `${actor.id}-note-${String(actor.created)}.md`;
@@ -277,7 +364,7 @@ describe("SyncEngine convergence fuzzer (deterministic, seeded)", () => {
           );
           actor.liveCreated.push(name);
           creates++;
-        } else if (roll < 0.83) {
+        } else if (roll < 0.74) {
           // DELETE: actor removes ONE of ITS OWN previously-created notes. Single-
           // author → the delete is uncontested, so the note MUST be gone on ALL
           // peers at quiescence (the tombstone replicates through any partition).
@@ -285,10 +372,69 @@ describe("SyncEngine convergence fuzzer (deterministic, seeded)", () => {
             const di = Math.floor(rnd() * actor.liveCreated.length);
             const target = must(actor.liveCreated[di], "delete target");
             actor.liveCreated.splice(di, 1);
+            // A note may have been RENAMED before this delete (its current name is a
+            // `-renamed-` path tracked in `renamedNotes`). Deleting it must drop that
+            // survival expectation — otherwise the rename-survival assertion would wrongly
+            // demand a legitimately-deleted note still exist. (The delete-propagation
+            // assertion still verifies the deleted path is absent on every peer.)
+            renamedNotes.delete(target);
             await actor.vault.remove(path(target));
             deletes++;
           }
-        } else if (roll < 0.92) {
+        } else if (roll < 0.82) {
+          // RENAME (0b-3 Fix 2): actor renames ONE of ITS OWN previously-created notes
+          // via `vault.rename`. The WatcherVault ALSO emits the spurious post-rename
+          // `delete(old)` + `modify(new)` the real recursive watcher produces — the blind
+          // spot the plain-FakeVault rename never exercised. Single-author → no rename
+          // conflict; the renamed file must MATERIALIZE at the new path with docId
+          // continuity on EVERY peer (caught by the byte-identical-vaults compare), and
+          // the old path must be GONE everywhere (caught by the delete-propagation check,
+          // since the old name is dropped from `liveCreated`). The new path is unique
+          // (`-renamed-<n>`) so it never collides with a future create. May rename an
+          // already-renamed note again — content is preserved across renames.
+          if (actor.liveCreated.length > 0) {
+            const ri = Math.floor(rnd() * actor.liveCreated.length);
+            const from = must(actor.liveCreated[ri], "rename source");
+            const fromBytes = await actor.vault.read(path(from));
+            if (fromBytes !== null) {
+              actor.created++;
+              const to = `${actor.id}-renamed-${String(actor.created)}.md`;
+              await actor.vault.rename(path(from), path(to));
+              actor.liveCreated.splice(ri, 1);
+              actor.liveCreated.push(to);
+              renamedNotes.delete(from); // a renamed-AGAIN note: its old new-path is gone.
+              renamedNotes.set(to, decode(fromBytes));
+              renames++;
+            }
+          }
+        } else if (roll < 0.87) {
+          // POST-START CREATE-COLLISION (0b-3 Fix 1): partition ALL peers, then have
+          // EVERY peer create the SAME fresh `collide-post-<k>.md` with peer-distinct
+          // content — a genuine after-start concurrent create. Each peer settles its
+          // offline ingest in isolation (no peer sees another's index), so each mints its
+          // OWN docId. On the final heal the index LWW binds one winner per path and the
+          // orphan sweep recovers the loser(s); the byte-identical-vaults + identical-
+          // inbox assertions then catch a lost loser. Driven entirely from the ingest/
+          // vault path (NOT a bootstrap seed) and fully deterministic (no wall-clock).
+          const k = collisions;
+          const cp = path(`collide-post-${String(k)}.md`);
+          const bodies: string[] = [];
+          for (const p of peers) {
+            if (p.online) {
+              p.transport.goOffline();
+              p.online = false;
+              partitions++;
+            }
+          }
+          for (const p of peers) {
+            const body = `post-collision ${cp} from ${p.id}`;
+            await p.vault.writeAtomic(cp, utf8(body));
+            bodies.push(body);
+            await p.engine.whenIdle();
+          }
+          postCollideContents.set(cp, bodies);
+          collisions++;
+        } else if (roll < 0.93) {
           // PARTITION the actor (no-op if already offline).
           if (actor.online) {
             actor.transport.goOffline();
@@ -337,10 +483,46 @@ describe("SyncEngine convergence fuzzer (deterministic, seeded)", () => {
         }
       }
 
+      // Every POST-start collision's DISTINCT contents ALL survive on EVERY peer (winner
+      // at collide-post-<k>.md, loser(s) at recovered conflict paths). This is the direct
+      // 0b-3 Fix 1 assertion: an after-start concurrent-create loser is never silently
+      // dropped. (The byte-identical-vaults compare above already proves they survive
+      // IDENTICALLY across peers; this names the specific contents so a regression can't
+      // pass vacuously.)
+      for (const p of peers) {
+        const bodies = new Set<string>();
+        for (const { path: fp } of await p.vault.list()) {
+          if (fp.startsWith(".obsidian/zync/")) continue;
+          const bytes = await p.vault.read(fp);
+          if (bytes !== null) bodies.add(decode(bytes));
+        }
+        for (const contents of postCollideContents.values()) {
+          for (const body of contents) expect(bodies.has(body)).toBe(true);
+        }
+      }
+
+      // Every RENAME materialized at its NEW path with the ORIGINAL content on EVERY peer
+      // (0b-3 Fix 2). A renamed note (only ever renamed within `liveCreated`, never deleted
+      // afterwards) must be present at its final new path with the unchanged content on
+      // ALL peers — the direct watcher-echo assertion: a spurious delete(old)/modify(new)
+      // that stranded the old file, re-minted a docId, or failed to materialize the renamed
+      // content would fail this. (The old names are absent everywhere via the delete-
+      // propagation check above; the byte-identical-vaults compare proves identical
+      // materialization, this names the specific path+content so a regression can't pass
+      // vacuously.)
+      for (const [newPath, content] of renamedNotes) {
+        for (const p of peers) {
+          const bytes = await p.vault.read(path(newPath));
+          expect(bytes === null ? null : decode(bytes)).toBe(content);
+        }
+      }
+
       // The synced inbox CONVERGES IDENTICALLY across peers (the empty-inbox invariant
       // no longer holds: pre-start collisions produce one recovery entry per loser).
-      // Line-disjoint prose edits and single-author deletes add NO artifacts, so the
-      // only entries are the deterministic collision recoveries — identical everywhere.
+      // Line-disjoint prose edits, single-author deletes, and single-author renames add NO
+      // artifacts, so the only entries are the deterministic collision recoveries —
+      // identical everywhere. A rename that mis-tombstoned/divergently-resolved would add a
+      // spurious resurrection/conflict entry and break this identical-inbox compare.
       const inboxView = (p: Device): string[] =>
         p.engine.inbox
           .list()
@@ -357,8 +539,16 @@ describe("SyncEngine convergence fuzzer (deterministic, seeded)", () => {
       expect(edits).toBeGreaterThan(0);
       expect(creates).toBeGreaterThan(0);
       expect(deletes).toBeGreaterThan(0);
+      // At least one RENAME was injected AND survived to assert (0b-3 Fix 2 — no vacuous
+      // pass: the renamed-notes survival + byte-identical assertions above must have had a
+      // renamed file at a new path to test against the watcher-echo).
+      expect(renames).toBeGreaterThan(0);
+      expect(renamedNotes.size).toBeGreaterThan(0);
       expect(partitions).toBeGreaterThan(0);
       expect(heals).toBeGreaterThan(0);
+      // At least one POST-start create-collision was injected (0b-3 Fix 1 — no vacuous
+      // pass: the survival + byte-identical assertions above must have had a loser to test).
+      expect(collisions).toBeGreaterThan(0);
       // The shared notes carry real merged content from all peers.
       expect(Object.keys(ref).length).toBeGreaterThanOrEqual(NUM_SHARED);
     });

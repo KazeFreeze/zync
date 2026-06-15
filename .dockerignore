@@ -1,0 +1,15 @@
+# Keep the Docker build context small + reproducible. node_modules is rebuilt
+# in-image via `pnpm install --frozen-lockfile`; the rest is never needed at
+# runtime. (Does NOT affect the workspace files the Dockerfiles copy:
+# pnpm-workspace.yaml, package.json, pnpm-lock.yaml, packages/**.)
+**/node_modules
+.git
+docs
+*.log
+.DS_Store
+**/dist
+**/build
+**/*.tsbuildinfo
+packages/harness/fixtures/lifeos
+packages/harness/fixtures/lifeos-identical
+packages/harness/fixtures/lifeos-divergent-10

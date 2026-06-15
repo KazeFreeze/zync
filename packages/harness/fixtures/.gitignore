@@ -1,0 +1,9 @@
+# The real-vault scale fixture (Task 6) is the user's PERSONAL note content —
+# NEVER commit it. Covers lifeos/ + its variants (lifeos-identical/,
+# lifeos-divergent-10/) produced by scripts/snapshot-vault.sh.
+lifeos
+lifeos-*
+
+# The ~5 MB routing-matrix binary is GENERATED deterministically by
+# routing/prepare.mjs at fixture-prep time — never commit 5 MB to git.
+routing/assets/large.bin

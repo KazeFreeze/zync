@@ -18,7 +18,9 @@ describe("BaseStore", () => {
     };
     await store.save(id("doc1"), rec);
     const got = await store.load(id("doc1"));
-    expect(got).toEqual(rec); // baseText survives the round-trip (NEW-7 BLOCKER-1)
+    // baseText survives the round-trip (NEW-7 BLOCKER-1); an OMITTED acked base defaults to the
+    // working base on save/load (fully-acked steady-state semantics — 0b-3 crash-window no-loss).
+    expect(got).toEqual({ ...rec, ackedText: rec.baseText, ackedHash: rec.fileHash });
     expect((await v.list()).map((f) => f.path)).toContain(".obsidian/zync/base/doc1.json");
   });
   it("round-trips an adopt-pending record (crdtToken === null, 0b-2 §B)", async () => {
@@ -31,7 +33,29 @@ describe("BaseStore", () => {
       substrate: "yjs",
     };
     await store.save(id("doc-pending"), rec);
-    expect(await store.load(id("doc-pending"))).toEqual(rec);
+    expect(await store.load(id("doc-pending"))).toEqual({
+      ...rec,
+      ackedText: rec.baseText,
+      ackedHash: rec.fileHash,
+    });
+  });
+  it("round-trips an EXPLICIT lagging acked base (0b-3 crash-window no-loss)", async () => {
+    // The crash-window discipline: the WORKING base advances to an unpushed edit while the
+    // ACKED/recovery base stays at the last relay-acked content. Both must survive the round-trip
+    // INDEPENDENTLY (not collapse to one), so the post-restart dirty reconcile merges against the
+    // genuinely-acked content.
+    const v = new FakeVault();
+    const store = new BaseStore(v, ".obsidian");
+    const rec: BaseRecord = {
+      baseText: "edited (unpushed)\n",
+      fileHash: sha("h-edit"),
+      crdtToken: null,
+      substrate: "yjs",
+      ackedText: "pristine (last acked)\n",
+      ackedHash: sha("h-pristine"),
+    };
+    await store.save(id("doc-dirty"), rec);
+    expect(await store.load(id("doc-dirty"))).toEqual(rec);
   });
   it("returns null for an unknown doc", async () => {
     const store = new BaseStore(new FakeVault(), ".obsidian");

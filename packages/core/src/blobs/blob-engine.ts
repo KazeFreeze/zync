@@ -106,6 +106,18 @@ export class BlobEngine {
       throw new Error(`BlobEngine.materialize: no manifest entry for ${path}`);
     }
 
+    // IDEMPOTENCY SHORT-CIRCUIT (0b-3 loop fix): if the file already on disk hashes to the
+    // manifest sha, the blob is ALREADY materialized — fetching + re-writing would be wasted
+    // work AND (critically) would emit another fs "modify" event, feeding the eager-materialize
+    // feedback loop (materialize → write → fs event → onWrite → onLocalBlobWrite → manifest
+    // re-stamp → observe → materialize → …). Skipping here makes both the steady state and the
+    // initial eager sweep idempotent, breaking the loop even if an echo is ever missed. Returns
+    // the on-disk bytes (which provably hash to the manifest sha) without touching the vault.
+    const onDisk = await d.vault.read(path);
+    if (onDisk !== null && (await sha256OfBytes(onDisk)) === entry.sha256) {
+      return onDisk;
+    }
+
     const bytes = await d.blobStore.get(entry.sha256);
     const actual = await sha256OfBytes(bytes);
     if (actual !== entry.sha256) {
@@ -121,11 +133,38 @@ export class BlobEngine {
   }
 
   /**
+   * READ-ONLY snapshot of the blob manifest: every `[path, entry]` advertised in the
+   * index `blobs` map. The engine's `pendingDocs` blob-accounting (0b-3 Fix 3) reads
+   * this to check whether each advertised blob has actually materialized onto THIS
+   * device's disk (a follower must not report quiescence while a manifest-advertised
+   * blob is still missing). PURE READ — it never mutates the manifest, so calling it
+   * from a remote-facing convergence loop is loop-safe.
+   */
+  manifestEntries(): [VaultPath, BlobManifestEntry][] {
+    return this.#deps.manifest.entries().map(([k, v]) => [k as VaultPath, v]);
+  }
+
+  /**
    * Observe the manifest and drive eager fetches: every changed path is routed
    * through {@link onManifestChange} (eager ⇒ auto-materialize; lazy ⇒ no-op).
    * Returns the unsubscribe.
+   *
+   * INITIAL EAGER SWEEP (0b-3 Fix 3): `observe` only fires on FUTURE manifest changes,
+   * but a follower that attaches the index doc AFTER a blob was already advertised pulls
+   * that entry via the INITIAL state-vector exchange — i.e. it is ALREADY present when
+   * `start()` subscribes, so no observe callback ever fires for it. Without an initial
+   * pass an eager follower would never materialize a pre-existing blob (the bug surfaced
+   * by the new blob-pending accounting). So eager `start()` also routes every entry
+   * already in the manifest through {@link onManifestChange}. Fire-and-forget + echo-
+   * guarded + idempotent (a re-materialize re-writes byte-identical content), so it is
+   * loop-safe; lazy stays a pure no-op.
    */
   start(): Unsubscribe {
+    if (this.#deps.policy === "eager") {
+      for (const [p] of this.#deps.manifest.entries()) {
+        void this.onManifestChange(p as VaultPath);
+      }
+    }
     return this.#deps.manifest.observe((changedPaths) => {
       for (const p of changedPaths) {
         void this.onManifestChange(p as VaultPath);

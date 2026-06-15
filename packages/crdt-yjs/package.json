@@ -18,6 +18,8 @@
   },
   "devDependencies": {
     "@codemirror/state": "^6.4.0",
-    "@codemirror/view": "^6.30.0"
+    "@codemirror/view": "^6.30.0",
+    "@types/node": "^22.0.0",
+    "@zync/server": "workspace:*"
   }
 }

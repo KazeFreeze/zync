@@ -108,6 +108,19 @@ interface Attachment {
   rejectSynced: (err: Error) => void;
   /** True once `syncedPromise` has settled (resolved or rejected) — prevents double-settle. */
   settled: boolean;
+  /**
+   * True once delivery to peers has OCCURRED for this doc — the in-process analogue of the
+   * relay's received+merged ack. Because the bus delivers SYNCHRONOUSLY, every local update is
+   * exchanged the instant it can; so this latches whenever we can exchange (the same point
+   * `synced` resolves). While offline/partitioned it stays false until the next resync.
+   */
+  delivered: boolean;
+  /**
+   * In-flight `acked()` waiters created on demand (NOT eagerly) so an UNCONSUMED ack never
+   * becomes an unhandled rejection on close — mirrors the Hocuspocus adapter. `resolve` is
+   * called when delivery latches; `reject` on detach/close. A waiter is removed on settle.
+   */
+  readonly ackWaiters: Set<{ resolve: () => void; reject: (err: Error) => void }>;
 }
 
 export class InProcessTransport implements TransportPort {
@@ -220,6 +233,8 @@ export class InProcessTransport implements TransportPort {
       resolveSynced,
       rejectSynced,
       settled: false,
+      delivered: false,
+      ackWaiters: new Set(),
     };
 
     this.attachments.set(doc.id, attachment);
@@ -233,10 +248,25 @@ export class InProcessTransport implements TransportPort {
 
     return {
       synced: () => attachment.syncedPromise,
+      acked: () => this.makeAcked(attachment),
       detach: () => {
         this.detachAttachment(doc.id);
       },
     };
+  }
+
+  /**
+   * Build a fresh `acked()` promise: resolves immediately if delivery already occurred for this
+   * doc, otherwise registers a waiter resolved on the next resync (goOnline/heal) and rejected on
+   * detach/close. On-demand (not eager) so an unconsumed ack is never an unhandled rejection.
+   */
+  private makeAcked(attachment: Attachment): Promise<void> {
+    if (this.closed) return Promise.reject(new ClosedError());
+    if (attachment.delivered) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      const waiter = { resolve, reject };
+      attachment.ackWaiters.add(waiter);
+    });
   }
 
   private detachAttachment(id: DocId): void {
@@ -252,6 +282,11 @@ export class InProcessTransport implements TransportPort {
       attachment.settled = true;
       attachment.rejectSynced(new ClosedError("transport attachment detached before sync"));
     }
+    // Reject any pending `acked()` waiters — detach means the relay will never confirm receipt.
+    for (const waiter of [...attachment.ackWaiters]) {
+      waiter.reject(new ClosedError("transport attachment detached before ack"));
+    }
+    attachment.ackWaiters.clear();
   }
 
   // ── resync ────────────────────────────────────────────────────────────────
@@ -272,6 +307,14 @@ export class InProcessTransport implements TransportPort {
       attachment.settled = true;
       attachment.resolveSynced();
     }
+
+    // Delivery has OCCURRED (the bus exchanged synchronously above), so any local updates queued
+    // for this doc have been received by every reachable peer — the in-process received+merged
+    // ack. Latch it whenever we can exchange and resolve any pending `acked()` waiters; offline/
+    // partitioned it stays unlatched until the next resync (goOnline/heal) reaches here.
+    attachment.delivered = true;
+    for (const waiter of [...attachment.ackWaiters]) waiter.resolve();
+    attachment.ackWaiters.clear();
   }
 
   private resyncAll(): void {
@@ -294,6 +337,8 @@ export class InProcessTransport implements TransportPort {
         attachment.settled = true;
         attachment.rejectSynced(new ClosedError());
       }
+      for (const waiter of [...attachment.ackWaiters]) waiter.reject(new ClosedError());
+      attachment.ackWaiters.clear();
     }
     this.attachments.clear();
 

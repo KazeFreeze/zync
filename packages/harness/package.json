@@ -1,0 +1,20 @@
+{
+  "name": "@zync/harness",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "harness:build": "ZYNC_HARNESS_ROOT=$PWD/../.. docker compose -p zync-harness -f docker-compose.yml build",
+    "harness:down": "ZYNC_HARNESS_ROOT=$PWD/../.. docker compose -p zync-harness -f docker-compose.yml down -v --remove-orphans",
+    "harness:test": "vitest run --config vitest.config.ts",
+    "harness": "tsx scripts/run.ts",
+    "harness:scale": "tsx scripts/run.ts --scale"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@zync/headless-client": "workspace:*",
+    "execa": "^9.5.0",
+    "tsx": "^4.19.0",
+    "vitest": "^2.1.0"
+  }
+}

@@ -6,6 +6,8 @@
   "scripts": {
     "server": "pnpm --filter @zync/server dev",
     "build:plugin": "pnpm --filter @zync/plugin build",
+    "harness": "pnpm --filter @zync/harness harness",
+    "harness:scale": "pnpm --filter @zync/harness harness:scale",
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",

@@ -3,6 +3,8 @@ import {
   IndexDoc,
   LazyAttachManager,
   makeStamp,
+  sha256OfText,
+  stampHash,
   type AttachedDoc,
   type ConnStatus,
   type CrdtDoc,
@@ -83,6 +85,8 @@ class CountingTransport implements TransportPort {
           settle();
         }
       },
+      // Delegate the relay-ack signal to the inner transport unchanged.
+      acked: () => attached.acked(),
     };
   }
 }
@@ -196,10 +200,15 @@ describe("LazyAttachManager — inequality-triggered lazy attach + bounded catch
     expect(transport.peakInFlight).toBeLessThanOrEqual(6);
     expect(transport.peakInFlight).toBeGreaterThan(1); // genuinely concurrent
 
-    // All 50 reconciled.
+    // All 50 reconciled. The synced stamp now reflects the doc's ACTUAL synced content
+    // (the materialized fresh doc is empty here) — NOT the fabricated index `h-N` stamp.
+    // Recording the doc's real content is the 0b-3 stale-snapshot-latch fix; the index
+    // stamps in this fixture were never backed by real doc text, so the recorded hash is
+    // sha256("") for every doc. (Convergence still holds: pendingDocs compares HASH parts.)
+    const emptyHash = await sha256OfText("");
     for (let i = 0; i < 50; i++) {
       const synced = await engineState.getSyncedStamp(docId(`c-${String(i)}`));
-      expect(synced).toBe(makeStamp(sha(`h-${String(i)}`), DEVICE));
+      expect(stampHash(synced ?? "")).toBe(emptyHash);
     }
   });
 

@@ -1,10 +1,32 @@
 import type { DocId, Sha256, VaultPath, VaultPort } from "../ports.js";
 
 export interface BaseRecord {
-  baseText: string; // the merge base TEXT — merge3 needs reconstructable text, not a one-way hash (NEW-7 BLOCKER-1)
-  fileHash: Sha256; // quick compare / echo
+  baseText: string; // the WORKING merge base TEXT — merge3 needs reconstructable text, not a one-way hash (NEW-7 BLOCKER-1)
+  fileHash: Sha256; // quick compare / echo (the working base's hash)
   crdtToken: Uint8Array | null; // state vector; null = "adopt-pending" until first attach (0b-2 §A/§B)
   substrate: string;
+  /**
+   * The last RELAY-ACKED content TEXT — the CRASH-RECOVERY merge base (0b-3 crash-window no-loss).
+   *
+   * `baseText` is the WORKING base: a LOCAL ingest/reconcile advances it to the just-edited
+   * content immediately (so the next ingest merges against it). But that edit may NOT have
+   * reached the relay yet. If the device is SIGKILL'd in that window and restarts with a
+   * PRISTINE/stale reloaded CRDT doc, reconciling against the WORKING base (== the edit) makes
+   * `merge3(base=EDIT, disk=EDIT, crdt=PRISTINE)` see only the CRDT as changed → pristine wins
+   * → the disk edit is REVERTED (silent data loss). So we ALSO persist `ackedText`: the content
+   * the relay has actually confirmed receipt of (advanced ONLY by the catch-up ack gate and by
+   * remote-origin outbound writes, whose content came FROM the relay). The crash-recovery dirty
+   * reconcile uses `ackedText` as its merge base, so `merge3(acked=PRISTINE, disk=EDIT,
+   * crdt=PRISTINE)` correctly keeps the DISK EDIT and re-pushes it.
+   *
+   * BACKWARD-COMPAT / ERGONOMICS: OPTIONAL on save — a caller that does not distinguish working
+   * from acked (or an older on-disk record) omits them and {@link BaseStore.save}/{@link
+   * BaseStore.load} default them to `baseText`/`fileHash` (fully-acked, correct for steady state).
+   * Callers that must keep the recovery base LAGGING an unpushed edit (ingest, seed, the dirty
+   * reconcile) set them explicitly. `load` ALWAYS returns them populated.
+   */
+  ackedText?: string;
+  ackedHash?: Sha256; // the last-acked content's hash (the recovery anchor for the disk-ahead guard)
 }
 
 interface SerializedBase {
@@ -12,6 +34,8 @@ interface SerializedBase {
   fileHash: Sha256;
   crdtTokenB64: string | null; // null mirrors an adopt-pending BaseRecord (crdtToken === null)
   substrate: string;
+  ackedText?: string; // absent in pre-0b-3 records ⇒ defaults to baseText on load
+  ackedHash?: Sha256; // absent in pre-0b-3 records ⇒ defaults to fileHash on load
 }
 
 /**
@@ -39,6 +63,9 @@ export class BaseStore {
       fileHash: s.fileHash,
       substrate: s.substrate,
       crdtToken: s.crdtTokenB64 === null ? null : b64ToBytes(s.crdtTokenB64),
+      // Pre-0b-3 records have no acked* fields ⇒ treat the working base as fully-acked.
+      ackedText: s.ackedText ?? s.baseText,
+      ackedHash: s.ackedHash ?? s.fileHash,
     };
   }
 
@@ -48,6 +75,9 @@ export class BaseStore {
       fileHash: rec.fileHash,
       substrate: rec.substrate,
       crdtTokenB64: rec.crdtToken === null ? null : bytesToB64(rec.crdtToken),
+      // Default an omitted acked base to the working base (fully-acked, steady-state semantics).
+      ackedText: rec.ackedText ?? rec.baseText,
+      ackedHash: rec.ackedHash ?? rec.fileHash,
     };
     await this.vault.writeAtomic(this.path(docId), new TextEncoder().encode(JSON.stringify(s)));
   }

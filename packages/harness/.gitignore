@@ -1,0 +1,4 @@
+# Per-run harness artifacts (see scripts/run.ts CONTRACT) — outputs, not source.
+results.json
+logs.txt
+metrics.json

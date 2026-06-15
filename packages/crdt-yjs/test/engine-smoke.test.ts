@@ -139,4 +139,61 @@ describe("SyncEngine two-engine smoke (deterministic — no setTimeout polling)"
     expect(await a.engine.pendingDocs()).toEqual([]);
     expect(await b.engine.pendingDocs()).toEqual([]);
   });
+
+  it("observability seam: getAuthority / ensureNoteAttached / counts (0b-3)", async () => {
+    const bus = new InProcessBus();
+    a = makeDevice(bus, "dev-a", "Device A");
+    b = makeDevice(bus, "dev-b", "Device B");
+
+    await a.vault.writeAtomic(A_MD, utf8("seam content"));
+    await a.engine.start();
+    await b.engine.start();
+    await converge(a, b);
+
+    // Index doc snapshot has bytes once started.
+    expect(a.engine.indexSnapshotBytes()).toBeGreaterThan(0);
+
+    // getAuthority returns the canonical authority; binding flips it active-bound.
+    const auth = a.engine.getAuthority(A_MD);
+    expect(auth.state).toBe("inactive");
+    auth.bindEditor("pane-1");
+    expect(auth.state).toBe("active-bound");
+
+    // ensureNoteAttached (online path via runCatchUp) attaches the open note's doc.
+    const doc = await a.engine.ensureNoteAttached(A_MD);
+    expect(doc).toBeDefined();
+    expect(doc?.getText()).toBe("seam content");
+    expect(a.engine.getAttachedDoc(A_MD)).toBe(doc); // canonical instance
+    expect(a.engine.attachedDocCount()).toBeGreaterThanOrEqual(1);
+    auth.unbindEditor("pane-1");
+  });
+});
+
+describe("SyncEngine projector mode (ingestDisabled, 0b-3 Part C)", () => {
+  it("does NOT ingest a local write when ingestDisabled is true", async () => {
+    const bus = new InProcessBus();
+    const vault = new FakeVault();
+    const engine = new SyncEngine(
+      {
+        vault,
+        crdt: new YjsCrdtProvider(),
+        transport: bus.connect(),
+        blobs: new FakeBlobStore(),
+        docStore: new FakeDocStore(),
+        clock: new FakeClock(),
+        identity: identity("dev-proj", "Projector"),
+        engineState: new MemEngineState(),
+      },
+      { configDir: ".obsidian", maxProseBytes: 1_000_000, substrate: "yjs", ingestDisabled: true },
+    );
+    await engine.start();
+
+    // A local write fires onWrite, but ingest is disabled → no index entry, nothing pending.
+    await vault.writeAtomic(A_MD, utf8("projected only"));
+    await engine.whenIdle();
+
+    expect(engine.index.get(A_MD)).toBeUndefined();
+    expect(await engine.pendingDocs()).toEqual([]);
+    await engine.stop();
+  });
 });

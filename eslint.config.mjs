@@ -8,6 +8,10 @@ export default tseslint.config(
       "**/build/**",
       "**/node_modules/**",
       "packages/plugin/**",
+      // Harness fixtures are synthetic test DATA, not typed source. The routing
+      // fixture's deterministic 5 MB-blob generator is a plain Node `.mjs` script
+      // run at fixture-prep time; it is not part of any tsconfig project.
+      "packages/harness/fixtures/**",
     ],
   },
   ...tseslint.configs.strictTypeChecked,

@@ -53,6 +53,9 @@ export async function supervisedImport(
     fileHash: serverHash,
     crdtToken: null, // adopt-pending: no CRDT side attached yet
     substrate,
+    // The adopted content came FROM the server, so it is relay-acked — both bases advance.
+    ackedText: serverText,
+    ackedHash: serverHash,
   });
   echo.recordWrite(path, serverHash);
   await vault.writeAtomic(path, utf8(serverText));

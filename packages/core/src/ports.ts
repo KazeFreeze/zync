@@ -66,8 +66,10 @@ export type ConnStatus = "connected" | "connecting" | "offline" | "unauthorized"
  * - `attach(doc)` while offline returns an `AttachedDoc` immediately; never throws; queues until connected.
  * - `AttachedDoc.synced()` resolves after the FIRST successful state-vector exchange; during a partition it
  *   stays PENDING (never rejects, never resolves stale).
+ * - `AttachedDoc.acked()` resolves once the relay has CONFIRMED RECEIPT of this doc's queued local
+ *   updates (see its doc-comment for the exact bar); same liveness rules as `synced()`.
  * - On reconnect, an attached doc AUTO-resyncs (re-exchanges state vectors); the engine does NOT re-attach.
- * - `close()` detaches all; in-flight `synced()` promises reject with a typed `ClosedError`.
+ * - `close()` detaches all; in-flight `synced()`/`acked()` promises reject with a typed `ClosedError`.
  */
 export interface TransportPort {
   status(): ConnStatus;
@@ -76,7 +78,25 @@ export interface TransportPort {
   close(): Promise<void>;
 }
 export interface AttachedDoc {
+  /** Resolves after the FIRST successful state-vector handshake (see {@link TransportPort}). */
   synced(): Promise<void>;
+  /**
+   * Resolves when the transport has confirmed the relay RECEIVED+MERGED all local updates
+   * currently queued for this doc — the signal that retires this device's re-push obligation.
+   *
+   * ACK BAR — RECEIVED+MERGED, NOT fsync-grade durability. This resolves once the relay has
+   * acknowledged it merged the pushed update into its in-memory doc, NOT that the bytes are
+   * fsync'd to the relay's disk. True fsync-grade durability would require a server-side
+   * change (a persistence ack); that is DEFERRED. The engine treats RECEIVED+MERGED as the
+   * bar for clearing dirty / advancing the synced-stamp, which closes the local-crash data-loss
+   * window (a crash AFTER ack no longer loses the edit — the relay has it).
+   *
+   * LIVENESS — mirrors `synced()`: never resolves stale; rejects with `ClosedError` on
+   * close/detach; while OFFLINE it stays PENDING (the caller MUST NOT await it offline — the
+   * engine's catch-up only awaits `acked()` when `status() !== "offline"`, and even then with a
+   * bound, so a never-acking doc surfaces as a visible non-convergence, never silent loss).
+   */
+  acked(): Promise<void>;
   detach(): void;
 }
 

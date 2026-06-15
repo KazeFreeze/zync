@@ -112,11 +112,19 @@ export async function applyBootstrap(
       // localText is non-null here (decision "seed" ⇒ hasLocalFile). Save adopt-pending
       // base + mark dirty so lazy-attach pushes later. No docId is minted here.
       const text = localText ?? "";
+      const textHash = await sha256OfText(text);
+      // A seed is a LOCAL-only create not yet on the relay (it is dirty, re-pushed by
+      // lazy-attach). So the WORKING base is the seeded text, but the ACKED/recovery base is
+      // EMPTY — nothing is relay-acked yet (0b-3 crash-window no-loss). After a crash the dirty
+      // reconcile then merges against empty (crdt === "" short-circuits to disk), keeping the
+      // local content.
       await deps.base.save(docId, {
         baseText: text,
-        fileHash: await sha256OfText(text),
+        fileHash: textHash,
         crdtToken: null,
         substrate: deps.substrate,
+        ackedText: "",
+        ackedHash: await sha256OfText(""),
       });
       await deps.engineState.markDirty(docId);
       return { decision, needsAttach: true };
@@ -125,11 +133,16 @@ export async function applyBootstrap(
       // Byte-identical local (the landmine guard): adopt-pending base + synced stamp, ZERO attach.
       // `localEqualsServer` already implies treeStamp/localText are non-null.
       if (localEqualsServer) {
+        // The server ALREADY has this exact content (byte-identical adopt), so it is
+        // relay-acked — advance BOTH bases (0b-3 crash-window no-loss).
+        const localHash = await sha256OfText(localText);
         await deps.base.save(docId, {
           baseText: localText,
-          fileHash: await sha256OfText(localText),
+          fileHash: localHash,
           crdtToken: null,
           substrate: deps.substrate,
+          ackedText: localText,
+          ackedHash: localHash,
         });
         await deps.engineState.setSyncedStamp(docId, treeStamp);
         return { decision, needsAttach: false };

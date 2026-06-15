@@ -177,6 +177,70 @@ describe("BlobEngine.materialize (hash-verify-on-read)", () => {
   });
 });
 
+describe("BlobEngine two-device materialization (shared manifest + shared store)", () => {
+  /**
+   * Reproduces Fix 3's root bug at the engine level: device A writes a blob
+   * (store + manifest), device B with `policy:"eager"` MUST materialize the bytes
+   * onto its own vault when it observes the shared manifest entry. A SHARED
+   * FakeCrdtMap + SHARED FakeBlobStore mimic the replicated index `blobs` map and
+   * the content-addressed store both devices reach. Pre-fix the headless follower
+   * defaulted to `"lazy"` (a NO-OP `onManifestChange`), so the blob never landed.
+   */
+  it("eager B materializes A's blob from the shared manifest+store", async () => {
+    const manifest = new FakeCrdtMap<BlobManifestEntry>();
+    const blobStore = new FakeBlobStore();
+
+    // Device A: writes the blob locally (store the bytes + advertise the manifest entry).
+    const vaultA = new FakeVault();
+    const engineA = new BlobEngine({
+      manifest,
+      blobStore,
+      vault: vaultA,
+      echo: new EchoLedger(),
+      identity: identity(DEV_A),
+      policy: "lazy",
+    });
+
+    // Device B: EAGER + observing — it must auto-fetch the moment the entry lands.
+    const vaultB = new FakeVault();
+    const DEV_B = "dev-b" as DeviceId;
+    const engineB = new BlobEngine({
+      manifest,
+      blobStore,
+      vault: vaultB,
+      echo: new EchoLedger(),
+      identity: identity(DEV_B),
+      policy: "eager",
+    });
+
+    let writtenB = false;
+    vaultB.onEvent(() => {
+      writtenB = true;
+    });
+    const unsubB = engineB.start();
+
+    await engineA.onLocalBlobWrite(path("img.png"), PNG);
+    // The shared FakeCrdtMap fires B's observe synchronously; its async materialize settles over ticks.
+    await waitFor(() => writtenB);
+
+    // B's vault now holds the byte-identical blob (the bug: pre-fix it stayed null).
+    expect(await vaultB.read(path("img.png"))).toEqual(PNG);
+    const sha = await sha256OfBytes(PNG);
+    expect(await sha256OfBytes((await vaultB.read(path("img.png"))) ?? new Uint8Array())).toBe(sha);
+
+    unsubB();
+  });
+
+  it("manifestEntries exposes the manifest read-only (for pendingDocs blob accounting)", async () => {
+    const h = makeEngine("eager");
+    await h.engine.onLocalBlobWrite(path("img.png"), PNG);
+    const sha = await sha256OfBytes(PNG);
+    expect(h.engine.manifestEntries()).toEqual([
+      ["img.png", { sha256: sha, size: PNG.length, deviceId: DEV_A }],
+    ]);
+  });
+});
+
 describe("BlobEngine.start (observe → drive eager fetches)", () => {
   it("eager engine auto-materializes when a manifest entry is observed", async () => {
     const h = makeEngine("eager");

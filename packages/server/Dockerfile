@@ -6,4 +6,5 @@ COPY packages/server/package.json packages/server/
 RUN pnpm install --frozen-lockfile --filter @zync/server...
 COPY packages/server packages/server
 EXPOSE 1234
+EXPOSE 8080
 CMD ["pnpm","--filter","@zync/server","exec","tsx","src/index.ts"]
