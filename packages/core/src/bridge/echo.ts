@@ -28,14 +28,6 @@ export class EchoLedger {
   readonly #pending = new Map<string, Set<string>>();
 
   /**
-   * Optional hook fired AFTER every {@link recordWrite}, with the recorded `(path, hash)`. The engine
-   * wires this to its `DiskHashCache.note` so a KNOWN post-write hash keeps the cache warm in the
-   * window before the (async, on real Obsidian) watcher event lands. Default: no-op.
-   */
-  // eslint-disable-next-line @typescript-eslint/no-empty-function
-  onRecord: (path: string, hash: string) => void = () => {};
-
-  /**
    * Record that we are about to write `hash` to `path`.
    * May be called multiple times before the corresponding fs events arrive.
    */
@@ -46,7 +38,6 @@ export class EchoLedger {
     } else {
       this.#pending.set(path, new Set([hash]));
     }
-    this.onRecord(path, hash);
   }
 
   /**

@@ -33,7 +33,6 @@ import { applyBootstrap } from "./protocol/bootstrap.js";
 import { supervisedImport } from "./conflicts/supervised-import.js";
 import { orphanSweep, type OrphanMeta } from "./protocol/orphan-sweep.js";
 import { makeStamp, stampHash, stampsEqual } from "./protocol/stamp.js";
-import { DiskHashCache } from "./protocol/disk-hash-cache.js";
 import { BlobEngine, type BlobFetchPolicy, type BlobManifestEntry } from "./blobs/blob-engine.js";
 import { Inbox } from "./conflicts/inbox.js";
 import { writeConflictArtifact } from "./conflicts/artifact.js";
@@ -135,13 +134,6 @@ export class SyncEngine {
    */
   private priorDivergence = new Map<DocId, string>();
   readonly base: BaseStore;
-  /**
-   * In-memory disk-hash cache (path -> sha256(diskBytes)). Read-through at the materialize skip-gate
-   * and clean-settle (the dominant first-sync reads); kept warm by `echo.onRecord` and invalidated by
-   * `onVaultEvent` + the `structuralVault()` remove/rename wrapper. Constructed per-instance (never
-   * persisted) so a restart re-reads disk fresh. See `protocol/disk-hash-cache.ts`.
-   */
-  private readonly diskHashCache: DiskHashCache;
 
   private readonly ports: EnginePorts;
   private readonly config: EngineConfig;
@@ -208,17 +200,6 @@ export class SyncEngine {
     this.debounceMs = config.stampDebounceMs ?? DEFAULT_DEBOUNCE_MS;
     this.renameSettleMs = config.renameSettleMs ?? DEFAULT_RENAME_SETTLE_MS;
     this.base = new BaseStore(ports.vault, config.configDir);
-    this.diskHashCache = new DiskHashCache({
-      read: (p) => this.ports.vault.read(p),
-      hashBytes: (bytes) => sha256OfBytes(bytes),
-    });
-    // Keep the cache warm: every engine file write goes recordWrite -> writeAtomic, so noting the
-    // post-write hash here means a reconcile pass that runs before the watcher echo lands still sees
-    // the file as canonical without a read. (Correctness never depends on this; `onVaultEvent` forget
-    // is the correctness hook. On real Obsidian the watcher event is async, so this window is real.)
-    this.echo.onRecord = (p, h) => {
-      this.diskHashCache.note(p as VaultPath, h as Sha256);
-    };
   }
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -907,7 +888,7 @@ export class SyncEngine {
     };
     await runStructuralReconcile({
       index: this.index,
-      vault: this.structuralVault(),
+      vault: this.ports.vault,
       localHashOf: async (path) => {
         const bytes = await this.ports.vault.read(path);
         return bytes === null ? null : await sha256OfBytes(bytes);
@@ -1005,32 +986,22 @@ export class SyncEngine {
       const docStamp = makeStamp(await sha256OfText(doc.getText()), deviceId);
       if (!stampsEqual(docStamp, entry.stamp)) continue; // CRDT not yet at the indexed content.
 
-      // CACHED SKIP GATE: if the cached on-disk hash already equals the indexed content, the file is
-      // canonical -> skip WITHOUT a disk read. This is the dominant first-sync read: once a note is
-      // seeded, every later relay-echoed pass re-confirmed "already canonical". Stale-safe -- a stale
-      // "canonical" only MISSES a materialize (re-driven by a later pass / waitConverged via the FRESH
-      // pendingDocs gate), it can NEVER authorize a clobber.
-      const cachedHash = await this.diskHashCache.hash(path);
-      const cachedStamp = cachedHash === null ? null : makeStamp(cachedHash, deviceId);
-      if (stampsEqual(cachedStamp, entry.stamp)) continue; // disk already canonical (cache hit).
-
-      // Past the skip => we MIGHT write. The cache may NEVER authorize a write (clobbering is the only
-      // unsafe direction), so re-read FRESH for the anti-clobber proof. `note` the fresh truth to
-      // self-heal a stale-behind cache entry for the next pass.
       const bytes = await this.ports.vault.read(path);
-      const diskHash = bytes === null ? null : await sha256OfBytes(bytes);
-      this.diskHashCache.note(path, diskHash);
-      const diskStamp = diskHash === null ? null : makeStamp(diskHash, deviceId);
-      if (stampsEqual(diskStamp, entry.stamp)) continue; // disk canonical after all (cache was stale).
+      const diskStamp = bytes === null ? null : makeStamp(await sha256OfBytes(bytes), deviceId);
+      if (stampsEqual(diskStamp, entry.stamp)) continue; // disk already canonical.
 
-      // ANTI-CLOBBER GUARD: only write when the disk is genuinely BEHIND the converged doc -- never
-      // over a newer un-ingested edit, and never over a DIRTY doc's unpushed edit.
+      // ANTI-CLOBBER GUARD: only write when the disk is genuinely BEHIND the converged
+      // doc — never over a newer un-ingested edit, and never over a DIRTY doc's unpushed
+      // edit (see CLOBBER HAZARD above).
       if (bytes !== null) {
-        // DIRTY => this device owes a push; the disk may hold the unpushed (post-crash recovered)
-        // edit. Never materialize over it -- the dirty reconcile + re-push own it.
+        // DIRTY ⇒ this device owes a push; the disk may hold the unpushed (post-crash
+        // recovered) edit. Never materialize over it — the dirty reconcile + re-push own it.
         if (dirty.has(entry.docId)) continue;
         const base = await this.base.load(entry.docId);
-        // disk != last-reconciled working base => a newer un-ingested edit (or no base) => SKIP.
+        const diskHash = await sha256OfBytes(bytes);
+        // disk ≠ last-reconciled working base ⇒ a newer un-ingested edit (or we cannot prove
+        // it is behind: no base ⇒ `base?.fileHash` is undefined ⇒ never equal) ⇒ SKIP. Ingest
+        // will reconcile it; pendingDocs keeps the loop alive.
         if (diskHash !== base?.fileHash) continue;
       }
 
@@ -1167,37 +1138,8 @@ export class SyncEngine {
   private async diskHashOf(docId: DocId): Promise<Sha256 | null> {
     const path = this.pathOf(docId);
     if (path === undefined) return null;
-    // CACHED: clean-settle's triple-equality read. Stale-safe -- settle advances ONLY the synced
-    // stamp (never clears dirty / writes / removes), and the FRESH `pendingDocs` gate backstops it,
-    // so a stale value can never produce false convergence or data loss.
-    return this.diskHashCache.hash(path);
-  }
-
-  /**
-   * The vault handed to structural reconcile: a thin wrapper that invalidates the disk-hash cache on
-   * the only vault MUTATIONS structural reconcile performs (`remove`/`rename`), so a path it deletes
-   * or moves cannot be served a stale hash by a later pass. Every other method delegates unchanged --
-   * this is invalidation only, NOT a read cache (hashing stays at the explicit `diskHashCache.hash`
-   * sites; `read` returns bytes verbatim).
-   */
-  private structuralVault(): VaultPort {
-    const v = this.ports.vault;
-    const cache = this.diskHashCache;
-    return {
-      read: (p) => v.read(p),
-      writeAtomic: (p, d, o) => v.writeAtomic(p, d, o),
-      list: (prefix) => v.list(prefix),
-      onEvent: (cb) => v.onEvent(cb),
-      remove: async (p) => {
-        cache.note(p, null); // removed -> known-absent
-        await v.remove(p);
-      },
-      rename: async (from, to) => {
-        cache.forget(from);
-        cache.forget(to);
-        await v.rename(from, to);
-      },
-    };
+    const bytes = await this.ports.vault.read(path);
+    return bytes === null ? null : await sha256OfBytes(bytes);
   }
 
   // ── debounced index-stamp bump ──────────────────────────────────────────
@@ -1612,13 +1554,6 @@ export class SyncEngine {
   // ── vault events ───────────────────────────────────────────────────────────
 
   private onVaultEvent(e: VaultEvent): void {
-    // CACHE INVALIDATION (correctness hook): an external change at `e.path` (or both paths of a
-    // rename) makes any cached disk hash for it stale, so forget it BEFORE routing the event -- the
-    // next reconcile read re-hashes fresh. This also forgets the engine's OWN write echoes (harmless:
-    // the next read re-reads exactly what we wrote). `echo.onRecord`'s warm-set serves the window
-    // before this event arrives (async on real Obsidian); the forget here ends that window cleanly.
-    this.diskHashCache.forget(e.path);
-    if (e.type === "rename") this.diskHashCache.forget(e.oldPath);
     switch (e.type) {
       case "create":
       case "modify":
