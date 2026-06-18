@@ -7,3 +7,4 @@ export { MemEngineState } from "./mem-engine-state.js";
 export { FakeDocStore } from "./fake-doc-store.js";
 export { FakeBlobStore } from "./fake-blob-store.js";
 export { SimulatedEditor } from "./simulated-editor.js";
+export { CallCounter } from "./counting-port.js";

@@ -170,16 +170,36 @@ export class SyncEngine {
   // ── deterministic quiescence ────────────────────────────────────────────
   private readonly inflight = new Set<Promise<unknown>>();
   private readonly pendingBumps = new Map<VaultPath, PendingBump>();
-  // COALESCED reconcile (the index-observe-driven catch-up → structural-reconcile → settle chain).
-  // Firing the full O(n) chain on EVERY index transaction made a bulk seed O(n²): the relay echoes
-  // ~n index updates and each re-scanned all live entries (the on-device ~16-min bottleneck — see
-  // bench `vault.read` ~2200/note). These bound it to one pass in flight, re-running once more if any
-  // change arrived mid-pass; since a pass is O(n) work, the echoes that land while it runs coalesce
-  // into that single re-run. See {@link scheduleReconcile}.
-  private reconcileScheduled = false;
-  private reconcileRunning = false;
-  private reconcileAgain = false;
-  private reconcileGate: (() => void) | null = null;
+  // DURABLE WORK-QUEUE COALESCER (Stage 2 — replaces the three-boolean coalescer).
+  //
+  // Stage 1 coalescer (boolean flags): bounded to one pass in flight, re-ran once more if any
+  // change arrived mid-pass (reconcileAgain). Caught the O(n^2) burst. BUT: it discarded the
+  // changed paths delivered by IndexDoc.observe, and on a thrown pass the gate resolved early
+  // (before the work was done), letting whenIdle falsely report idle while pending work remained.
+  //
+  // Stage 2 coalescer: accumulates the ACTUAL changed paths from IndexDoc.observe, threads them
+  // as a durable work queue so no path is ever dropped on throw, and tracks the REAL loop promise
+  // (not a manual gate) so whenIdle/waitConverged await real work and see real rejections.
+  //
+  // Invariants:
+  //   (a) Every VaultPath delivered by IndexDoc.observe lands in pendingChangedPaths.
+  //   (b) A running pass drains pendingChangedPaths into runningBatch at loop-start; new changes
+  //       that arrive MID-PASS land in pendingChangedPaths (next iteration), never lost.
+  //   (c) On THROW: runningBatch paths are re-added to pendingChangedPaths, a fresh pass is
+  //       scheduled, and the loop promise rejects (so whenIdle/allSettled sees the failure).
+  //   (d) On SUCCESS: runningBatch is cleared; loop continues if pendingChangedPaths is non-empty.
+  //   (e) whenIdle drains inflight with allSettled — sees the real loop promise, never a manual gate.
+  //
+  // Passes are still FULL (runCatchUp + structuralReconcile + settleCleanDocs over ALL entries).
+  // The batch is collected but not yet used to scope the work — scoping is a later stage.
+  // This is pure plumbing: convergence must stay byte-identical.
+  private readonly pendingChangedPaths = new Set<VaultPath>();
+  // The set of paths snapshotted into the currently-running pass (cleared on success, re-queued
+  // on throw). Kept separate from pendingChangedPaths so mid-pass changes land in the pending set
+  // and can never be lost even if the running pass throws.
+  private runningBatch = new Set<VaultPath>();
+  // True while the reconcile loop promise is in flight. Prevents double-scheduling.
+  private reconcileLoopRunning = false;
   /**
    * The single in-flight rename-transaction settle: a tracked, RE-ARMABLE timer (see
    * {@link scheduleRenameSettle}). Re-arming on each suppressed fallout event keeps the
@@ -315,7 +335,10 @@ export class SyncEngine {
     //    index against the vault (inbound tombstone → vault.remove). Structural reconcile runs AFTER
     //    catch-up so a doc the same index change attaches is materialized before we judge its disk
     //    state. COALESCED (not one chain per transaction) — see {@link scheduleReconcile}.
-    this.indexUnsub = this.index.observe(() => {
+    //    Stage 2: thread the changed paths into pendingChangedPaths so they are durable across
+    //    a thrown pass (no path is ever dropped).
+    this.indexUnsub = this.index.observe((changedPaths) => {
+      for (const p of changedPaths) this.pendingChangedPaths.add(p);
       this.scheduleReconcile();
     });
 
@@ -1018,58 +1041,88 @@ export class SyncEngine {
   }
 
   /**
-   * COALESCE the index-observe-driven reconcile chain. The OLD handler fired a fresh
-   * `runCatchUp → structuralReconcile → settleCleanDocs` chain on EVERY index transaction; during a
-   * bulk seed the relay echoes ~n index updates, so that was n chains each doing an O(n) full rescan
-   * (vault.read + sha256 + getSyncedStamp per live entry) → O(n²), the dominant on-device first-sync
-   * cost the profiler exposed (~2200 vault.reads/note). Here at most ONE pass is in flight; an index
-   * change arriving while a pass runs sets `reconcileAgain` so the pass loops once more instead of
-   * spawning another. Because a pass is itself O(n) work, the burst of echoes that lands during it
-   * folds into that single re-run — collapsing ~n passes to a handful (≈ seed-time / pass-time).
+   * SCHEDULE the durable work-queue reconcile loop (Stage 2 replacement for the boolean coalescer).
    *
-   * A single tracked `done` gate covers the scheduled-and-running lifetime so {@link whenIdle} (and
-   * thus {@link waitConverged}) still awaits a pending pass. The chain is idempotent + convergent, so
-   * running it fewer times — but always at least once after the final change (via `reconcileAgain` for
-   * mid-pass changes, or a fresh schedule for post-pass changes) — preserves convergence.
+   * If the loop is already running, there is nothing to do: the running iteration will check
+   * pendingChangedPaths at the top of its next iteration and pick up the newly added paths.
+   * If the loop is not running, schedule it via queueMicrotask (same timing as Stage 1) and
+   * track the ACTUAL loop promise so whenIdle/waitConverged await real work.
+   *
+   * Coalescing property preserved: a burst of observe callbacks all add to pendingChangedPaths
+   * before the microtask fires, so they fold into a single first iteration — exactly like the
+   * old reconcileAgain flag, but now tracking WHICH paths changed (plumbing for later stages).
    */
   private scheduleReconcile(): void {
-    if (this.reconcileRunning) {
-      this.reconcileAgain = true;
-      return;
-    }
-    if (this.reconcileScheduled) return;
-    this.reconcileScheduled = true;
-    const done = new Promise<void>((resolve) => {
-      this.reconcileGate = resolve;
+    // Loop already running — new paths were added to pendingChangedPaths; the running
+    // iteration will drain them at the top of its next while-iteration.
+    if (this.reconcileLoopRunning) return;
+    // queueMicrotask ensures a burst of synchronous observe callbacks all land in
+    // pendingChangedPaths before the loop fires (same timing guarantee as Stage 1).
+    this.reconcileLoopRunning = true;
+    const loopPromise = new Promise<void>((resolve, reject) => {
+      queueMicrotask(() => {
+        void this.runReconcileLoop().then(resolve, reject);
+      });
     });
-    this.track(done);
-    queueMicrotask(() => {
-      void this.runReconcilePass();
-    });
+    this.track(loopPromise);
   }
 
-  private async runReconcilePass(): Promise<void> {
-    this.reconcileScheduled = false;
-    this.reconcileRunning = true;
-    const resolveGate = this.reconcileGate;
-    this.reconcileGate = null;
+  /**
+   * Durable work-queue reconcile loop (Stage 2).
+   *
+   * Loop while pendingChangedPaths is non-empty:
+   *   1. Snapshot-and-drain pendingChangedPaths into runningBatch (the durability boundary —
+   *      observe callbacks arriving during the awaits land in pendingChangedPaths, not runningBatch).
+   *   2. Run the FULL chain (unchanged — full scans; runningBatch is collected for later stages).
+   *   3. SUCCESS: clear runningBatch; continue if pendingChangedPaths grew mid-pass.
+   *   4. THROW: re-add runningBatch to pendingChangedPaths (no-work-dropped), stop this loop, and
+   *      arm a FRESH loop in the finally (after reconcileLoopRunning is cleared) so the requeued
+   *      paths are retried; that retry's tracked promise keeps whenIdle open until it succeeds.
+   *
+   * The expected failure is handled HERE (re-queue + reschedule), so the loop promise RESOLVES
+   * cleanly and {@link track} stays resolve-only — which preserves the unhandled-rejection signal
+   * for every OTHER tracked caller (emitConflict, onWrite, etc.). Only an UNEXPECTED throw outside
+   * the inner try would reject the loop promise and surface as an unhandled rejection (a real bug).
+   *
+   * Convergence: passes are still FULL (runCatchUp + structuralReconcile + settleCleanDocs over all
+   * live entries). runningBatch is collected but not used to scope the work yet (later stages).
+   */
+  private async runReconcileLoop(): Promise<void> {
+    let needsReschedule = false;
     try {
-      do {
-        this.reconcileAgain = false;
-        await this.lazyAttach.runCatchUp(this.openDocIds());
-        await this.structuralReconcile();
-        // Clean-settle (0b-3 Fix 6) AFTER reconcile materialized disk: re-advance the synced stamp of
-        // any doc fully converged (doc==disk==index) but latched at an intermediate merge hash.
-        await this.lazyAttach.settleCleanDocs();
-        // `reconcileAgain` is set TRUE re-entrantly by scheduleReconcile() when an index change lands
-        // DURING the awaits above — TS's single-pass flow analysis can't see that cross-await mutation
-        // and wrongly reads this as always-false, hence the disable. Looping folds that change into
-        // this pass instead of spawning another (the coalescing).
-        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-      } while (this.reconcileAgain);
+      // A new observe callback adding to pendingChangedPaths while we await inside the loop is
+      // picked up by the NEXT iteration — no extra schedule needed (the loop is already running).
+      while (this.pendingChangedPaths.size > 0) {
+        // Snapshot-and-drain: transfer all pending paths into runningBatch. New observe callbacks
+        // arriving during the awaits below go into pendingChangedPaths (next iteration) — never into
+        // runningBatch. This is the durability boundary.
+        this.runningBatch = new Set(this.pendingChangedPaths);
+        this.pendingChangedPaths.clear();
+
+        try {
+          // FULL chain — unchanged from Stage 1. `this.runningBatch` is collected for later stages
+          // that will scope the work to changed docIds; for now the chain ignores it (full scans).
+          await this.lazyAttach.runCatchUp(this.openDocIds());
+          await this.structuralReconcile();
+          // Clean-settle (0b-3 Fix 6): re-advance the synced stamp of any doc fully converged
+          // (doc==disk==index) but latched at an intermediate merge hash. Runs AFTER reconcile.
+          await this.lazyAttach.settleCleanDocs();
+          // Success: clear the running batch. Loop continues if pendingChangedPaths is non-empty.
+          this.runningBatch = new Set();
+        } catch {
+          // Re-queue the failed batch so no path is dropped, then stop this loop; the fresh loop
+          // armed in the finally retries the requeued paths.
+          for (const p of this.runningBatch) this.pendingChangedPaths.add(p);
+          this.runningBatch = new Set();
+          needsReschedule = true;
+          break;
+        }
+      }
     } finally {
-      this.reconcileRunning = false;
-      resolveGate?.();
+      // Always clear the running flag here. On the error path, arm a fresh loop AFTER clearing it so
+      // scheduleReconcile sees reconcileLoopRunning === false and starts the retry with a clean flag.
+      this.reconcileLoopRunning = false;
+      if (needsReschedule) this.scheduleReconcile();
     }
   }
 
