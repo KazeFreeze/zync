@@ -35,4 +35,14 @@ describe("MemEngineState (in-memory EngineStateStore for tests)", () => {
     const store = new MemEngineState();
     expect(await store.listDirty()).toEqual([]);
   });
+
+  it("isDirty matches listDirty membership (O(1) single-doc check)", async () => {
+    const store = new MemEngineState();
+    expect(await store.isDirty(docId("d1"))).toBe(false); // unknown → false
+    await store.markDirty(docId("d1"));
+    expect(await store.isDirty(docId("d1"))).toBe(true);
+    expect(await store.isDirty(docId("d2"))).toBe(false); // other doc untouched
+    await store.clearDirty(docId("d1"));
+    expect(await store.isDirty(docId("d1"))).toBe(false);
+  });
 });

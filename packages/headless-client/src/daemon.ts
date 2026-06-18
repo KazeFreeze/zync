@@ -24,10 +24,10 @@ import type {
   VaultEvent,
 } from "@zync/core";
 import { YjsCrdtProvider, HocuspocusTransport } from "@zync/crdt-yjs";
+import { HttpBlobStore } from "@zync/blob-http";
 import { NodeFsVault } from "./adapters/node-fs-vault.js";
 import { FsDocStore } from "./adapters/fs-docstore.js";
 import { FsEngineStateStore } from "./adapters/fs-engine-state.js";
-import { HttpBlobStore } from "./adapters/http-blob-store.js";
 import { createControlApi, type DaemonState } from "./control-api.js";
 
 /** Daemon configuration. Env-derived in {@link configFromEnv}; explicit in tests. */
@@ -60,6 +60,7 @@ export interface DaemonConfig {
   serverWs: string;
   /** Base URL for the HTTP blob store. */
   serverHttp: string;
+  /** Static shared auth token (ZYNC_TOKEN) — sent to the relay AND the blob endpoint. */
   token?: string;
   port: number;
   maxProseBytes: number;
@@ -105,7 +106,7 @@ export async function createDaemon(config: DaemonConfig): Promise<Daemon> {
   const vault = new NodeFsVault(config.vaultDir);
   const docStore = new FsDocStore(config.docStoreDir);
   const engineState = await FsEngineStateStore.open(config.stateFile);
-  const blobs = new HttpBlobStore(config.serverHttp);
+  const blobs = new HttpBlobStore(config.serverHttp, config.token);
   const crdt = new YjsCrdtProvider();
   const transport = new HocuspocusTransport({
     url: config.serverWs,

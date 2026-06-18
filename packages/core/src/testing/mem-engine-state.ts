@@ -32,4 +32,8 @@ export class MemEngineState implements EngineStateStore {
   listDirty(): Promise<DocId[]> {
     return Promise.resolve([...this.dirty]);
   }
+
+  isDirty(id: DocId): Promise<boolean> {
+    return Promise.resolve(this.dirty.has(id));
+  }
 }

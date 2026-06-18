@@ -11,7 +11,8 @@
   },
   "dependencies": {
     "@zync/core": "workspace:*",
-    "@zync/crdt-yjs": "workspace:*"
+    "@zync/crdt-yjs": "workspace:*",
+    "@zync/blob-http": "workspace:*"
   },
   "devDependencies": {
     "@zync/server": "workspace:*",

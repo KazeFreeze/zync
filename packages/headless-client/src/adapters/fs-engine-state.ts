@@ -82,6 +82,10 @@ export class FsEngineStateStore implements EngineStateStore {
     return Promise.resolve([...this.dirty]);
   }
 
+  isDirty(id: DocId): Promise<boolean> {
+    return Promise.resolve(this.dirty.has(id));
+  }
+
   // ---------------------------------------------------------------------------
   // Internal persistence (atomic write)
   // ---------------------------------------------------------------------------

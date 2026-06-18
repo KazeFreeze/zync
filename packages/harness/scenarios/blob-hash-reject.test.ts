@@ -17,7 +17,7 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { beforeAll, expect, test } from "vitest";
-import { resetStack, SERVER_BLOB_BASE } from "../src/harness.js";
+import { blobAuthHeader, resetStack, SERVER_BLOB_BASE } from "../src/harness.js";
 
 const sha256Hex = (bytes: Uint8Array): string =>
   createHash("sha256").update(Buffer.from(bytes)).digest("hex");
@@ -25,7 +25,10 @@ const sha256Hex = (bytes: Uint8Array): string =>
 async function putBlob(shaPath: string, body: Uint8Array): Promise<number> {
   const res = await fetch(`${SERVER_BLOB_BASE}/blob/${shaPath}`, {
     method: "PUT",
-    headers: { "Content-Type": "application/octet-stream" },
+    // Authorized: this scenario tests hash-on-write / sha-validation, NOT auth — so it
+    // must clear the auth gate (the endpoint now 401s without a token). The malformed-sha
+    // cases still get 400 because auth passes first, THEN sha validation runs.
+    headers: { "Content-Type": "application/octet-stream", ...blobAuthHeader },
     body: Buffer.from(body),
   });
   // Drain the body so the socket is released promptly.

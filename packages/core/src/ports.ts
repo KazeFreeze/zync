@@ -127,6 +127,13 @@ export interface EngineStateStore {
   markDirty(id: DocId): Promise<void>;
   clearDirty(id: DocId): Promise<void>;
   listDirty(): Promise<DocId[]>;
+  /**
+   * Whether a SINGLE doc is dirty — an O(1) membership check. Equivalent to
+   * `(await listDirty()).includes(id)` but without materializing/scanning the whole dirty set:
+   * `reconcileDirtyDoc` runs this per attached doc during catch-up, where `listDirty()` on the IDB
+   * store is a full cursor scan → O(n) per note → O(n^2) over a first sync of an n-note vault.
+   */
+  isDirty(id: DocId): Promise<boolean>;
 }
 export interface ClockPort {
   now(): number;

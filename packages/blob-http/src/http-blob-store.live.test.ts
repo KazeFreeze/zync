@@ -1,11 +1,12 @@
 /**
- * Live HttpBlobStore ↔ real blob endpoint conformance (Phase 0b-3, Task 3).
+ * Live HttpBlobStore ↔ real blob endpoint conformance.
  *
  * The sibling `http-blob-store.test.ts` exercises the client against a hand-rolled fake server.
  * THIS suite points the SAME real {@link HttpBlobStore} at the REAL `createBlobHandler` from
  * `@zync/server` (the production blob endpoint), in-process on an ephemeral port — proving the
  * client honors the same contract over the real wire, including the SERVER-SIDE guarantees the fake
- * doesn't implement: hash-on-write rejection (400) and strict sha256 validation (400).
+ * doesn't implement: hash-on-write rejection (400), strict sha256 validation (400), and (last
+ * describe) Bearer-token auth (401) enforced across HEAD/GET/PUT.
  *
  * Backend: an in-memory Map `BlobBackend` (the S3BlobStore-over-MinIO live path needs MinIO via
  * Docker and is DEFERRED to a later task). The Map backend lets us inject a tampered key whose
@@ -63,9 +64,10 @@ interface LiveBlobServer {
   backend: MapBlobBackend;
 }
 
-async function startLiveBlobServer(): Promise<LiveBlobServer> {
+async function startLiveBlobServer(opts: { token?: string } = {}): Promise<LiveBlobServer> {
   const backend = new MapBlobBackend();
-  const server = http.createServer(createBlobHandler(backend));
+  const handlerOpts = opts.token !== undefined ? { token: opts.token } : {};
+  const server = http.createServer(createBlobHandler(backend, handlerOpts));
   await new Promise<void>((resolve, reject) => {
     server.on("error", reject);
     server.listen(0, "127.0.0.1", () => {
@@ -79,6 +81,16 @@ async function startLiveBlobServer(): Promise<LiveBlobServer> {
   return { server, backend, baseUrl: `http://127.0.0.1:${String(addr.port)}` };
 }
 
+async function closeLiveServer(s: LiveBlobServer): Promise<void> {
+  s.server.closeAllConnections();
+  await new Promise<void>((resolve, reject) => {
+    s.server.close((err) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+}
+
 let live: LiveBlobServer;
 let store: HttpBlobStore;
 
@@ -88,13 +100,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  live.server.closeAllConnections();
-  await new Promise<void>((resolve, reject) => {
-    live.server.close((err) => {
-      if (err) reject(err);
-      else resolve();
-    });
-  });
+  await closeLiveServer(live);
 });
 
 describe("HttpBlobStore ↔ real blob endpoint [live] — round-trip", () => {
@@ -179,5 +185,61 @@ describe("HttpBlobStore ↔ real blob endpoint [live] — server hash-on-write &
 
     // The client surfaces the malformed-sha 400 as a thrown error from put().
     await expect(store.put("ABCDEF" as Sha256, body)).rejects.toThrow(/400/);
+  });
+});
+
+describe("HttpBlobStore ↔ real blob endpoint [live] — Bearer-token auth", () => {
+  const TOKEN = "live-static-token";
+  let authed: LiveBlobServer;
+
+  beforeAll(async () => {
+    authed = await startLiveBlobServer({ token: TOKEN });
+  });
+
+  afterAll(async () => {
+    await closeLiveServer(authed);
+  });
+
+  it("a token-bearing client round-trips through the real authed endpoint", async () => {
+    const client = new HttpBlobStore(authed.baseUrl, TOKEN);
+    const data = new TextEncoder().encode("authed live content");
+    const sha = await sha256OfBytes(data);
+
+    expect(await client.has(sha)).toBe(false);
+    await client.put(sha, data);
+    expect(await client.has(sha)).toBe(true);
+    expect(await client.get(sha)).toEqual(data);
+  });
+
+  it("the real endpoint rejects a missing token with 401 on HEAD/GET/PUT", async () => {
+    const body = new Uint8Array([1, 2, 3]);
+    const sha = await sha256OfBytes(body);
+
+    for (const method of ["HEAD", "GET"] as const) {
+      const res = await fetch(`${authed.baseUrl}/blob/${sha}`, { method });
+      void res.body?.cancel();
+      expect(res.status).toBe(401);
+    }
+    const put = await fetch(`${authed.baseUrl}/blob/${sha}`, {
+      method: "PUT",
+      body,
+      headers: { "Content-Type": "application/octet-stream" },
+    });
+    void put.body?.cancel();
+    expect(put.status).toBe(401);
+  });
+
+  it("the real endpoint rejects a wrong token with 401", async () => {
+    const res = await fetch(`${authed.baseUrl}/blob/${"a".repeat(64)}`, {
+      method: "HEAD",
+      headers: { Authorization: "Bearer wrong-token" },
+    });
+    void res.body?.cancel();
+    expect(res.status).toBe(401);
+  });
+
+  it("a tokenless HttpBlobStore surfaces the 401 as a throw (not blob-absent)", async () => {
+    const anon = new HttpBlobStore(authed.baseUrl); // no token
+    await expect(anon.has("a".repeat(64) as Sha256)).rejects.toThrow(/401/);
   });
 });

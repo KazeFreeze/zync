@@ -8,18 +8,21 @@
  *                                              | 413 (body exceeds maxBodyBytes)
  *
  * Security:
+ *   - Auth (Phase 1): when a token is configured, EVERY verb (HEAD/GET/PUT)
+ *     requires `Authorization: Bearer <token>`; a missing/wrong token yields 401
+ *     (checked BEFORE sha validation or body read, so an unauthorized PUT never
+ *     streams a body). When NO token is configured the endpoint is open (the
+ *     pre-auth behavior) — used by the in-memory unit tests. M1 uses one static
+ *     token shared with the relay; per-device tokens are M4.
  *   - sha256 segment is strictly validated: must be exactly 64 lowercase hex chars.
  *   - PUT hash-on-write: sha256(body) is computed and MUST equal the :sha256 path
  *     segment. Rejects mislabeled or poisoned blobs with 400.
- *   - Body size is capped at maxBodyBytes (default 100 MB) to prevent OOM on an
- *     unauthenticated endpoint. Exceeding the cap yields 413 and destroys the
- *     request socket so the OS reclaims the connection promptly.
+ *   - Body size is capped at maxBodyBytes (default 100 MB) to prevent OOM.
+ *     Exceeding the cap yields 413 and destroys the request socket so the OS
+ *     reclaims the connection promptly.
  *
  * The blob backend is injectable (BlobBackend) so tests can pass an in-memory
  * Map-based fake and production wires in S3BlobStore.
- *
- * Auth: blob endpoint auth is DEFERRED to Phase 1. The current HttpBlobStore
- * client sends no Authorization header, so no auth is applied here.
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -109,20 +112,27 @@ function readBody(req: IncomingMessage, res: ServerResponse, maxBytes: number): 
 export interface BlobHandlerOptions {
   /** Maximum PUT body size in bytes. Defaults to DEFAULT_MAX_BODY_BYTES (100 MB). */
   maxBodyBytes?: number;
+  /**
+   * Static auth token. When set (non-empty), every verb requires
+   * `Authorization: Bearer <token>` (401 otherwise). When omitted, the endpoint
+   * is open (pre-auth behavior — used by the in-memory unit tests).
+   */
+  token?: string;
 }
 
 /**
  * Create a node:http-compatible request handler for the blob endpoint.
  * @param backend — injectable blob storage (in-memory for tests, S3 for prod).
- * @param opts    — optional config (maxBodyBytes for tests that need a low cap).
+ * @param opts    — optional config (maxBodyBytes, token).
  */
 export function createBlobHandler(
   backend: BlobBackend,
   opts: BlobHandlerOptions = {},
 ): (req: IncomingMessage, res: ServerResponse) => void {
   const maxBodyBytes = opts.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
+  const token = opts.token;
   return function blobHandler(req: IncomingMessage, res: ServerResponse): void {
-    void handleBlobRequest(req, res, backend, maxBodyBytes);
+    void handleBlobRequest(req, res, backend, maxBodyBytes, token);
   };
 }
 
@@ -131,10 +141,24 @@ async function handleBlobRequest(
   res: ServerResponse,
   backend: BlobBackend,
   maxBodyBytes: number,
+  token: string | undefined,
 ): Promise<void> {
   try {
     const url = req.url ?? "";
     const method = req.method ?? "GET";
+
+    // CORS: the Obsidian plugin fetches this endpoint from the `app://obsidian.md` origin — a cross-origin
+    // request that, with the Authorization header, triggers a preflight. Send the headers on every response
+    // and answer the preflight OPTIONS, which carries NO Authorization and so must bypass the auth gate.
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, PUT, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+    res.setHeader("Access-Control-Max-Age", "86400");
+    if (method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
 
     // Route: /blob/:sha256
     const match = /^\/blob\/([^/?#]+)$/.exec(url);
@@ -142,6 +166,18 @@ async function handleBlobRequest(
       res.writeHead(404);
       res.end();
       return;
+    }
+
+    // Auth gate (when a token is configured): every blob verb requires a matching
+    // Bearer. Checked BEFORE sha validation / body read so an unauthorized PUT
+    // never streams a body; drain any sent body so the keep-alive socket stays clean.
+    if (token !== undefined && token !== "") {
+      if (req.headers.authorization !== `Bearer ${token}`) {
+        res.writeHead(401);
+        res.end();
+        req.resume();
+        return;
+      }
     }
 
     const sha = match[1] ?? "";

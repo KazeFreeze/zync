@@ -58,6 +58,18 @@ export type DeviceName = "device-a" | "device-b" | "device-c" | "device-proj";
  */
 export const SERVER_BLOB_BASE = "http://localhost:18080";
 
+/**
+ * The static auth token the compose stack shares across the relay + blob endpoint
+ * + every device (`ZYNC_TOKEN` in docker-compose.yml). Direct-fetch blob scenarios
+ * must send `Authorization: Bearer ${SERVER_TOKEN}` — the endpoint 401s without it.
+ */
+export const SERVER_TOKEN = "dev-static-token";
+
+/** Auth header object for direct fetches at the blob endpoint. */
+export const blobAuthHeader: Readonly<Record<string, string>> = {
+  Authorization: `Bearer ${SERVER_TOKEN}`,
+};
+
 // ── control-API response shapes (the slices the harness reads) ──────────────
 
 /** `GET /fs/tree` → path → content digest. The convergence-assertion surface. */

@@ -44,13 +44,16 @@ function sha256(data: Buffer | Uint8Array): string {
 interface FetchOpts {
   method?: string;
   body?: Buffer | null;
+  headers?: Record<string, string>;
 }
 
 async function startTestServer(
   backend: BlobBackend,
-  opts: { maxBodyBytes?: number } = {},
+  opts: { maxBodyBytes?: number; token?: string } = {},
 ): Promise<{ baseUrl: string; close: () => Promise<void> }> {
-  const handlerOpts = opts.maxBodyBytes !== undefined ? { maxBodyBytes: opts.maxBodyBytes } : {};
+  const handlerOpts: { maxBodyBytes?: number; token?: string } = {};
+  if (opts.maxBodyBytes !== undefined) handlerOpts.maxBodyBytes = opts.maxBodyBytes;
+  if (opts.token !== undefined) handlerOpts.token = opts.token;
   const handler = createBlobHandler(backend, handlerOpts);
   const server = http.createServer(handler);
 
@@ -71,8 +74,8 @@ async function startTestServer(
 
 async function req(
   url: string,
-  { method = "GET", body = null }: FetchOpts = {},
-): Promise<{ status: number; body: Buffer }> {
+  { method = "GET", body = null, headers = {} }: FetchOpts = {},
+): Promise<{ status: number; body: Buffer; headers: http.IncomingHttpHeaders }> {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
     const options: http.RequestOptions = {
@@ -80,6 +83,7 @@ async function req(
       port: parsed.port,
       path: parsed.pathname,
       method,
+      headers,
     };
     const r = http.request(options, (res) => {
       const chunks: Buffer[] = [];
@@ -88,6 +92,7 @@ async function req(
         resolve({
           status: res.statusCode ?? 0,
           body: Buffer.concat(chunks),
+          headers: res.headers,
         }),
       );
     });
@@ -330,5 +335,128 @@ describe("file-endpoint blob handler — body size cap", () => {
 
     const res = await req(`${baseUrl}/blob/${sha}`, { method: "PUT", body: data });
     expect(res.status).toBe(201);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Auth tests — server configured with a static token. Every verb requires
+// `Authorization: Bearer <token>`; checked before sha validation / body read.
+// ---------------------------------------------------------------------------
+
+describe("file-endpoint blob handler — Bearer-token auth", () => {
+  const TOKEN = "unit-static-token";
+  let baseUrl: string;
+  let backend: BlobBackend;
+  let close: () => Promise<void>;
+
+  const authed = (extra: Record<string, string> = {}): Record<string, string> => ({
+    authorization: `Bearer ${TOKEN}`,
+    ...extra,
+  });
+
+  beforeEach(async () => {
+    backend = makeMemBackend();
+    const server = await startTestServer(backend, { token: TOKEN });
+    baseUrl = server.baseUrl;
+    close = server.close;
+  });
+
+  afterEach(async () => {
+    await close();
+  });
+
+  it("a correct Bearer token round-trips PUT → GET → HEAD", async () => {
+    const data = Buffer.from("authed blob content");
+    const sha = sha256(data);
+
+    expect(
+      (await req(`${baseUrl}/blob/${sha}`, { method: "PUT", body: data, headers: authed() }))
+        .status,
+    ).toBe(201);
+    expect((await req(`${baseUrl}/blob/${sha}`, { headers: authed() })).status).toBe(200);
+    expect(
+      (await req(`${baseUrl}/blob/${sha}`, { method: "HEAD", headers: authed() })).status,
+    ).toBe(200);
+  });
+
+  it("a missing token is rejected with 401 on HEAD/GET/PUT (before sha validation)", async () => {
+    const data = Buffer.from("x");
+    const sha = sha256(data);
+    expect((await req(`${baseUrl}/blob/${sha}`, { method: "HEAD" })).status).toBe(401);
+    expect((await req(`${baseUrl}/blob/${sha}`, { method: "GET" })).status).toBe(401);
+    expect((await req(`${baseUrl}/blob/${sha}`, { method: "PUT", body: data })).status).toBe(401);
+  });
+
+  it("a wrong token is rejected with 401", async () => {
+    const sha = "a".repeat(64);
+    expect(
+      (
+        await req(`${baseUrl}/blob/${sha}`, {
+          method: "HEAD",
+          headers: { authorization: "Bearer nope" },
+        })
+      ).status,
+    ).toBe(401);
+  });
+
+  it("auth is checked BEFORE sha validation (a malformed sha without a token is 401, not 400)", async () => {
+    // Unauthorized callers must not learn anything about path validity.
+    expect((await req(`${baseUrl}/blob/${"A".repeat(64)}`, { method: "HEAD" })).status).toBe(401);
+    expect((await req(`${baseUrl}/blob/tooshort`, { method: "HEAD" })).status).toBe(401);
+  });
+
+  it("an authorized but malformed sha still gets the normal 400", async () => {
+    expect(
+      (await req(`${baseUrl}/blob/${"A".repeat(64)}`, { method: "HEAD", headers: authed() }))
+        .status,
+    ).toBe(400);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CORS — the Obsidian plugin fetches this endpoint from the app://obsidian.md
+// origin (cross-origin; the Authorization header forces a preflight). The blob
+// endpoint MUST answer the OPTIONS preflight + send Access-Control-Allow-Origin
+// on every response, or the browser blocks the fetch (real-Obsidian-only bug).
+// ---------------------------------------------------------------------------
+
+describe("file-endpoint blob handler — CORS", () => {
+  const TOKEN = "cors-token";
+  let baseUrl: string;
+  let close: () => Promise<void>;
+
+  beforeEach(async () => {
+    const server = await startTestServer(makeMemBackend(), { token: TOKEN });
+    baseUrl = server.baseUrl;
+    close = server.close;
+  });
+
+  afterEach(async () => {
+    await close();
+  });
+
+  it("answers the OPTIONS preflight with 204 + CORS headers, WITHOUT requiring auth", async () => {
+    const res = await req(`${baseUrl}/blob/${"a".repeat(64)}`, { method: "OPTIONS" }); // no Authorization
+    expect(res.status).toBe(204);
+    expect(res.headers["access-control-allow-origin"]).toBe("*");
+    expect(String(res.headers["access-control-allow-methods"])).toContain("HEAD");
+    expect(String(res.headers["access-control-allow-headers"]).toLowerCase()).toContain(
+      "authorization",
+    );
+  });
+
+  it("sends Access-Control-Allow-Origin on a normal authed response", async () => {
+    const res = await req(`${baseUrl}/blob/${"b".repeat(64)}`, {
+      method: "HEAD",
+      headers: { authorization: `Bearer ${TOKEN}` },
+    });
+    expect(res.status).toBe(404); // absent blob, but the CORS header is still present
+    expect(res.headers["access-control-allow-origin"]).toBe("*");
+  });
+
+  it("sends Access-Control-Allow-Origin even on a 401 (so the browser sees the real status)", async () => {
+    const res = await req(`${baseUrl}/blob/${"c".repeat(64)}`, { method: "HEAD" }); // no auth → 401
+    expect(res.status).toBe(401);
+    expect(res.headers["access-control-allow-origin"]).toBe("*");
   });
 });

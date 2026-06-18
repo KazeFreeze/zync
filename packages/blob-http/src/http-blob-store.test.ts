@@ -6,19 +6,37 @@ import { HttpBlobStore } from "./http-blob-store.js";
 
 // ---------------------------------------------------------------------------
 // Tiny in-process blob server (Map-backed, no external deps)
+//
+// `requireToken`: when set, the server enforces `Authorization: Bearer <token>`
+// on every verb (401 otherwise) — used by the auth tests. `lastAuth` records the
+// Authorization header of the most recent request so the client-sends-it tests
+// can assert what HttpBlobStore actually transmitted.
 // ---------------------------------------------------------------------------
 
 interface BlobServerHandle {
   server: http.Server;
   baseUrl: string;
   injectTampered(sha: string, bytes: Buffer): void;
+  lastAuth(): string | undefined;
 }
 
-function startBlobServer(): Promise<BlobServerHandle> {
+function startBlobServer(opts: { requireToken?: string } = {}): Promise<BlobServerHandle> {
   const blobs = new Map<string, Buffer>();
   const tampered = new Map<string, Buffer>(); // sha → wrong bytes
+  let lastAuth: string | undefined;
 
   const server = http.createServer((req, res) => {
+    lastAuth = req.headers.authorization;
+
+    if (
+      opts.requireToken !== undefined &&
+      req.headers.authorization !== `Bearer ${opts.requireToken}`
+    ) {
+      res.writeHead(401).end();
+      req.resume(); // drain any unauthorized body so the socket stays clean
+      return;
+    }
+
     const urlPath = req.url ?? "";
     const match = /^\/blob\/([0-9a-f]+)$/.exec(urlPath);
     if (match === null) {
@@ -69,13 +87,14 @@ function startBlobServer(): Promise<BlobServerHandle> {
         server,
         baseUrl: `http://127.0.0.1:${String(port)}`,
         injectTampered: (sha, bytes) => tampered.set(sha, bytes),
+        lastAuth: () => lastAuth,
       });
     });
   });
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Tests (no-auth server)
 // ---------------------------------------------------------------------------
 
 let handle: BlobServerHandle;
@@ -148,5 +167,58 @@ describe("HttpBlobStore — hash verification on get()", () => {
 describe("HttpBlobStore — error handling", () => {
   it("get() throws for a blob that does not exist on the server", async () => {
     await expect(store.get("a".repeat(64) as Sha256)).rejects.toThrow();
+  });
+
+  it("no token configured → no Authorization header is sent", async () => {
+    await store.has("0".repeat(64) as Sha256);
+    expect(handle.lastAuth()).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Auth tests (token-enforcing server)
+// ---------------------------------------------------------------------------
+
+describe("HttpBlobStore — Bearer-token auth", () => {
+  const TOKEN = "s3cr3t-static-token";
+  let authHandle: BlobServerHandle;
+
+  beforeAll(async () => {
+    authHandle = await startBlobServer({ requireToken: TOKEN });
+  });
+
+  afterAll(() => {
+    authHandle.server.close();
+  });
+
+  it("sends `Authorization: Bearer <token>` on put/has/get when constructed with a token", async () => {
+    const authed = new HttpBlobStore(authHandle.baseUrl, TOKEN);
+    const data = new TextEncoder().encode("authed content");
+    const hash = await sha256OfBytes(data);
+
+    await authed.put(hash, data);
+    expect(authHandle.lastAuth()).toBe(`Bearer ${TOKEN}`);
+
+    expect(await authed.has(hash)).toBe(true);
+    expect(authHandle.lastAuth()).toBe(`Bearer ${TOKEN}`);
+
+    await authed.get(hash);
+    expect(authHandle.lastAuth()).toBe(`Bearer ${TOKEN}`);
+  });
+
+  it("a tokenless client is rejected (401 surfaces as a throw, NOT a blob-absent false/404)", async () => {
+    const anon = new HttpBlobStore(authHandle.baseUrl); // no token
+    const data = new TextEncoder().encode("rejected content");
+    const hash = await sha256OfBytes(data);
+
+    // has() must NOT swallow 401 as "absent: false" — it must throw.
+    await expect(anon.has(hash)).rejects.toThrow(/401/);
+    await expect(anon.put(hash, data)).rejects.toThrow(/401/);
+    await expect(anon.get(hash)).rejects.toThrow(/401/);
+  });
+
+  it("a wrong-token client is rejected (401)", async () => {
+    const wrong = new HttpBlobStore(authHandle.baseUrl, "not-the-token");
+    await expect(wrong.has("0".repeat(64) as Sha256)).rejects.toThrow(/401/);
   });
 });

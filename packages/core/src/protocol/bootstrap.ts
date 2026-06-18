@@ -92,13 +92,16 @@ export async function applyBootstrap(
   const hasServerDoc = treeStamp !== null;
   const hasLocalFile = localText !== null;
   const baseExists = await deps.baseExists(docId);
+  // Hashed once and reused (localEqualsServer + the converge offline-drift check below).
+  const localHash = localText !== null ? await sha256OfText(localText) : null;
   // localEqualsServer compares the LOCAL file hash to the HASH PART of the tree stamp
   // (the index alone — the relay is content-blind). When true, both treeStamp and
   // localText are necessarily non-null (TS narrows them via this `&&`).
   const localEqualsServer =
     treeStamp !== null &&
     localText !== null &&
-    (await sha256OfText(localText)) === stampHash(treeStamp);
+    localHash !== null &&
+    localHash === stampHash(treeStamp);
 
   const decision = bootstrapDecision({
     hasServerDoc,
@@ -134,8 +137,8 @@ export async function applyBootstrap(
       // `localEqualsServer` already implies treeStamp/localText are non-null.
       if (localEqualsServer) {
         // The server ALREADY has this exact content (byte-identical adopt), so it is
-        // relay-acked — advance BOTH bases (0b-3 crash-window no-loss).
-        const localHash = await sha256OfText(localText);
+        // relay-acked — advance BOTH bases (0b-3 crash-window no-loss). localText/localHash are
+        // narrowed non-null by the localEqualsServer `&&` chain.
         await deps.base.save(docId, {
           baseText: localText,
           fileHash: localHash,
@@ -153,9 +156,27 @@ export async function applyBootstrap(
     case "supervised-import":
       // No base merge here. Task 13 attaches, then calls supervisedImport.
       return { decision, needsAttach: true };
-    case "converge":
+    case "converge": {
+      // OFFLINE-DRIFT RECOVERY (GUI #3 — plugin-disabled / out-of-band edit). bootstrapDecision
+      // collapses every base-exists path to "converge", whose only normal question is "is the index
+      // ahead of my disk?" (needsAttach = !localEqualsServer). But a note edited while the engine was
+      // DOWN (plugin disabled, external tool, any write the watcher missed) fired no "modify" event,
+      // so its DISK can hold a local edit the engine NEVER ingested. Plain converge would then attach
+      // and materialize the relay's version straight OVER that un-ingested edit — a silent loss. The
+      // tell is disk≠base: the on-disk hash differs from the base THIS device last reconciled (NOT the
+      // index stamp — a peer's concurrent edit legitimately advances the index). Mark the doc dirty so
+      // the catch-up attach runs reconcileDirtyDoc's 3-way merge (merge3(ackedBase, disk, crdt)) and
+      // the offline edit MERGES with any concurrent remote edit instead of being clobbered. Steady-
+      // state restarts (disk==base) are untouched, so this never spuriously re-pushes.
+      if (localHash !== null) {
+        const baseRec = await deps.base.load(docId);
+        if (baseRec !== null && baseRec.fileHash !== localHash) {
+          await deps.engineState.markDirty(docId);
+        }
+      }
       // Steady state: attach iff the tree stamp's hash differs from the local file's hash.
       return { decision, needsAttach: !localEqualsServer };
+    }
     case "none":
       return { decision, needsAttach: false };
   }

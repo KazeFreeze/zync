@@ -19,18 +19,6 @@ export const TEXT_NAME = "content";
 const EDIT_ORIGINS: readonly EditOrigin[] = ["local-editor", "local-bridge", "remote"];
 
 /**
- * Map a Yjs transaction origin back to an {@link EditOrigin}. When a doc edit/update
- * carries one of our own origin strings we pass it through; any foreign origin
- * (e.g. a CodeMirror binding's own origin object) looks `"remote"` to the engine.
- *
- * NOTE: Task 6 revisits binding-origin tagging so editor-bound transactions can be
- * distinguished from true remote updates; until then they intentionally read as remote.
- */
-function toEditOrigin(origin: unknown): EditOrigin {
-  return EDIT_ORIGINS.includes(origin as EditOrigin) ? (origin as EditOrigin) : "remote";
-}
-
-/**
  * Yjs-backed {@link CrdtDoc}. Exposes the underlying {@link Y.Doc} as `yDoc` so infrastructure
  * adapters in THIS package (e.g. the Hocuspocus transport, the CodeMirror binding) can bind the
  * same document. Core never sees `yDoc` — it works through the {@link CrdtDoc} port only.
@@ -39,6 +27,16 @@ export class YjsCrdtDoc implements CrdtDoc {
   readonly id: DocId;
   readonly yDoc: Y.Doc;
   private readonly doc: Y.Doc;
+  /**
+   * Transaction-origin objects that represent a LOCAL EDITOR binding (e.g. a y-codemirror
+   * `YSyncConfig`). An update whose Yjs origin is one of these is classified `"local-editor"` so the
+   * engine treats live editor keystrokes as local UNACKED edits — NOT relay-acked remote content
+   * (which would advance the acked base early and risk losing edits on an offline/crash window). The
+   * binding registers its origin here via {@link markEditorOrigin} and clears it on destroy. A Set
+   * because a doc may be bound to several editor panes at once. Identity-based on purpose: this keeps
+   * `crdt.ts` free of any y-codemirror import (which would drag `@codemirror/*` into the headless daemon).
+   */
+  private readonly editorOrigins = new Set<object>();
 
   constructor(id: DocId, doc: Y.Doc) {
     this.id = id;
@@ -48,6 +46,34 @@ export class YjsCrdtDoc implements CrdtDoc {
 
   private text(): Y.Text {
     return this.doc.getText(TEXT_NAME);
+  }
+
+  /** Register a transaction-origin object as a local-editor binding (see {@link editorOrigins}). */
+  markEditorOrigin(origin: object): void {
+    this.editorOrigins.add(origin);
+  }
+
+  /** Unregister a previously {@link markEditorOrigin}'d origin (call on binding destroy). */
+  unmarkEditorOrigin(origin: object): void {
+    this.editorOrigins.delete(origin);
+  }
+
+  /** Number of registered editor-origin bindings (observability; used in tests). */
+  get editorOriginCount(): number {
+    return this.editorOrigins.size;
+  }
+
+  /**
+   * Map a Yjs transaction origin to an {@link EditOrigin}: our own origin STRINGS pass through; a
+   * registered editor-origin OBJECT reads `"local-editor"`; any other foreign origin (e.g. the
+   * Hocuspocus provider applying a remote update) reads `"remote"`.
+   */
+  private classifyOrigin(origin: unknown): EditOrigin {
+    if (EDIT_ORIGINS.includes(origin as EditOrigin)) return origin as EditOrigin;
+    if (typeof origin === "object" && origin !== null && this.editorOrigins.has(origin)) {
+      return "local-editor";
+    }
+    return "remote";
   }
 
   getText(): string {
@@ -88,7 +114,7 @@ export class YjsCrdtDoc implements CrdtDoc {
 
   onUpdate(cb: (update: Uint8Array, origin: EditOrigin) => void): Unsubscribe {
     const handler = (update: Uint8Array, origin: unknown): void => {
-      cb(update, toEditOrigin(origin));
+      cb(update, this.classifyOrigin(origin));
     };
     this.doc.on("update", handler);
     return () => {

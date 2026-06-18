@@ -4,6 +4,10 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+overrides:
+  '@codemirror/state': 6.5.0
+  '@codemirror/view': 6.38.6
+
 importers:
 
   .:
@@ -36,6 +40,16 @@ importers:
         specifier: ^2.1.0
         version: 2.1.9(@types/node@25.9.3)
 
+  packages/blob-http:
+    dependencies:
+      '@zync/core':
+        specifier: workspace:*
+        version: link:../core
+    devDependencies:
+      '@zync/server':
+        specifier: workspace:*
+        version: link:../server
+
   packages/core:
     dependencies:
       diff-match-patch:
@@ -59,7 +73,7 @@ importers:
         version: link:../core
       y-codemirror.next:
         specifier: ^0.3.5
-        version: 0.3.5(@codemirror/state@6.6.0)(@codemirror/view@6.43.1)(yjs@13.6.31)
+        version: 0.3.5(@codemirror/state@6.5.0)(@codemirror/view@6.38.6)(yjs@13.6.31)
       y-protocols:
         specifier: ^1.0.6
         version: 1.0.7(yjs@13.6.31)
@@ -68,11 +82,11 @@ importers:
         version: 13.6.31
     devDependencies:
       '@codemirror/state':
-        specifier: ^6.4.0
-        version: 6.6.0
+        specifier: 6.5.0
+        version: 6.5.0
       '@codemirror/view':
-        specifier: ^6.30.0
-        version: 6.43.1
+        specifier: 6.38.6
+        version: 6.38.6
       '@types/node':
         specifier: ^22.0.0
         version: 22.19.21
@@ -98,8 +112,36 @@ importers:
         specifier: ^2.1.0
         version: 2.1.9(@types/node@22.19.21)
 
+  packages/harness/idb-bench:
+    dependencies:
+      idb:
+        specifier: ^8.0.3
+        version: 8.0.3
+      y-indexeddb:
+        specifier: ^9.0.12
+        version: 9.0.12(yjs@13.6.31)
+      yjs:
+        specifier: ^13.6.0
+        version: 13.6.31
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.19.21
+      esbuild:
+        specifier: ^0.24.2
+        version: 0.24.2
+      playwright:
+        specifier: ^1.54.0
+        version: 1.61.0
+      typescript:
+        specifier: ^5.6.0
+        version: 5.9.3
+
   packages/headless-client:
     dependencies:
+      '@zync/blob-http':
+        specifier: workspace:*
+        version: link:../blob-http
       '@zync/core':
         specifier: workspace:*
         version: link:../core
@@ -116,34 +158,31 @@ importers:
 
   packages/plugin:
     dependencies:
-      '@hocuspocus/provider':
-        specifier: ^2.15.0
-        version: 2.15.3(y-protocols@1.0.7(yjs@13.6.31))(yjs@13.6.31)
-      y-codemirror.next:
-        specifier: ^0.3.5
-        version: 0.3.5(@codemirror/state@6.6.0)(@codemirror/view@6.43.1)(yjs@13.6.31)
-      y-indexeddb:
-        specifier: ^9.0.12
-        version: 9.0.12(yjs@13.6.31)
-      y-protocols:
-        specifier: ^1.0.6
-        version: 1.0.7(yjs@13.6.31)
-      yjs:
-        specifier: ^13.6.0
-        version: 13.6.31
+      '@zync/blob-http':
+        specifier: workspace:*
+        version: link:../blob-http
+      '@zync/core':
+        specifier: workspace:*
+        version: link:../core
+      '@zync/crdt-yjs':
+        specifier: workspace:*
+        version: link:../crdt-yjs
+      '@zync/store-idb':
+        specifier: workspace:*
+        version: link:../store-idb
+      '@zync/vault-obsidian':
+        specifier: workspace:*
+        version: link:../vault-obsidian
     devDependencies:
-      '@codemirror/state':
-        specifier: ^6.4.0
-        version: 6.6.0
-      '@codemirror/view':
-        specifier: ^6.30.0
-        version: 6.43.1
+      builtin-modules:
+        specifier: ^4.0.0
+        version: 4.0.0
       esbuild:
         specifier: ^0.24.0
         version: 0.24.2
       obsidian:
-        specifier: ^1.7.2
-        version: 1.13.1(@codemirror/state@6.6.0)(@codemirror/view@6.43.1)
+        specifier: ^1.8.8
+        version: 1.13.1(@codemirror/state@6.5.0)(@codemirror/view@6.38.6)
 
   packages/server:
     dependencies:
@@ -169,6 +208,38 @@ importers:
       tsx:
         specifier: ^4.19.0
         version: 4.22.4
+
+  packages/store-idb:
+    dependencies:
+      '@zync/core':
+        specifier: workspace:*
+        version: link:../core
+      idb:
+        specifier: ^8.0.3
+        version: 8.0.3
+    devDependencies:
+      fake-indexeddb:
+        specifier: ^6.0.0
+        version: 6.2.5
+
+  packages/vault-obsidian:
+    dependencies:
+      '@zync/core':
+        specifier: workspace:*
+        version: link:../core
+      '@zync/crdt-yjs':
+        specifier: workspace:*
+        version: link:../crdt-yjs
+    devDependencies:
+      '@codemirror/state':
+        specifier: 6.5.0
+        version: 6.5.0
+      '@codemirror/view':
+        specifier: 6.38.6
+        version: 6.38.6
+      obsidian:
+        specifier: ^1.8.8
+        version: 1.13.1(@codemirror/state@6.5.0)(@codemirror/view@6.38.6)
 
 packages:
 
@@ -283,11 +354,11 @@ packages:
     resolution: {integrity: sha512-qehxGkRj55h/ff8EMaJ+cYhyaKlHIxqYDn682wQD7RNp9UujOQsHog2uS0r2vzr4pW+sXf90NeeayjcNaX3fFg==}
     engines: {node: '>=6.9.0'}
 
-  '@codemirror/state@6.6.0':
-    resolution: {integrity: sha512-4nbvra5R5EtiCzr9BTHiTLc+MLXK2QGiAVYMyi8PkQd3SR+6ixar/Q/01Fa21TBIDOZXgeWV4WppsQolSreAPQ==}
+  '@codemirror/state@6.5.0':
+    resolution: {integrity: sha512-MwBHVK60IiIHDcoMet78lxt6iw5gJOGSbNbOIVBHWVXIH4/Nq1+GQgLLGgI1KlnN86WDXsPudVaqYHKBIx7Eyw==}
 
-  '@codemirror/view@6.43.1':
-    resolution: {integrity: sha512-+BIjw/AG3tDQ4pJgTLPYdAW25eDE66YsvM4LKyVPgGzVgZ4a9Wj1SRX8kPVKgBDdPt8oHtZ15F0qx7p0oOHdHw==}
+  '@codemirror/view@6.38.6':
+    resolution: {integrity: sha512-qiS0z1bKs5WOvHIAC0Cybmv4AJSkAXgX5aD6Mqd2epSLlVJsQl8NG23jCVouIgkh4All/mrbdsf2UOLFnJw0tw==}
 
   '@commitlint/cli@19.8.1':
     resolution: {integrity: sha512-LXUdNIkspyxrlV6VDHWBmCZRtkEVRpBKxi2Gtw3J54cGWhLCTouVD/Q6ZSaSvd2YaDObWK8mDjrz3TIKtaQMAA==}
@@ -1256,6 +1327,10 @@ packages:
     resolution: {integrity: sha512-kLpxurY4Z4r9sgMsyG0Z9uzsBlgiU/EFKhj/h91/8yHu0edo7XuixOIH3VcJ8kkxs6/jPzoI6U9Vj3WqbMQ94g==}
     engines: {node: 18 || 20 || >=22}
 
+  builtin-modules@4.0.0:
+    resolution: {integrity: sha512-p1n8zyCkt1BVrKNFymOHjcDSAl7oq/gUvfgULv2EblgpPVQlQr9yHnWjg9IJ2MhfwPqiYqMMrr01OY7yQoK2yA==}
+    engines: {node: '>=18.20'}
+
   cac@6.7.14:
     resolution: {integrity: sha512-b6Ilus+c3RrdDk+JhLKUAQfzzgLEPy6wcXqS7f/xe1EETvsDP6GORG7SFuOs6cID5YkqchW/LXZbX5bc8j7ZcQ==}
     engines: {node: '>=8'}
@@ -1479,6 +1554,10 @@ packages:
     resolution: {integrity: sha512-knvyeauYhqjOYvQ66MznSMs83wmHrCycNEN6Ao+2AeYEfxUIkuiVxdEa1qlGEPK+We3n0THiDciYSsCcgW/DoA==}
     engines: {node: '>=12.0.0'}
 
+  fake-indexeddb@6.2.5:
+    resolution: {integrity: sha512-CGnyrvbhPlWYMngksqrSSUT1BAVP49dZocrHuK0SvtR0D5TMs5wP0o3j7jexDJW01KSadjBp1M/71o/KR3nD1w==}
+    engines: {node: '>=18'}
+
   fast-deep-equal@3.1.3:
     resolution: {integrity: sha512-f3qQ9oQy9j2AhBe/H9VC91wLmKBCCU/gDOnKNAYG5hswO7BLKj09Hc5HYNz9cGI++xlpDCIgDaitVs03ATR84Q==}
 
@@ -1530,6 +1609,11 @@ packages:
   flatted@3.4.2:
     resolution: {integrity: sha512-PjDse7RzhcPkIJwy5t7KPWQSZ9cAbzQXcafsetQoD7sOJRQlGikNbx7yZp2OotDnJyrDcbyRq3Ttb18iYOqkxA==}
 
+  fsevents@2.3.2:
+    resolution: {integrity: sha512-xiqMQR4xAeHTuB9uWm+fFRcIOgKBMiOBP+eXiyT7jsgVCq1bkVygt00oASowB7EdtpOHaaPgKt812P9ab+DDKA==}
+    engines: {node: ^8.16.0 || ^10.6.0 || >=11.0.0}
+    os: [darwin]
+
   fsevents@2.3.3:
     resolution: {integrity: sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==}
     engines: {node: ^8.16.0 || ^10.6.0 || >=11.0.0}
@@ -1577,6 +1661,9 @@ packages:
     resolution: {integrity: sha512-5gs5ytaNjBrh5Ow3zrvdUUY+0VxIuWVL4i9irt6friV+BqdCfmV11CQTWMiBYWHbXhco+J1kHfTOUkePhCDvMA==}
     engines: {node: '>=18'}
     hasBin: true
+
+  idb@8.0.3:
+    resolution: {integrity: sha512-LtwtVyVYO5BqRvcsKuB2iUMnHwPVByPCXFXOpuU96IZPPoPN6xjOGxZQ74pgSVVLQWtUOYgyeL4GE98BY5D3wg==}
 
   ignore@5.3.2:
     resolution: {integrity: sha512-hsBTNUqQTDwkWtcdYI2i06Y/nUBEsNEDJKjWdigLvegy8kDuJAS8uRlpkkcQpyEXL0Z/pjDy5HBmMjRCJ2gq+g==}
@@ -1864,6 +1951,16 @@ packages:
   picomatch@4.0.4:
     resolution: {integrity: sha512-QP88BAKvMam/3NxH6vj2o21R6MjxZUAd6nlwAS/pnGvN9IVLocLHxGYIzFhg6fUQ+5th6P4dv4eW9jX3DSIj7A==}
     engines: {node: '>=12'}
+
+  playwright-core@1.61.0:
+    resolution: {integrity: sha512-caX7TrY3Ml6egyDX0WUcTHDxodl/b51y5wJOdCEA36QviK/s2g081hvmGs8eaE3DWb6NYZQ6BjO/QkNRPenoPA==}
+    engines: {node: '>=18'}
+    hasBin: true
+
+  playwright@1.61.0:
+    resolution: {integrity: sha512-Z+7BeeqQPRRzklHsVFP4KTGIyMxKUmfeRA4WisM6G3/XW6nwGeX6fX9qYaDa+CiUqpOkb2f6X3nar05R3kSuJQ==}
+    engines: {node: '>=18'}
+    hasBin: true
 
   postcss@8.5.15:
     resolution: {integrity: sha512-FfR8sjd4em2T6fb3I2MwAJU7HWVMr9zba+enmQeeWFfCbm+UOC/0X4DS8XtpUTMwWMGbjKYP7xjfNekzyGmB3A==}
@@ -2187,8 +2284,8 @@ packages:
   y-codemirror.next@0.3.5:
     resolution: {integrity: sha512-VluNu3e5HfEXybnypnsGwKAj+fKLd4iAnR7JuX1Sfyydmn1jCBS5wwEL/uS04Ch2ib0DnMAOF6ZRR/8kK3wyGw==}
     peerDependencies:
-      '@codemirror/state': ^6.0.0
-      '@codemirror/view': ^6.0.0
+      '@codemirror/state': 6.5.0
+      '@codemirror/view': 6.38.6
       yjs: ^13.5.6
 
   y-indexeddb@9.0.12:
@@ -2476,13 +2573,13 @@ snapshots:
 
   '@babel/helper-validator-identifier@7.29.7': {}
 
-  '@codemirror/state@6.6.0':
+  '@codemirror/state@6.5.0':
     dependencies:
       '@marijn/find-cluster-break': 1.0.2
 
-  '@codemirror/view@6.43.1':
+  '@codemirror/view@6.38.6':
     dependencies:
-      '@codemirror/state': 6.6.0
+      '@codemirror/state': 6.5.0
       crelt: 1.0.6
       style-mod: 4.1.3
       w3c-keyname: 2.2.8
@@ -3276,6 +3373,8 @@ snapshots:
     dependencies:
       balanced-match: 4.0.4
 
+  builtin-modules@4.0.0: {}
+
   cac@6.7.14: {}
 
   callsites@3.1.0: {}
@@ -3578,6 +3677,8 @@ snapshots:
 
   expect-type@1.3.0: {}
 
+  fake-indexeddb@6.2.5: {}
+
   fast-deep-equal@3.1.3: {}
 
   fast-json-stable-stringify@2.1.0: {}
@@ -3628,6 +3729,9 @@ snapshots:
 
   flatted@3.4.2: {}
 
+  fsevents@2.3.2:
+    optional: true
+
   fsevents@2.3.3:
     optional: true
 
@@ -3661,6 +3765,8 @@ snapshots:
   human-signals@8.0.1: {}
 
   husky@9.1.7: {}
+
+  idb@8.0.3: {}
 
   ignore@5.3.2: {}
 
@@ -3831,10 +3937,10 @@ snapshots:
       path-key: 4.0.0
       unicorn-magic: 0.3.0
 
-  obsidian@1.13.1(@codemirror/state@6.6.0)(@codemirror/view@6.43.1):
+  obsidian@1.13.1(@codemirror/state@6.5.0)(@codemirror/view@6.38.6):
     dependencies:
-      '@codemirror/state': 6.6.0
-      '@codemirror/view': 6.43.1
+      '@codemirror/state': 6.5.0
+      '@codemirror/view': 6.38.6
       '@types/codemirror': 5.60.8
       moment: 2.29.4
 
@@ -3897,6 +4003,14 @@ snapshots:
   picocolors@1.1.1: {}
 
   picomatch@4.0.4: {}
+
+  playwright-core@1.61.0: {}
+
+  playwright@1.61.0:
+    dependencies:
+      playwright-core: 1.61.0
+    optionalDependencies:
+      fsevents: 2.3.2
 
   postcss@8.5.15:
     dependencies:
@@ -4248,10 +4362,10 @@ snapshots:
 
   xml-naming@0.1.0: {}
 
-  y-codemirror.next@0.3.5(@codemirror/state@6.6.0)(@codemirror/view@6.43.1)(yjs@13.6.31):
+  y-codemirror.next@0.3.5(@codemirror/state@6.5.0)(@codemirror/view@6.38.6)(yjs@13.6.31):
     dependencies:
-      '@codemirror/state': 6.6.0
-      '@codemirror/view': 6.43.1
+      '@codemirror/state': 6.5.0
+      '@codemirror/view': 6.38.6
       lib0: 0.2.117
       yjs: 13.6.31
 

@@ -82,6 +82,15 @@ export class BaseStore {
     await this.vault.writeAtomic(this.path(docId), new TextEncoder().encode(JSON.stringify(s)));
   }
 
+  /**
+   * Remove a doc's base record — the delete/tombstone cleanup (otherwise a deleted note leaves an
+   * orphaned `<docId>.json` behind forever). Idempotent: every {@link VaultPort.remove} implementation
+   * is a no-op on a missing file, so calling this for a doc that never had a base record is safe.
+   */
+  async delete(docId: DocId): Promise<void> {
+    await this.vault.remove(this.path(docId));
+  }
+
   /** Atomic-ordering helper: base first, then the note file. */
   async saveThenFile(
     docId: DocId,

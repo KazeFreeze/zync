@@ -1,8 +1,9 @@
 {
-  "id": "zync-spike",
-  "name": "Zync Spike",
-  "version": "0.0.1",
-  "minAppVersion": "1.5.0",
-  "description": "Phase-0a editor-binding viability spike. Throwaway.",
+  "id": "zync",
+  "name": "Zync",
+  "version": "0.1.0",
+  "minAppVersion": "1.8.8",
+  "description": "Self-hosted real-time sync for your vault — CRDT prose + content-addressed blobs against your own server.",
+  "author": "KazeFreeze",
   "isDesktopOnly": false
 }

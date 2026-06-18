@@ -70,6 +70,12 @@ export class OutboundPipeline {
     });
 
     // 4. Write to disk ONLY if it differs — and echo-record IMMEDIATELY before the write.
+    //    CANONICAL-LF (#35 + hash-identity): `newText` is the doc text, which is already LF
+    //    (the CRDT only ever received canonicalized prose). Compare against the RAW on-disk
+    //    text so a CRLF file is recognized as DIFFERING from the LF doc text and rewritten to
+    //    LF — the one-time line-ending churn. (We compare raw, not canonicalized, so a CRLF
+    //    receiver file is not falsely judged already-equal and left un-rewritten.) Outbound
+    //    only reconciles prose note docs.
     const bytes = await d.vault.read(path);
     const diskText = bytes === null ? null : new TextDecoder().decode(bytes);
     if (diskText !== newText) {

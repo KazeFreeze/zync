@@ -31,6 +31,14 @@ export interface StructuralReconcileDeps {
    * content upstream (the resurrecting device owes a re-push of its edited content).
    */
   markDirty: (docId: DocId) => Promise<void>;
+  /**
+   * Remove a doc's BASE record when its delete is applied here (Concern 1). The local-delete path
+   * (`engine.onDelete`) removes the base directly, but an INBOUND tombstone removes the FILE here and
+   * its echoed "delete" event hits an already-tombstoned entry → `onDelete` early-returns, so without
+   * this seam the receiver's `<docId>.json` base record would be orphaned forever. Optional (no-op
+   * default) so unit-test callers that don't assert base cleanup can omit it.
+   */
+  deleteBase?: (docId: DocId) => Promise<void>;
   /** Surface a resurrection notice to the user's inbox (Concern 2). */
   onInboxNotice: (notice: ResurrectedNotice) => void;
   /**
@@ -128,6 +136,7 @@ export interface StructuralReconcileDeps {
  */
 export async function runStructuralReconcile(deps: StructuralReconcileDeps): Promise<void> {
   const { index, vault, localHashOf, markDirty, onInboxNotice } = deps;
+  const deleteBase = deps.deleteBase ?? ((): Promise<void> => Promise.resolve());
 
   // Reverse index: docId → its LIVE paths. A docId LIVE at any path makes a same-docId
   // tombstone a MOVE (rename loser / in-flight rename), never a deletion — used by the
@@ -226,6 +235,9 @@ export async function runStructuralReconcile(deps: StructuralReconcileDeps): Pro
     if (diskHash === null) continue; // no local file → nothing to remove.
     if (resolveTombstone(entry, diskHash) === "delete") {
       await vault.remove(path);
+      // Clean up the now-deleted doc's base record. The fired "delete" event reaches an
+      // already-tombstoned entry, so `onDelete` early-returns without removing it — do it here.
+      await deleteBase(entry.docId);
     }
   }
 }

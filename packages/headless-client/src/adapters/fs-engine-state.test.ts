@@ -53,6 +53,16 @@ describe("FsEngineStateStore — markDirty / clearDirty / listDirty", () => {
     expect((await store.listDirty()).filter((x) => x === id("d1"))).toHaveLength(1);
   });
 
+  it("isDirty matches listDirty membership (O(1) single-doc check)", async () => {
+    const { store } = await makeTmpState();
+    expect(await store.isDirty(id("d1"))).toBe(false);
+    await store.markDirty(id("d1"));
+    expect(await store.isDirty(id("d1"))).toBe(true);
+    expect(await store.isDirty(id("d2"))).toBe(false);
+    await store.clearDirty(id("d1"));
+    expect(await store.isDirty(id("d1"))).toBe(false);
+  });
+
   it("clearDirty removes the doc from listDirty", async () => {
     const { store } = await makeTmpState();
     await store.markDirty(id("d1"));

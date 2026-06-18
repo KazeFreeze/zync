@@ -31,7 +31,14 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { device, resetStack, SERVER_BLOB_BASE, sleep, waitConverged } from "../src/harness.js";
+import {
+  blobAuthHeader,
+  device,
+  resetStack,
+  SERVER_BLOB_BASE,
+  sleep,
+  waitConverged,
+} from "../src/harness.js";
 
 const a = device("device-a");
 const b = device("device-b");
@@ -54,7 +61,7 @@ const sha256Hex = (bytes: Uint8Array | string): string =>
 
 /** GET the blob from the relay's published content-addressed endpoint; null on 404. */
 async function serverBlob(sha: string): Promise<Uint8Array | null> {
-  const res = await fetch(`${SERVER_BLOB_BASE}/blob/${sha}`);
+  const res = await fetch(`${SERVER_BLOB_BASE}/blob/${sha}`, { headers: { ...blobAuthHeader } });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`GET /blob/${sha} → ${String(res.status)}`);
   return new Uint8Array(await res.arrayBuffer());

@@ -33,10 +33,11 @@ import { applyBootstrap } from "./protocol/bootstrap.js";
 import { supervisedImport } from "./conflicts/supervised-import.js";
 import { orphanSweep, type OrphanMeta } from "./protocol/orphan-sweep.js";
 import { makeStamp, stampHash, stampsEqual } from "./protocol/stamp.js";
+import { DiskHashCache } from "./protocol/disk-hash-cache.js";
 import { BlobEngine, type BlobFetchPolicy, type BlobManifestEntry } from "./blobs/blob-engine.js";
 import { Inbox } from "./conflicts/inbox.js";
 import { writeConflictArtifact } from "./conflicts/artifact.js";
-import { sha256OfBytes, sha256OfText } from "./hash.js";
+import { canonicalizeProse, sha256OfBytes, sha256OfText } from "./hash.js";
 import { diffToEdits, merge3 } from "./bridge/merge.js";
 
 export interface EnginePorts {
@@ -134,6 +135,13 @@ export class SyncEngine {
    */
   private priorDivergence = new Map<DocId, string>();
   readonly base: BaseStore;
+  /**
+   * In-memory disk-hash cache (path -> sha256(diskBytes)). Read-through at the materialize skip-gate
+   * and clean-settle (the dominant first-sync reads); kept warm by `echo.onRecord` and invalidated by
+   * `onVaultEvent` + the `structuralVault()` remove/rename wrapper. Constructed per-instance (never
+   * persisted) so a restart re-reads disk fresh. See `protocol/disk-hash-cache.ts`.
+   */
+  private readonly diskHashCache: DiskHashCache;
 
   private readonly ports: EnginePorts;
   private readonly config: EngineConfig;
@@ -170,6 +178,16 @@ export class SyncEngine {
   // ── deterministic quiescence ────────────────────────────────────────────
   private readonly inflight = new Set<Promise<unknown>>();
   private readonly pendingBumps = new Map<VaultPath, PendingBump>();
+  // COALESCED reconcile (the index-observe-driven catch-up → structural-reconcile → settle chain).
+  // Firing the full O(n) chain on EVERY index transaction made a bulk seed O(n²): the relay echoes
+  // ~n index updates and each re-scanned all live entries (the on-device ~16-min bottleneck — see
+  // bench `vault.read` ~2200/note). These bound it to one pass in flight, re-running once more if any
+  // change arrived mid-pass; since a pass is O(n) work, the echoes that land while it runs coalesce
+  // into that single re-run. See {@link scheduleReconcile}.
+  private reconcileScheduled = false;
+  private reconcileRunning = false;
+  private reconcileAgain = false;
+  private reconcileGate: (() => void) | null = null;
   /**
    * The single in-flight rename-transaction settle: a tracked, RE-ARMABLE timer (see
    * {@link scheduleRenameSettle}). Re-arming on each suppressed fallout event keeps the
@@ -190,6 +208,17 @@ export class SyncEngine {
     this.debounceMs = config.stampDebounceMs ?? DEFAULT_DEBOUNCE_MS;
     this.renameSettleMs = config.renameSettleMs ?? DEFAULT_RENAME_SETTLE_MS;
     this.base = new BaseStore(ports.vault, config.configDir);
+    this.diskHashCache = new DiskHashCache({
+      read: (p) => this.ports.vault.read(p),
+      hashBytes: (bytes) => sha256OfBytes(bytes),
+    });
+    // Keep the cache warm: every engine file write goes recordWrite -> writeAtomic, so noting the
+    // post-write hash here means a reconcile pass that runs before the watcher echo lands still sees
+    // the file as canonical without a read. (Correctness never depends on this; `onVaultEvent` forget
+    // is the correctness hook. On real Obsidian the watcher event is async, so this window is real.)
+    this.echo.onRecord = (p, h) => {
+      this.diskHashCache.note(p as VaultPath, h as Sha256);
+    };
   }
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -301,20 +330,12 @@ export class SyncEngine {
       this.onVaultEvent(e);
     });
 
-    // 8. Subscribe index changes → pull peers' bumped docs via catch-up, then
-    //    reconcile the inbound index against the vault (inbound tombstone →
-    //    vault.remove). Structural reconcile runs AFTER catch-up so a doc the same
-    //    index change attaches is materialized before we judge its disk state.
+    // 8. Subscribe index changes → pull peers' bumped docs via catch-up, then reconcile the inbound
+    //    index against the vault (inbound tombstone → vault.remove). Structural reconcile runs AFTER
+    //    catch-up so a doc the same index change attaches is materialized before we judge its disk
+    //    state. COALESCED (not one chain per transaction) — see {@link scheduleReconcile}.
     this.indexUnsub = this.index.observe(() => {
-      this.track(
-        this.lazyAttach
-          .runCatchUp(this.openDocIds())
-          .then(() => this.structuralReconcile())
-          // Clean-settle (0b-3 Fix 6) AFTER reconcile materialized disk: re-advance the synced
-          // stamp of any doc that has fully converged (doc==disk==index) but whose synced stamp
-          // is latched at an intermediate merge hash — the symmetric clean-3-way-merge latch.
-          .then(() => this.lazyAttach.settleCleanDocs()),
-      );
+      this.scheduleReconcile();
     });
 
     // 9. Initial catch-up so an adopting device pulls everything the index already
@@ -577,7 +598,17 @@ export class SyncEngine {
       throw new Error("SyncEngine.ensureNoteAttached: engine not started — call start() first");
     }
     const existing = this.getAttachedDoc(path);
-    if (existing !== undefined) return existing;
+    if (existing !== undefined) {
+      // Already attached (e.g. by the background initial catch-up). Its dirty-reconcile may still
+      // be IN FLIGHT; AWAIT it before handing the doc to the editor binding so the Y.Text is FINAL
+      // (a disk edit made while the engine was down is merged in) BEFORE ySync starts tracking.
+      // Otherwise a reconcile that lands AFTER the binding attaches replays the disk-edit delta into
+      // an editor that already shows it → the edit is DUPLICATED (the cold-restart-with-open-note
+      // bug surfaced in real Obsidian). Idempotent + offline-safe: no-op unless the doc is dirty, and
+      // for an active-bound path the disk write is gated — only the Y.Text merge runs.
+      await this.reconcileDirtyDoc(existing);
+      return existing;
+    }
     await this.lazyAttach.runCatchUp(this.openDocIds());
     const afterCatchUp = this.getAttachedDoc(path);
     if (afterCatchUp !== undefined) return afterCatchUp;
@@ -637,7 +668,16 @@ export class SyncEngine {
     this.attached.set(doc.id, doc);
     if (this.attachedUnsubs.has(doc.id)) return;
     const unsub = doc.onUpdate((_update, origin) => {
-      if (origin === "remote") this.track(this.outbound.onRemoteUpdate(doc));
+      if (origin !== "remote") return;
+      // ACTIVE-BOUND GUARD: when an editor is bound to this doc, the CM6/yCollab binding renders the
+      // remote update into the editor LIVE and the host (Obsidian) autosaves it to disk. Materializing
+      // here too would write the open file behind the host's back ("modified externally") and race its
+      // autosave → spurious 3-way-merge conflicts. So leave disk to the editor while bound; the editor's
+      // autosave drives ingest, which reconciles base/stamp (and on unbind the note reconciles normally).
+      // Headless/daemon docs are never `active-bound`, so this is a no-op there (harness unchanged).
+      const path = this.pathOf(doc.id);
+      if (path !== undefined && this.isActiveBound(path)) return;
+      this.track(this.outbound.onRemoteUpdate(doc));
     });
     this.attachedUnsubs.set(doc.id, unsub);
   }
@@ -669,13 +709,19 @@ export class SyncEngine {
    */
   private async reconcileDirtyDoc(doc: CrdtDoc): Promise<void> {
     const docId = doc.id;
-    if (!(await this.ports.engineState.listDirty()).includes(docId)) return;
+    if (!(await this.ports.engineState.isDirty(docId))) return;
 
     const path = this.pathOf(docId);
     if (path === undefined) return;
     const bytes = await this.ports.vault.read(path);
     if (bytes === null) return; // gone — the delete/tombstone path owns this
-    const diskText = decode(bytes);
+    // CANONICAL-LF (#35 + hash-identity): a note CRDT doc is ALWAYS prose, so canonicalize
+    // the decoded disk content to LF at this decode boundary before it is merged into the
+    // CRDT / hashed-as-text / saved to base / stamped. `rawDiskText` keeps the un-canonicalized
+    // form for the disk write-back DIFF only, so a CRLF file is rewritten to LF (the one-time
+    // churn through the EXISTING write path). See {@link canonicalizeProse}.
+    const rawDiskText = decode(bytes);
+    const diskText = canonicalizeProse(rawDiskText);
     const crdtText = doc.getText();
 
     const baseRec = await this.base.load(docId);
@@ -712,7 +758,13 @@ export class SyncEngine {
       ackedText: baseRec?.ackedText ?? "",
       ackedHash: baseRec?.ackedHash ?? (await sha256OfText("")),
     });
-    if (merged !== diskText) {
+    // Compare the merge result against the RAW (un-canonicalized) disk text so a CRLF file
+    // whose canonical content already equals `merged` (LF) is still rewritten to LF — the
+    // one-time canonical-LF churn (#35 + hash-identity).
+    // ACTIVE-BOUND: skip the disk write — the open editor + host autosave own this file (writing here
+    // races the autosave → "modified externally"). The merge/base/dirty bookkeeping above still runs, so
+    // the edit is tracked + pushed via the provider; disk is reconciled by the autosave + on unbind.
+    if (merged !== rawDiskText && !this.isActiveBound(path)) {
       // echo.recordWrite IMMEDIATELY precedes vault.writeAtomic, ALWAYS.
       this.echo.recordWrite(path, mergedHash);
       await this.ports.vault.writeAtomic(path, utf8(merged));
@@ -849,18 +901,19 @@ export class SyncEngine {
     // NEXT pass can confirm. A divergence resolves only when seen on two consecutive passes.
     const currentDivergence = new Map<DocId, string>();
     const confirmDivergence = (docId: DocId, livePaths: VaultPath[]): boolean => {
-      const sig = [...livePaths].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).join(" ");
+      const sig = [...livePaths].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).join("\u0000");
       currentDivergence.set(docId, sig);
       return this.priorDivergence.get(docId) === sig;
     };
     await runStructuralReconcile({
       index: this.index,
-      vault: this.ports.vault,
+      vault: this.structuralVault(),
       localHashOf: async (path) => {
         const bytes = await this.ports.vault.read(path);
         return bytes === null ? null : await sha256OfBytes(bytes);
       },
       markDirty: (docId) => this.ports.engineState.markDirty(docId),
+      deleteBase: (docId) => this.base.delete(docId),
       onInboxNotice: (notice) => {
         this.inbox.add({
           id: `resurrected:${notice.path}:${notice.docId}`,
@@ -936,30 +989,48 @@ export class SyncEngine {
   private async materializeLiveDiskContent(): Promise<void> {
     const deviceId = this.ports.identity.deviceId();
     // Load the dirty set ONCE before the loop (was re-read per live entry; behavior-identical).
-    const dirty = await this.ports.engineState.listDirty();
+    // A Set, not the array, so the per-entry membership check below is O(1) not O(n) (else the
+    // loop is O(n^2) over a large live index).
+    const dirty = new Set(await this.ports.engineState.listDirty());
     for (const [path, entry] of this.index.liveEntries()) {
       const doc = this.attached.get(entry.docId);
       if (doc === undefined) continue;
 
+      // ACTIVE-BOUND: an open editor owns this file's disk — the CM/yCollab binding renders the
+      // converged content live and the host (Obsidian) autosaves it. Materializing here races that
+      // autosave (disk is briefly "behind" the just-typed CRDT) and trips the host's "modified
+      // externally" auto-merge. Skip; disk reconciles via the editor's autosave (ingest) and on unbind.
+      if (this.isActiveBound(path)) continue;
+
       const docStamp = makeStamp(await sha256OfText(doc.getText()), deviceId);
       if (!stampsEqual(docStamp, entry.stamp)) continue; // CRDT not yet at the indexed content.
 
-      const bytes = await this.ports.vault.read(path);
-      const diskStamp = bytes === null ? null : makeStamp(await sha256OfBytes(bytes), deviceId);
-      if (stampsEqual(diskStamp, entry.stamp)) continue; // disk already canonical.
+      // CACHED SKIP GATE: if the cached on-disk hash already equals the indexed content, the file is
+      // canonical -> skip WITHOUT a disk read. This is the dominant first-sync read: once a note is
+      // seeded, every later relay-echoed pass re-confirmed "already canonical". Stale-safe -- a stale
+      // "canonical" only MISSES a materialize (re-driven by a later pass / waitConverged via the FRESH
+      // pendingDocs gate), it can NEVER authorize a clobber.
+      const cachedHash = await this.diskHashCache.hash(path);
+      const cachedStamp = cachedHash === null ? null : makeStamp(cachedHash, deviceId);
+      if (stampsEqual(cachedStamp, entry.stamp)) continue; // disk already canonical (cache hit).
 
-      // ANTI-CLOBBER GUARD: only write when the disk is genuinely BEHIND the converged
-      // doc — never over a newer un-ingested edit, and never over a DIRTY doc's unpushed
-      // edit (see CLOBBER HAZARD above).
+      // Past the skip => we MIGHT write. The cache may NEVER authorize a write (clobbering is the only
+      // unsafe direction), so re-read FRESH for the anti-clobber proof. `note` the fresh truth to
+      // self-heal a stale-behind cache entry for the next pass.
+      const bytes = await this.ports.vault.read(path);
+      const diskHash = bytes === null ? null : await sha256OfBytes(bytes);
+      this.diskHashCache.note(path, diskHash);
+      const diskStamp = diskHash === null ? null : makeStamp(diskHash, deviceId);
+      if (stampsEqual(diskStamp, entry.stamp)) continue; // disk canonical after all (cache was stale).
+
+      // ANTI-CLOBBER GUARD: only write when the disk is genuinely BEHIND the converged doc -- never
+      // over a newer un-ingested edit, and never over a DIRTY doc's unpushed edit.
       if (bytes !== null) {
-        // DIRTY ⇒ this device owes a push; the disk may hold the unpushed (post-crash
-        // recovered) edit. Never materialize over it — the dirty reconcile + re-push own it.
-        if (dirty.includes(entry.docId)) continue;
+        // DIRTY => this device owes a push; the disk may hold the unpushed (post-crash recovered)
+        // edit. Never materialize over it -- the dirty reconcile + re-push own it.
+        if (dirty.has(entry.docId)) continue;
         const base = await this.base.load(entry.docId);
-        const diskHash = await sha256OfBytes(bytes);
-        // disk ≠ last-reconciled working base ⇒ a newer un-ingested edit (or we cannot prove
-        // it is behind: no base ⇒ `base?.fileHash` is undefined ⇒ never equal) ⇒ SKIP. Ingest
-        // will reconcile it; pendingDocs keeps the loop alive.
+        // disk != last-reconciled working base => a newer un-ingested edit (or no base) => SKIP.
         if (diskHash !== base?.fileHash) continue;
       }
 
@@ -973,6 +1044,62 @@ export class SyncEngine {
     void p.finally(() => {
       this.inflight.delete(p);
     });
+  }
+
+  /**
+   * COALESCE the index-observe-driven reconcile chain. The OLD handler fired a fresh
+   * `runCatchUp → structuralReconcile → settleCleanDocs` chain on EVERY index transaction; during a
+   * bulk seed the relay echoes ~n index updates, so that was n chains each doing an O(n) full rescan
+   * (vault.read + sha256 + getSyncedStamp per live entry) → O(n²), the dominant on-device first-sync
+   * cost the profiler exposed (~2200 vault.reads/note). Here at most ONE pass is in flight; an index
+   * change arriving while a pass runs sets `reconcileAgain` so the pass loops once more instead of
+   * spawning another. Because a pass is itself O(n) work, the burst of echoes that lands during it
+   * folds into that single re-run — collapsing ~n passes to a handful (≈ seed-time / pass-time).
+   *
+   * A single tracked `done` gate covers the scheduled-and-running lifetime so {@link whenIdle} (and
+   * thus {@link waitConverged}) still awaits a pending pass. The chain is idempotent + convergent, so
+   * running it fewer times — but always at least once after the final change (via `reconcileAgain` for
+   * mid-pass changes, or a fresh schedule for post-pass changes) — preserves convergence.
+   */
+  private scheduleReconcile(): void {
+    if (this.reconcileRunning) {
+      this.reconcileAgain = true;
+      return;
+    }
+    if (this.reconcileScheduled) return;
+    this.reconcileScheduled = true;
+    const done = new Promise<void>((resolve) => {
+      this.reconcileGate = resolve;
+    });
+    this.track(done);
+    queueMicrotask(() => {
+      void this.runReconcilePass();
+    });
+  }
+
+  private async runReconcilePass(): Promise<void> {
+    this.reconcileScheduled = false;
+    this.reconcileRunning = true;
+    const resolveGate = this.reconcileGate;
+    this.reconcileGate = null;
+    try {
+      do {
+        this.reconcileAgain = false;
+        await this.lazyAttach.runCatchUp(this.openDocIds());
+        await this.structuralReconcile();
+        // Clean-settle (0b-3 Fix 6) AFTER reconcile materialized disk: re-advance the synced stamp of
+        // any doc fully converged (doc==disk==index) but latched at an intermediate merge hash.
+        await this.lazyAttach.settleCleanDocs();
+        // `reconcileAgain` is set TRUE re-entrantly by scheduleReconcile() when an index change lands
+        // DURING the awaits above — TS's single-pass flow analysis can't see that cross-await mutation
+        // and wrongly reads this as always-false, hence the disable. Looping folds that change into
+        // this pass instead of spawning another (the coalescing).
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+      } while (this.reconcileAgain);
+    } finally {
+      this.reconcileRunning = false;
+      resolveGate?.();
+    }
   }
 
   /**
@@ -1006,6 +1133,17 @@ export class SyncEngine {
     return a;
   }
 
+  /**
+   * True iff an editor is currently bound to `path`. NON-creating, unlike {@link authorityFor}: a path
+   * with no authority yet CANNOT be `active-bound` (binding goes through `authorityFor`), so this peeks the
+   * map instead of materializing an inactive authority. The disk-materialize gates call this in the hot
+   * reconcile/catch-up loops — creating an authority there would be a pointless side effect AND would
+   * perturb the operation-ordering of timing-sensitive non-editor conflict resolution.
+   */
+  private isActiveBound(path: VaultPath): boolean {
+    return this.authorities.get(path)?.state === "active-bound";
+  }
+
   /** Unique per device: `${deviceId}-${clock.now()}-${seq}`. */
   private mintDocId(): DocId {
     const deviceId = this.ports.identity.deviceId();
@@ -1029,8 +1167,37 @@ export class SyncEngine {
   private async diskHashOf(docId: DocId): Promise<Sha256 | null> {
     const path = this.pathOf(docId);
     if (path === undefined) return null;
-    const bytes = await this.ports.vault.read(path);
-    return bytes === null ? null : await sha256OfBytes(bytes);
+    // CACHED: clean-settle's triple-equality read. Stale-safe -- settle advances ONLY the synced
+    // stamp (never clears dirty / writes / removes), and the FRESH `pendingDocs` gate backstops it,
+    // so a stale value can never produce false convergence or data loss.
+    return this.diskHashCache.hash(path);
+  }
+
+  /**
+   * The vault handed to structural reconcile: a thin wrapper that invalidates the disk-hash cache on
+   * the only vault MUTATIONS structural reconcile performs (`remove`/`rename`), so a path it deletes
+   * or moves cannot be served a stale hash by a later pass. Every other method delegates unchanged --
+   * this is invalidation only, NOT a read cache (hashing stays at the explicit `diskHashCache.hash`
+   * sites; `read` returns bytes verbatim).
+   */
+  private structuralVault(): VaultPort {
+    const v = this.ports.vault;
+    const cache = this.diskHashCache;
+    return {
+      read: (p) => v.read(p),
+      writeAtomic: (p, d, o) => v.writeAtomic(p, d, o),
+      list: (prefix) => v.list(prefix),
+      onEvent: (cb) => v.onEvent(cb),
+      remove: async (p) => {
+        cache.note(p, null); // removed -> known-absent
+        await v.remove(p);
+      },
+      rename: async (from, to) => {
+        cache.forget(from);
+        cache.forget(to);
+        await v.rename(from, to);
+      },
+    };
   }
 
   // ── debounced index-stamp bump ──────────────────────────────────────────
@@ -1286,7 +1453,11 @@ export class SyncEngine {
       }
       if (route !== "crdt-prose") continue;
 
-      const text = decode(bytes);
+      // CANONICAL-LF (#35 + hash-identity): canonicalize the decoded PROSE to LF at this
+      // decode boundary — we are past the `route !== "crdt-prose"` guard, so this only
+      // touches prose. The seed/adopt/import decisions below all hash/seed THIS text into
+      // the CRDT/base/index stamp, so LF must be canonical from here. See canonicalizeProse.
+      const text = canonicalizeProse(decode(bytes));
       const treeStamp = existing?.stamp ?? null;
       const docId = existing?.docId ?? this.mintDocId();
       const result = await applyBootstrap(
@@ -1350,6 +1521,25 @@ export class SyncEngine {
         case "adopt-server":
         case "converge":
         case "none":
+          // CANONICAL-LF HOLE (review of 00f3819). When a zero-attach decision (adopt-server or
+          // converge with needsAttach:false) keeps a PRE-EXISTING non-canonical (CRLF/lone-CR)
+          // file on disk whose CANONICAL (LF) content already equals the synced/tree stamp, NO
+          // later path rewrites it: the doc is never attached, so materializeLiveDiskContent and
+          // settleCleanDocs skip it, and catch-up never selects it (synced == tree, not dirty,
+          // not open) — yet pendingDocs' disk-hash clause hashes the RAW CRLF bytes against the
+          // LF stamp → pending FOREVER → waitConverged throws. Close it the SAME way every other
+          // canonical-LF site does: a ONE-TIME echo-guarded LF rewrite, raw-vs-canonical diffed.
+          // This stays ZERO-ATTACH (M2): we only write the vault bytes, we do NOT attach the doc,
+          // mint a docId, or touch index/inbox/blobs. needsAttach:true is left ALONE — that doc
+          // attaches via catch-up and rewrites through the normal materialize path. CANNOT LOOP:
+          // the rewrite's own fs event is echo-suppressed (recordWrite immediately precedes
+          // writeAtomic), and a re-run finds raw == LF == canonical so the diff guard skips it.
+          if (!result.needsAttach && text !== decode(bytes)) {
+            const canonicalHash = await sha256OfText(text);
+            // echo.recordWrite IMMEDIATELY precedes vault.writeAtomic, ALWAYS.
+            this.echo.recordWrite(path, canonicalHash);
+            await this.ports.vault.writeAtomic(path, utf8(text));
+          }
           break;
       }
     }
@@ -1422,6 +1612,13 @@ export class SyncEngine {
   // ── vault events ───────────────────────────────────────────────────────────
 
   private onVaultEvent(e: VaultEvent): void {
+    // CACHE INVALIDATION (correctness hook): an external change at `e.path` (or both paths of a
+    // rename) makes any cached disk hash for it stale, so forget it BEFORE routing the event -- the
+    // next reconcile read re-hashes fresh. This also forgets the engine's OWN write echoes (harmless:
+    // the next read re-reads exactly what we wrote). `echo.onRecord`'s warm-set serves the window
+    // before this event arrives (async on real Obsidian); the forget here ends that window cleanly.
+    this.diskHashCache.forget(e.path);
+    if (e.type === "rename") this.diskHashCache.forget(e.oldPath);
     switch (e.type) {
       case "create":
       case "modify":
@@ -1557,5 +1754,9 @@ export class SyncEngine {
     // edit-beats-delete revival arrives as an inbound index change + note-doc content
     // and re-marks dirty through the normal ingest/reconcile path, not this stale flag.
     await this.ports.engineState.clearDirty(entry.docId);
+    // Remove the now-tombstoned doc's base record so it is not orphaned. (The inbound-tombstone
+    // path cleans up via structural reconcile's `deleteBase` seam, since that removal echoes a
+    // "delete" onto an already-tombstoned entry and early-returns above.)
+    await this.base.delete(entry.docId);
   }
 }

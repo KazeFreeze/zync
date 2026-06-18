@@ -16,3 +16,7 @@ packages/harness/metrics.json
 # origin/main by packages/harness/scripts/snapshot-vault.sh.
 packages/harness/fixtures/lifeos
 packages/harness/fixtures/lifeos-*
+
+# IDB-bench generated outputs (esbuild bundle + result JSON) — generated, not source.
+packages/harness/idb-bench/public/bundle.js
+packages/harness/idb-bench/idb-bench-results.json

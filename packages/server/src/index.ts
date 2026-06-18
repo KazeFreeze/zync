@@ -8,9 +8,8 @@
  * Exports `createServer(config)` for in-process use (transport-conformance tests).
  * The `main()` function reads config from env and is the Docker entrypoint.
  *
- * Blob endpoint auth is DEFERRED to Phase 1.
- * The current HttpBlobStore client sends no Authorization header,
- * so no auth is applied to the blob endpoint in this task.
+ * The blob endpoint shares the relay's static `token` (ZYNC_TOKEN): every verb
+ * requires `Authorization: Bearer <token>`. Per-device tokens are M4.
  */
 
 import * as http from "node:http";
@@ -55,8 +54,8 @@ export async function createServer(config: ServerConfig): Promise<ServerHandle> 
   await relay.hocuspocus.listen();
   console.log(`[zync] relay on ws://0.0.0.0:${config.relayPort}`);
 
-  // 2. Start the blob HTTP server.
-  const blobHandler = createBlobHandler(config.blobBackend);
+  // 2. Start the blob HTTP server (shares the relay's static token).
+  const blobHandler = createBlobHandler(config.blobBackend, { token: config.token });
   const blobServer = http.createServer(blobHandler);
 
   await new Promise<void>((resolve, reject) => {

@@ -1,2 +1,5 @@
 packages:
   - "packages/*"
+  # Standalone IndexedDB benchmark (Phase-1 M0 gate #2) — nested under harness/,
+  # so it needs its own entry (the `packages/*` glob only matches direct children).
+  - "packages/harness/idb-bench"

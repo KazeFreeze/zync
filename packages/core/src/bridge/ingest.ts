@@ -1,7 +1,7 @@
 import type { Caps } from "../classify/classify.js";
 import { classify, type Route } from "../classify/classify.js";
 import type { CrdtDoc, DocId, Sha256, VaultPath, VaultPort } from "../ports.js";
-import { sha256OfBytes, sha256OfText } from "../hash.js";
+import { canonicalizeProse, sha256OfBytes, sha256OfText } from "../hash.js";
 import { diffToEdits, merge3 } from "./merge.js";
 import type { EchoLedger } from "./echo.js";
 import type { BaseStore } from "./base.js";
@@ -127,7 +127,15 @@ export class IngestPipeline {
 
     // 5. 3-way merge. With no CRDT side attached (adopt-pending) we feed the base
     //    as the "crdt" arm so `merge3(base, disk, base)` takes disk — NEVER drops it.
-    const diskText = new TextDecoder().decode(bytes);
+    //    CANONICAL-LF (#35 + hash-identity): canonicalize the decoded PROSE to LF HERE,
+    //    at the decode boundary, BEFORE it is merged / put into the CRDT / hashed-as-text /
+    //    saved to base / stamped. We are inside the `route === "crdt-prose"` branch, so this
+    //    only ever touches prose — blobs never reach here. `rawDiskText` keeps the UN-
+    //    canonicalized form for the write-back DIFF only (so a CRLF disk file is recognized
+    //    as DIFFERING from the LF merge result and rewritten to LF — the one-time line-ending
+    //    churn through the EXISTING write path). See {@link canonicalizeProse}.
+    const rawDiskText = new TextDecoder().decode(bytes);
+    const diskText = canonicalizeProse(rawDiskText);
     const baseRec = await d.base.load(docId);
     const baseText = baseRec?.baseText ?? "";
     const doc = d.getAttachedDoc(docId);
@@ -143,13 +151,13 @@ export class IngestPipeline {
       if (doc && newText !== crdtText) {
         doc.applyEdits(diffToEdits(crdtText, newText), "local-bridge");
       }
-      await this.#writeBackIfChanged(path, diskText, newText);
+      await this.#writeBackIfChanged(path, rawDiskText, newText);
       result = { action: "ingested-clean", docId, newText, activeBound };
     } else {
       // merge3 contract: on conflict `merged === crdt`, the CRDT wins.
       newText = crdtText;
       d.emitConflict(path, diskText); // disk side becomes the artifact
-      await this.#writeBackIfChanged(path, diskText, newText);
+      await this.#writeBackIfChanged(path, rawDiskText, newText);
       result = {
         action: "ingested-conflict",
         docId,
@@ -220,10 +228,13 @@ export class IngestPipeline {
 
   /**
    * Write `newText` back to disk only when it differs from what is already there.
-   * INVARIANT: record the echo IMMEDIATELY before the write, always.
+   * `rawDiskText` is the UN-canonicalized on-disk text (NOT the LF-normalized merge input):
+   * comparing against the raw form means a CRLF disk file whose canonical content already
+   * equals `newText` (LF) is still rewritten to LF — the one-time canonical-LF churn (#35 +
+   * hash-identity). INVARIANT: record the echo IMMEDIATELY before the write, always.
    */
-  async #writeBackIfChanged(path: VaultPath, diskText: string, newText: string): Promise<void> {
-    if (newText === diskText) return;
+  async #writeBackIfChanged(path: VaultPath, rawDiskText: string, newText: string): Promise<void> {
+    if (newText === rawDiskText) return;
     this.#deps.echo.recordWrite(path, await sha256OfText(newText));
     await this.#deps.vault.writeAtomic(path, utf8(newText));
   }

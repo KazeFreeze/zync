@@ -3,20 +3,20 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "node esbuild.config.mjs",
-    "dev": "node esbuild.config.mjs --watch"
+    "build": "node esbuild.config.mjs --production",
+    "dev": "node esbuild.config.mjs --watch",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "yjs": "^13.6.0",
-    "y-codemirror.next": "^0.3.5",
-    "y-protocols": "^1.0.6",
-    "@hocuspocus/provider": "^2.15.0",
-    "y-indexeddb": "^9.0.12"
+    "@zync/core": "workspace:*",
+    "@zync/crdt-yjs": "workspace:*",
+    "@zync/store-idb": "workspace:*",
+    "@zync/blob-http": "workspace:*",
+    "@zync/vault-obsidian": "workspace:*"
   },
   "devDependencies": {
-    "obsidian": "^1.7.2",
+    "obsidian": "^1.8.8",
     "esbuild": "^0.24.0",
-    "@codemirror/state": "^6.4.0",
-    "@codemirror/view": "^6.30.0"
+    "builtin-modules": "^4.0.0"
   }
 }

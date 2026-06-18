@@ -4,6 +4,10 @@ dist/
 build/
 *.tsbuildinfo
 
+# local Obsidian dev-loop scratch (server snapshots, headless peer vault) — see
+# docs/superpowers/notes/2026-06-17-zync-m1-dev-loop-runbook.md
+.zync-dev/
+
 # logs / os
 *.log
 .DS_Store

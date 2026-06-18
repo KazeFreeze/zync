@@ -33,4 +33,21 @@ describe("EchoLedger", () => {
     led.recordWrite("a.md", sha("x"));
     expect(led.isEcho("b.md", sha("x"))).toBe(false);
   });
+
+  describe("onRecord", () => {
+    it("fires onRecord with (path, hash) on every recordWrite", () => {
+      const seen: [string, string][] = [];
+      const ledger = new EchoLedger();
+      ledger.onRecord = (path, hash) => seen.push([path, hash]);
+      ledger.recordWrite("a.md", "h1");
+      ledger.recordWrite("a.md", "h2");
+      expect(seen).toEqual([
+        ["a.md", "h1"],
+        ["a.md", "h2"],
+      ]);
+      // The ledger still suppresses both recorded hashes as echoes.
+      expect(ledger.isEcho("a.md", "h1")).toBe(true);
+      expect(ledger.isEcho("a.md", "h2")).toBe(true);
+    });
+  });
 });
