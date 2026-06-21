@@ -39,6 +39,13 @@ export interface StructuralReconcileDeps {
    * default) so unit-test callers that don't assert base cleanup can omit it.
    */
   deleteBase?: (docId: DocId) => Promise<void>;
+  /**
+   * Remove the tombstoned doc's docStore (CRDT) snapshot. SAME inbound-tombstone rationale as
+   * {@link deleteBase}: `engine.onDelete` removes the snapshot directly for a LOCAL delete, but an
+   * INBOUND tombstone hits an already-tombstoned entry → `onDelete` early-returns, so without this
+   * seam the receiver's IDB snapshot would be orphaned forever. Optional (no-op default).
+   */
+  deleteSnapshot?: (docId: DocId) => Promise<void>;
   /** Surface a resurrection notice to the user's inbox (Concern 2). */
   onInboxNotice: (notice: ResurrectedNotice) => void;
   /**
@@ -153,6 +160,7 @@ export interface StructuralReconcileDeps {
 export async function runStructuralReconcile(deps: StructuralReconcileDeps): Promise<void> {
   const { index, vault, localHashOf, markDirty, onInboxNotice } = deps;
   const deleteBase = deps.deleteBase ?? ((): Promise<void> => Promise.resolve());
+  const deleteSnapshot = deps.deleteSnapshot ?? ((): Promise<void> => Promise.resolve());
 
   // Reverse index: docId → its LIVE paths. A docId LIVE at any path makes a same-docId
   // tombstone a MOVE (rename loser / in-flight rename), never a deletion — used by the
@@ -358,9 +366,11 @@ export async function runStructuralReconcile(deps: StructuralReconcileDeps): Pro
       if (diskHash === null) continue; // no local file → nothing to remove.
       if (resolveTombstone(entry, diskHash) === "delete") {
         await vault.remove(path);
-        // Clean up the now-deleted doc's base record. The fired "delete" event reaches an
-        // already-tombstoned entry, so `onDelete` early-returns without removing it — do it here.
+        // Clean up the now-deleted doc's base record AND docStore snapshot. The fired "delete"
+        // event reaches an already-tombstoned entry, so `onDelete` early-returns without removing
+        // them — do it here.
         await deleteBase(entry.docId);
+        await deleteSnapshot(entry.docId);
       }
     }
   } else {
@@ -372,9 +382,11 @@ export async function runStructuralReconcile(deps: StructuralReconcileDeps): Pro
       if (diskHash === null) continue; // no local file → nothing to remove.
       if (resolveTombstone(entry, diskHash) === "delete") {
         await vault.remove(path);
-        // Clean up the now-deleted doc's base record. The fired "delete" event reaches an
-        // already-tombstoned entry, so `onDelete` early-returns without removing it — do it here.
+        // Clean up the now-deleted doc's base record AND docStore snapshot. The fired "delete"
+        // event reaches an already-tombstoned entry, so `onDelete` early-returns without removing
+        // them — do it here.
         await deleteBase(entry.docId);
+        await deleteSnapshot(entry.docId);
       }
     }
   }

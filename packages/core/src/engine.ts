@@ -1359,6 +1359,7 @@ export class SyncEngine {
       },
       markDirty: (docId) => this.ports.engineState.markDirty(docId),
       deleteBase: (docId) => this.base.delete(docId),
+      deleteSnapshot: (docId) => this.ports.docStore.delete(docId),
       onInboxNotice: (notice) => {
         this.inbox.add({
           id: `resurrected:${notice.path}:${notice.docId}`,
@@ -2380,7 +2381,17 @@ export class SyncEngine {
       // bootstrap blob-publish must honour the same gate (skip publishing in projector mode).
       if (route === "structured-blob" || route === "binary-blob") {
         if (this.config.ingestDisabled === true) continue;
-        await this.blobEngine.onLocalBlobWrite(path, bytes);
+        // ROBUSTNESS: a transient blob-store outage (S3/MinIO down -> 500) must NOT abort engine
+        // start -- the prose engine must come up regardless. Swallow + continue; the blob stays
+        // unpublished THIS session and re-publishes on the next start (bootstrap re-runs
+        // onLocalBlobWrite for every on-disk blob, and blobStore.has() returns false while the
+        // store was down, so a later successful start re-puts it). Prose sync is unaffected --
+        // blob publish touches only the blob store + manifest, never the vault/prose path.
+        try {
+          await this.blobEngine.onLocalBlobWrite(path, bytes);
+        } catch {
+          // transient blob-store failure -- self-heals on the next start (see above).
+        }
         continue;
       }
       if (route !== "crdt-prose") continue;
@@ -2683,5 +2694,12 @@ export class SyncEngine {
     // path cleans up via structural reconcile's `deleteBase` seam, since that removal echoes a
     // "delete" onto an already-tombstoned entry and early-returns above.)
     await this.base.delete(entry.docId);
+    // Likewise remove the doc's docStore (CRDT) snapshot so it is not orphaned in IDB forever.
+    // SAFE re: orphan recovery: onDelete only fires for a docId BOUND to a live path being deleted
+    // (a winner / already-recovered doc) -- NEVER an unrecovered concurrent-create LOSER (which is
+    // never bound to a deletable live path), so the snapshot the orphan sweep materializes from is
+    // never removed here. An edit-beats-delete resurrection re-attaches the doc from the relay and
+    // re-persists a fresh snapshot, so revival is unaffected.
+    await this.ports.docStore.delete(entry.docId);
   }
 }
