@@ -59,6 +59,22 @@ export interface StructuralReconcileDeps {
    * NEXT pass can confirm it — recording is the seam's side effect.
    */
   confirmDivergence?: (docId: DocId, livePaths: VaultPath[]) => boolean;
+  /**
+   * S5 WORKSET SCOPE — when present, limits the tombstone loops (rename/resurrect/delete)
+   * and the divergent-rename loop to paths/docIds reachable from the workset.
+   *
+   * `workset`: the set of docIds this observe-driven pass must process.
+   * `allByDocId`: maps every docId → ALL its paths (live + tombstoned). Critically, a
+   * rename's OLD-key tombstone is included here even though it is not a changed path —
+   * this is what makes the workset's docId closure reach the old-key sibling so the rename
+   * concern can act on it.
+   *
+   * When `undefined` (the FULL path), behavior is byte-for-byte unchanged.
+   */
+  scope?: {
+    workset: ReadonlySet<DocId>;
+    allByDocId: ReadonlyMap<DocId, VaultPath[]>;
+  };
 }
 
 /**
@@ -141,6 +157,8 @@ export async function runStructuralReconcile(deps: StructuralReconcileDeps): Pro
   // Reverse index: docId → its LIVE paths. A docId LIVE at any path makes a same-docId
   // tombstone a MOVE (rename loser / in-flight rename), never a deletion — used by the
   // rename concern (target lookup) and by the delete/resurrect guards below.
+  // ALWAYS built from the FULL index — NEVER scoped. A rename's old-key tombstone is only
+  // recognised as a MOVE (not a delete) because its docId appears live elsewhere in this map.
   const liveByDocId = new Map<DocId, VaultPath[]>();
   for (const [path, entry] of index.liveEntries()) {
     const paths = liveByDocId.get(entry.docId);
@@ -148,6 +166,35 @@ export async function runStructuralReconcile(deps: StructuralReconcileDeps): Pro
     else paths.push(path);
   }
   const isLiveElsewhere = (docId: DocId): boolean => (liveByDocId.get(docId)?.length ?? 0) > 0;
+
+  // S5 WORKSET SCOPE: when a scope is provided, restrict the tombstone loops and the
+  // divergent-rename loop to the paths/docIds reachable from the workset.
+  //
+  // `scopedPaths`: gathered ONCE from `scope.allByDocId` (live + tombstoned siblings).
+  // Critically, a rename's OLD-key tombstone is included because `allByDocId` maps the
+  // docId to ALL its paths (not just the changed live key). Without the tombstoned old-key
+  // the rename concern would never see the file that needs to be moved/removed.
+  //
+  // FRESHNESS INVARIANT: the paths list is computed once (path strings are stable — resurrect
+  // re-lists LIVE but does not add/remove paths). Each loop body re-reads the entry FRESH via
+  // `index.get(path)` so it sees mutations applied by earlier concerns (e.g. a resurrected
+  // entry is LIVE when the delete loop runs, so `entry.deleted !== true` → skip — correct).
+  //
+  // When `scope === undefined` (the FULL path), the existing `index.entries()` iteration is
+  // used — behavior byte-for-byte unchanged.
+  let scopedPaths: VaultPath[] | null = null;
+  if (deps.scope !== undefined) {
+    const { workset, allByDocId } = deps.scope;
+    const collected: VaultPath[] = [];
+    for (const docId of workset) {
+      const paths = allByDocId.get(docId);
+      if (paths === undefined) continue;
+      for (const p of paths) {
+        collected.push(p);
+      }
+    }
+    scopedPaths = collected;
+  }
 
   // CONCERN 3 — RENAME PROPAGATION FIRST. A tombstoned `oldPath` whose docId is bound
   // LIVE at a DIFFERENT `newPath` is a MOVE (same docId = content continuity), not a
@@ -164,37 +211,76 @@ export async function runStructuralReconcile(deps: StructuralReconcileDeps): Pro
   //     delete concern skips it (docId live elsewhere) → `pendingDocs`'s tombstone-with-
   //     file clause never clears → `waitConverged` hangs.
   // Runs before resurrect/delete so the old file is gone (→ skipped) by the time they run.
-  for (const [oldPath, entry] of index.entries()) {
-    if (entry.deleted !== true) continue;
-    const liveTargets = liveByDocId.get(entry.docId);
-    if (liveTargets === undefined) continue; // docId fully tombstoned → a real delete.
-    if ((await localHashOf(oldPath)) === null) continue; // no file to move.
-    // Find the rename TARGET: a live path for this docId that is NOT the old key. Prefer
-    // an EMPTY target (→ rename/move). If every live target is already materialized, the
-    // content reached the new home independently → the old file is removable.
-    // (Divergent renames may bind >1 live path; the resolver below collapses them to one,
-    // then a later pass settles to the winner.)
-    let emptyTarget: VaultPath | undefined;
-    let materializedTarget: VaultPath | undefined;
-    for (const candidate of liveTargets) {
-      if (candidate === oldPath) continue;
-      if ((await localHashOf(candidate)) === null) {
-        emptyTarget = candidate;
-        break;
+  if (scopedPaths !== null) {
+    // SCOPED: iterate only the paths belonging to workset docIds (live + tombstoned siblings).
+    for (const oldPath of scopedPaths) {
+      const entry = index.get(oldPath);
+      if (entry?.deleted !== true) continue;
+      const liveTargets = liveByDocId.get(entry.docId);
+      if (liveTargets === undefined) continue; // docId fully tombstoned → a real delete.
+      if ((await localHashOf(oldPath)) === null) continue; // no file to move.
+      // Find the rename TARGET: a live path for this docId that is NOT the old key. Prefer
+      // an EMPTY target (→ rename/move). If every live target is already materialized, the
+      // content reached the new home independently → the old file is removable.
+      // (Divergent renames may bind >1 live path; the resolver below collapses them to one,
+      // then a later pass settles to the winner.)
+      let emptyTarget: VaultPath | undefined;
+      let materializedTarget: VaultPath | undefined;
+      for (const candidate of liveTargets) {
+        if (candidate === oldPath) continue;
+        if ((await localHashOf(candidate)) === null) {
+          emptyTarget = candidate;
+          break;
+        }
+        materializedTarget ??= candidate;
       }
-      materializedTarget ??= candidate;
+      if (emptyTarget !== undefined) {
+        await vault.rename(oldPath, emptyTarget);
+      } else if (materializedTarget !== undefined && (await localHashOf(oldPath)) !== null) {
+        // Live target already on disk → the old file is a stranded leftover → remove it.
+        // RE-CHECK the old file still exists immediately before removing: a CONCURRENT
+        // reconcile pass may have already moved it (the pure-move case where two passes
+        // both saw the old file, one renamed it away). Without this re-check we would fire
+        // a no-op `vault.remove` on an already-gone path — harmless to disk, but it makes a
+        // pure move spuriously look like a delete. Skipping when gone keeps a true rename a
+        // true rename (no remove) and only removes a genuinely-stranded leftover.
+        await vault.remove(oldPath);
+      }
     }
-    if (emptyTarget !== undefined) {
-      await vault.rename(oldPath, emptyTarget);
-    } else if (materializedTarget !== undefined && (await localHashOf(oldPath)) !== null) {
-      // Live target already on disk → the old file is a stranded leftover → remove it.
-      // RE-CHECK the old file still exists immediately before removing: a CONCURRENT
-      // reconcile pass may have already moved it (the pure-move case where two passes
-      // both saw the old file, one renamed it away). Without this re-check we would fire
-      // a no-op `vault.remove` on an already-gone path — harmless to disk, but it makes a
-      // pure move spuriously look like a delete. Skipping when gone keeps a true rename a
-      // true rename (no remove) and only removes a genuinely-stranded leftover.
-      await vault.remove(oldPath);
+  } else {
+    // FULL (unscoped): original behavior — iterate all index entries.
+    for (const [oldPath, entry] of index.entries()) {
+      if (entry.deleted !== true) continue;
+      const liveTargets = liveByDocId.get(entry.docId);
+      if (liveTargets === undefined) continue; // docId fully tombstoned → a real delete.
+      if ((await localHashOf(oldPath)) === null) continue; // no file to move.
+      // Find the rename TARGET: a live path for this docId that is NOT the old key. Prefer
+      // an EMPTY target (→ rename/move). If every live target is already materialized, the
+      // content reached the new home independently → the old file is removable.
+      // (Divergent renames may bind >1 live path; the resolver below collapses them to one,
+      // then a later pass settles to the winner.)
+      let emptyTarget: VaultPath | undefined;
+      let materializedTarget: VaultPath | undefined;
+      for (const candidate of liveTargets) {
+        if (candidate === oldPath) continue;
+        if ((await localHashOf(candidate)) === null) {
+          emptyTarget = candidate;
+          break;
+        }
+        materializedTarget ??= candidate;
+      }
+      if (emptyTarget !== undefined) {
+        await vault.rename(oldPath, emptyTarget);
+      } else if (materializedTarget !== undefined && (await localHashOf(oldPath)) !== null) {
+        // Live target already on disk → the old file is a stranded leftover → remove it.
+        // RE-CHECK the old file still exists immediately before removing: a CONCURRENT
+        // reconcile pass may have already moved it (the pure-move case where two passes
+        // both saw the old file, one renamed it away). Without this re-check we would fire
+        // a no-op `vault.remove` on an already-gone path — harmless to disk, but it makes a
+        // pure move spuriously look like a delete. Skipping when gone keeps a true rename a
+        // true rename (no remove) and only removes a genuinely-stranded leftover.
+        await vault.remove(oldPath);
+      }
     }
   }
 
@@ -205,39 +291,91 @@ export async function runStructuralReconcile(deps: StructuralReconcileDeps): Pro
   // dissolves before the next pass) is never wrongly collapsed onto the old path. Gated so it
   // only writes when a conflict exists; idempotent + convergent (≤1 live → no-op).
   const confirm = deps.confirmDivergence ?? ((): boolean => true);
-  for (const [docId, paths] of liveByDocId) {
-    if (paths.length <= 1) continue;
-    if (!confirm(docId, paths)) continue; // torn-rename transient — await stability.
-    applyRenameConflictResolution(index, docId);
+  if (scopedPaths !== null && deps.scope !== undefined) {
+    // second clause narrows deps.scope for TS; equivalent to scopedPaths !== null
+    // SCOPED: iterate only workset docIds and check their live-path count.
+    // A divergence first appears when the rename's new key is changed (in the workset).
+    // confirmDivergence adds unconfirmed docIds to pendingDivergenceDocIds; buildWorkset
+    // unions pendingDivergenceDocIds into the workset every pass, so a divergent docId
+    // remains in scope until resolved — the drain interaction is preserved.
+    const { workset } = deps.scope;
+    for (const docId of workset) {
+      const paths = liveByDocId.get(docId);
+      if (paths === undefined || paths.length <= 1) continue;
+      if (!confirm(docId, paths)) continue; // torn-rename transient — await stability.
+      applyRenameConflictResolution(index, docId);
+    }
+  } else {
+    // FULL (unscoped): original behavior — iterate all of liveByDocId.
+    for (const [docId, paths] of liveByDocId) {
+      if (paths.length <= 1) continue;
+      if (!confirm(docId, paths)) continue; // torn-rename transient — await stability.
+      applyRenameConflictResolution(index, docId);
+    }
   }
 
   // CONCERN 2 — RESURRECT (before delete): a contested path becomes LIVE before the
   // delete pass runs, so it can never be removed. SKIP a tombstone whose docId is live
   // elsewhere (a move, not a resurrection at the old path).
-  for (const [path, entry] of index.entries()) {
-    if (entry.deleted !== true) continue;
-    if (isLiveElsewhere(entry.docId)) continue; // rename loser / move — not a resurrect.
-    const diskHash = await localHashOf(path);
-    if (diskHash === null) continue; // no local file → nothing to resurrect.
-    if (resolveTombstone(entry, diskHash) !== "resurrect") continue;
-    applyResurrection(index, path, entry, diskHash, onInboxNotice);
-    await markDirty(entry.docId);
+  if (scopedPaths !== null) {
+    // SCOPED: re-read each entry FRESH (the divergent resolver may have tombstoned losers;
+    // the entry's deleted flag must reflect the current state, not a stale snapshot).
+    for (const path of scopedPaths) {
+      const entry = index.get(path);
+      if (entry?.deleted !== true) continue;
+      if (isLiveElsewhere(entry.docId)) continue; // rename loser / move — not a resurrect.
+      const diskHash = await localHashOf(path);
+      if (diskHash === null) continue; // no local file → nothing to resurrect.
+      if (resolveTombstone(entry, diskHash) !== "resurrect") continue;
+      applyResurrection(index, path, entry, diskHash, onInboxNotice);
+      await markDirty(entry.docId);
+    }
+  } else {
+    // FULL (unscoped): original behavior.
+    for (const [path, entry] of index.entries()) {
+      if (entry.deleted !== true) continue;
+      if (isLiveElsewhere(entry.docId)) continue; // rename loser / move — not a resurrect.
+      const diskHash = await localHashOf(path);
+      if (diskHash === null) continue; // no local file → nothing to resurrect.
+      if (resolveTombstone(entry, diskHash) !== "resurrect") continue;
+      applyResurrection(index, path, entry, diskHash, onInboxNotice);
+      await markDirty(entry.docId);
+    }
   }
 
   // CONCERN 1 — DELETE: any STILL-tombstoned entry whose disk content matches the
   // tombstone hash is an uncontested delete. SKIP a tombstone whose docId is still LIVE
   // at another path — that is a rename's old key (or a rename loser), not a deletion;
   // removing it would destroy the file Concern 3 means to rename.
-  for (const [path, entry] of index.entries()) {
-    if (entry.deleted !== true) continue;
-    if (isLiveElsewhere(entry.docId)) continue; // move, not a delete.
-    const diskHash = await localHashOf(path);
-    if (diskHash === null) continue; // no local file → nothing to remove.
-    if (resolveTombstone(entry, diskHash) === "delete") {
-      await vault.remove(path);
-      // Clean up the now-deleted doc's base record. The fired "delete" event reaches an
-      // already-tombstoned entry, so `onDelete` early-returns without removing it — do it here.
-      await deleteBase(entry.docId);
+  if (scopedPaths !== null) {
+    // SCOPED: re-read each entry FRESH (resurrect may have re-listed a path LIVE; the
+    // freshness invariant ensures we never delete a just-resurrected file).
+    for (const path of scopedPaths) {
+      const entry = index.get(path);
+      if (entry?.deleted !== true) continue;
+      if (isLiveElsewhere(entry.docId)) continue; // move, not a delete.
+      const diskHash = await localHashOf(path);
+      if (diskHash === null) continue; // no local file → nothing to remove.
+      if (resolveTombstone(entry, diskHash) === "delete") {
+        await vault.remove(path);
+        // Clean up the now-deleted doc's base record. The fired "delete" event reaches an
+        // already-tombstoned entry, so `onDelete` early-returns without removing it — do it here.
+        await deleteBase(entry.docId);
+      }
+    }
+  } else {
+    // FULL (unscoped): original behavior.
+    for (const [path, entry] of index.entries()) {
+      if (entry.deleted !== true) continue;
+      if (isLiveElsewhere(entry.docId)) continue; // move, not a delete.
+      const diskHash = await localHashOf(path);
+      if (diskHash === null) continue; // no local file → nothing to remove.
+      if (resolveTombstone(entry, diskHash) === "delete") {
+        await vault.remove(path);
+        // Clean up the now-deleted doc's base record. The fired "delete" event reaches an
+        // already-tombstoned entry, so `onDelete` early-returns without removing it — do it here.
+        await deleteBase(entry.docId);
+      }
     }
   }
 }

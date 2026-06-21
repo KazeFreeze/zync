@@ -49,6 +49,16 @@ const DEFAULT_SETTINGS: ZyncSettings = {
 const CONFIG_DIR = ".obsidian/zync"; // vault-relative; the BaseStore zone ObsidianVaultPort excludes
 const MAX_PROSE_BYTES = 1_000_000;
 
+/**
+ * How often (ms) to poll engine.pendingDocs() for the status bar.
+ *
+ * pendingDocs() is an O(n) disk-read scan — intentionally authoritative but expensive. During a
+ * large first-sync (~1000+ notes) polling at 2 s produced ~450-900 full scans over the sync
+ * window. 8 s is still plenty fresh for a "N pending" indicator; connect/disconnect updates arrive
+ * push-style via transport.onStatus and are unaffected by this constant.
+ */
+const STATUS_POLL_INTERVAL_MS = 8_000;
+
 export default class ZyncPlugin extends Plugin {
   override settings: ZyncSettings = { ...DEFAULT_SETTINGS };
 
@@ -60,6 +70,11 @@ export default class ZyncPlugin extends Plugin {
   private dbName: string | null = null;
   private statusBar: HTMLElement | null = null;
   private statusTimer: number | null = null;
+  /** Guards against concurrent pendingDocs() scans when a poll takes longer than the interval. */
+  private statusRefreshInFlight = false;
+  /** Last computed pending count — rendered immediately on a connText push so a status change is
+   *  reflected without waiting for the next (coarse, possibly skipped) expensive scan. */
+  private lastPending = 0;
   private readonly unsubs: (() => void)[] = [];
   private connText = "offline";
   private lastConflictCount = 0;
@@ -172,9 +187,13 @@ export default class ZyncPlugin extends Plugin {
       this.editorBinding = new ObsidianEditorBinding(this.app, engine);
       this.editorBinding.start();
 
-      // Poll pending count for the status bar (cheap; the engine has no push for it). Tracked so
-      // stopEngine clears it — registerInterval alone would leak one timer per restart.
-      this.statusTimer = window.setInterval(() => void this.refreshStatus(), 2000);
+      // Poll pending count for the status bar. Tracked so stopEngine clears it — registerInterval
+      // alone would leak one timer per restart. Coarse cadence (STATUS_POLL_INTERVAL_MS) because
+      // pendingDocs() is O(n) disk I/O; connection status arrives push-style via onStatus above.
+      this.statusTimer = window.setInterval(
+        () => void this.refreshStatus(),
+        STATUS_POLL_INTERVAL_MS,
+      );
       void this.refreshStatus();
       console.log("[zync] engine started");
     } catch (err) {
@@ -191,6 +210,10 @@ export default class ZyncPlugin extends Plugin {
       window.clearInterval(this.statusTimer);
       this.statusTimer = null;
     }
+    // Reset the in-flight guard so a mid-poll stop doesn't permanently block polling after restart.
+    this.statusRefreshInFlight = false;
+    // Reset the cached pending count so a restart doesn't briefly render a stale number.
+    this.lastPending = 0;
     this.editorBinding?.stop();
     this.editorBinding = null;
     for (const u of this.unsubs.splice(0)) u();
@@ -231,15 +254,26 @@ export default class ZyncPlugin extends Plugin {
   // ── status + conflicts ───────────────────────────────────────────────────────
 
   private async refreshStatus(): Promise<void> {
-    let pending = 0;
-    if (this.engine !== null) {
-      try {
-        pending = (await this.engine.pendingDocs()).length;
-      } catch {
-        // engine stopped mid-poll — ignore
+    // Render the CHEAP current state immediately (connText + last-known pending). This path runs on
+    // every call — including the push-driven onStatus calls — so a connection change is reflected
+    // at once, even while an expensive scan below is in-flight (or skipped).
+    this.renderStatus(this.lastPending);
+    // Skip the EXPENSIVE O(n) pendingDocs() scan if a previous one is still running — prevents
+    // unbounded pileup during a large first-sync where a single scan can exceed the poll interval.
+    if (this.statusRefreshInFlight) return;
+    this.statusRefreshInFlight = true;
+    try {
+      if (this.engine !== null) {
+        try {
+          this.lastPending = (await this.engine.pendingDocs()).length;
+        } catch {
+          // engine stopped mid-poll — ignore
+        }
       }
+      this.renderStatus(this.lastPending);
+    } finally {
+      this.statusRefreshInFlight = false;
     }
-    this.renderStatus(pending);
   }
 
   private renderStatus(pending: number): void {

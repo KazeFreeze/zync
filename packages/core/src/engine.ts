@@ -83,6 +83,35 @@ const DEFAULT_DEBOUNCE_MS = 1500;
 /** Default rename-transaction settle window (ms) — see {@link EngineConfig.renameSettleMs}. */
 const DEFAULT_RENAME_SETTLE_MS = 60;
 
+/**
+ * S6c: Quiescence debounce (ms). After the reconcile loop goes idle, wait this long
+ * before triggering a full convergence audit. Re-armed on every reconcile activity
+ * so it only fires after a true quiet period.
+ *
+ * O(n^2)-AVOIDANCE (F2 — set from the on-device profile). The earlier 2000ms value
+ * fired ~70 audits DURING a real-relay first sync: a relay-bound seed is NOT
+ * "continuously busy" — index echoes arrive ~1-2/sec with brief lulls, and every lull
+ * longer than the window was (falsely) read as quiescence, firing a full O(n) audit.
+ * Audit-count then scaled with seed duration (which scales with n) -> O(n^2). The
+ * window must comfortably EXCEED the inter-echo gap so an actively-seeding loop keeps
+ * re-arming it and it fires only at a GENUINE pause (true settle). 15s sits well above
+ * the ~1/sec echo cadence yet below the watchdog floor, giving O(1) audits per seed.
+ * (The progress-aware watchdog handles the "busy but stuck/long" floor separately.)
+ */
+export const AUDIT_QUIESCENCE_MS = 15_000;
+
+/**
+ * S6c: Watchdog max staleness (ms). If the reconcile loop stays continuously busy
+ * for longer than this without a full audit, the watchdog fires ONE audit (one-shot
+ * latch per busy epoch, not repeating). Default 30 seconds.
+ *
+ * O(n^2)-AVOIDANCE: the one-shot latch (`auditedThisBusyEpoch`) ensures at most ONE
+ * watchdog audit per continuous-busy epoch regardless of how long the storm lasts.
+ * A repeating timer would fire ~(storm_duration/interval) times -> O(n^2). The latch
+ * is the load-bearing O(n^2) guard — tests verify removing it causes repeated firing.
+ */
+export const AUDIT_MAX_STALENESS_MS = 30_000;
+
 /** A pending debounced bump: its settle promise is tracked by {@link SyncEngine.whenIdle}. */
 interface PendingBump {
   timer: ReturnType<typeof setTimeout> | null;
@@ -133,6 +162,24 @@ export class SyncEngine {
    * the next pass and is never wrongly collapsed onto the old path.
    */
   private priorDivergence = new Map<DocId, string>();
+
+  /**
+   * Stage 3: docIds with a divergence RECORDED (in `priorDivergence`) but NOT YET RESOLVED
+   * on the CURRENT pass (the `confirmDivergence` seam returned `false` — the stability gate
+   * awaits a second consecutive sighting). Distinct from `priorDivergence` (which holds the
+   * SIGNATURE map); this is a WORK QUEUE of docIds that MUST appear in the next structural
+   * pass's workset.
+   *
+   * ENQUEUE: when `confirmDivergence` records a divergence for a docId but returns `false`
+   * (i.e. it is not yet confirmed/resolved — goes into `priorDivergence` awaiting the next
+   * pass). DRAIN: when the docId is observed with <=1 live path (non-divergent) OR after
+   * `applyRenameConflictResolution` runs and the post-check confirms <=1 live path.
+   *
+   * WHY NEEDED (S4+): under scoping, "next pass" may not visit the diverged docId. This set
+   * forces it into the next structural pass so the two-consecutive-pass stability gate can
+   * complete. (Risk #3 in CURSOR-GPT-KEYSCOPED-RECONCILE-FINDINGS.md.)
+   */
+  private readonly pendingDivergenceDocIds = new Set<DocId>();
   readonly base: BaseStore;
 
   private readonly ports: EnginePorts;
@@ -154,6 +201,18 @@ export class SyncEngine {
   private vaultUnsub: Unsubscribe | null = null;
   private indexUnsub: Unsubscribe | null = null;
   private blobUnsub: Unsubscribe | null = null;
+  /**
+   * F1 reconnect-backstop subscription. Unsubscribed in stop() so no status callback
+   * fires after the engine is torn down.
+   */
+  private transportUnsub: Unsubscribe | null = null;
+  /**
+   * F1 reconnect-backstop flag. Set to `true` once start()'s step-9 full pass is
+   * scheduled, so the onStatus handler can distinguish the initial connect (already
+   * handled by step 9) from a genuine RECONNECT (offline → connected transition that
+   * needs a fresh full pass to re-push offline-accumulated dirty docs).
+   */
+  private startupDone = false;
 
   // ── per-note bookkeeping ────────────────────────────────────────────────
   private readonly attached = new Map<DocId, CrdtDoc>();
@@ -170,6 +229,43 @@ export class SyncEngine {
   // ── deterministic quiescence ────────────────────────────────────────────
   private readonly inflight = new Set<Promise<unknown>>();
   private readonly pendingBumps = new Map<VaultPath, PendingBump>();
+  /**
+   * Stage 4a: per-path docId cache used as a safety net for paths that have left the index
+   * CRDT map entirely (not even a tombstone remains). Populated in the `index.observe` handler
+   * from each changed path's CURRENT docId — captured BEFORE the observe callback returns.
+   * When `buildWorksetWithMaps` sees a changed path absent from the index, it falls back here
+   * so the docId is still included in the workset.
+   *
+   * In practice tombstones keep the docId resolvable indefinitely (IndexDoc does not hard-delete),
+   * so this branch is forward-insurance rather than a common code path.
+   *
+   * BOUNDED: paths whose docId is now in the live or tombstoned index are pruned during
+   * `buildWorksetWithMaps` so the cache does not grow indefinitely.
+   */
+  private readonly prevEntryByPath = new Map<VaultPath, DocId>();
+
+  /**
+   * S6a — self-draining backstop flag. Set to `true` when a GENUINELY NEW docId enters any
+   * backstop set ({@link pendingDivergenceDocIds}, {@link LazyAttachManager.needsCatchUp}, or
+   * {@link LazyAttachManager.remoteUpdatedSinceSettle}) — i.e. when {@link onBackstopWork} fires
+   * or when `pendingDivergenceDocIds.add` is called for a docId not already in the set.
+   *
+   * `runReconcileLoop` checks this flag alongside `pendingChangedPaths` so a backstop-only
+   * enqueue (with no further index.observe) still gets a draining pass. Consumed (reset to false)
+   * at the TOP of each loop iteration; a new enqueue mid-pass re-sets it so the loop continues.
+   *
+   * ANTI-SPIN: the flag is set ONLY on a genuinely-new set member. Re-adding a docId already
+   * present in a backstop set (e.g. a persistent ack timeout re-adding to needsCatchUp) must NOT
+   * set this flag — so after ONE retry pass the loop exits even if the doc remains stuck.
+   *
+   * STALE-TRUE IS SAFE — DO NOT "fix" it by resetting in {@link runFullConvergencePass}. A full
+   * pass drains every backstop set but does not clear this flag (and an enqueue can fire between
+   * the last drain and the finally). Leaving it true costs at most ONE backstop-only pass over
+   * already-drained sets (a no-op: empty unions + openDocIds find nothing new). Resetting it in
+   * the full pass's finally would instead risk dropping a genuinely-new enqueue that raced it.
+   */
+  private freshBackstopWork = false;
+
   // DURABLE WORK-QUEUE COALESCER (Stage 2 — replaces the three-boolean coalescer).
   //
   // Stage 1 coalescer (boolean flags): bounded to one pass in flight, re-ran once more if any
@@ -190,9 +286,11 @@ export class SyncEngine {
   //   (d) On SUCCESS: runningBatch is cleared; loop continues if pendingChangedPaths is non-empty.
   //   (e) whenIdle drains inflight with allSettled — sees the real loop promise, never a manual gate.
   //
-  // Passes are still FULL (runCatchUp + structuralReconcile + settleCleanDocs over ALL entries).
-  // The batch is collected but not yet used to scope the work — scoping is a later stage.
-  // This is pure plumbing: convergence must stay byte-identical.
+  // Post-S6b the observe path is FULLY SCOPED: runCatchUp (S4b), materializeLiveDiskContent
+  // (S4c), structuralReconcile's tombstone/divergent loops (S5), and settleCleanDocs (S6b)
+  // all iterate only the workset. Only runFullConvergencePass (waitConverged/startup) remains
+  // unscoped. The batch is still collected here as the durable durability boundary (on throw,
+  // paths are re-queued so no index event is ever dropped).
   private readonly pendingChangedPaths = new Set<VaultPath>();
   // The set of paths snapshotted into the currently-running pass (cleared on success, re-queued
   // on throw). Kept separate from pendingChangedPaths so mid-pass changes land in the pending set
@@ -200,6 +298,102 @@ export class SyncEngine {
   private runningBatch = new Set<VaultPath>();
   // True while the reconcile loop promise is in flight. Prevents double-scheduling.
   private reconcileLoopRunning = false;
+  /**
+   * S6a: true while `runFullConvergencePass` is executing. Used in the `onBackstopWork` seam
+   * to suppress `scheduleReconcile()` calls from `LazyAttachManager` callbacks that fire
+   * mid-`runFullConvergencePass` (e.g. enqueue from the full-path precheck or ack-timeout
+   * workers). A `runFullConvergencePass` call already processes all backstop sets, so firing
+   * `scheduleReconcile()` there would spawn a parallel reconcile loop that runs CONCURRENTLY
+   * with the rest of the full pass — causing races and false-not-settled failures.
+   *
+   * `onBackstopWork` only needs to schedule the loop when triggered OUTSIDE of a
+   * `runFullConvergencePass` context (i.e. from the `bindOutbound` remote-update path or
+   * from the observe-loop's pass workers when no further observe will come). When inside a
+   * full convergence pass the pass already handles all sets — scheduling is a no-op at best,
+   * harmful at worst.
+   */
+  private inFullConvergencePass = false;
+
+  // ── S6c: hybrid low-frequency full convergence audit ────────────────────────
+  //
+  // Two triggers, both routing the audit through the reconcile loop (serialized +
+  // tracked for free via the loop promise):
+  //
+  // 1. QUIESCENCE-DEBOUNCED: after every period of reconcile activity, a debounced
+  //    timer fires once the loop has been idle for AUDIT_QUIESCENCE_MS (re-armed on each
+  //    loop iteration so it fires only after true quiescence). F2 WORK-AWARE GATE: when it
+  //    fires it requests the audit ONLY if `hasOutstandingWork()` is false (all scoped-path
+  //    backstop sets empty); if work remains it suppresses the audit (the scoped passes are
+  //    still converging). Firing always ends the current busy epoch (resets the watchdog).
+  //
+  // 2. WATCHDOG (PROGRESS-AWARE, ONE-SHOT PER STALL): armed when a busy epoch starts. On
+  //    fire (after AUDIT_MAX_STALENESS_MS) it RE-ARMS without auditing if `reconcileProgressTick`
+  //    advanced since it was armed (the loop is making progress — a healthy seed, not stuck);
+  //    it fires ONE audit only when the tick is UNCHANGED (genuinely STALLED). The
+  //    `auditedThisBusyEpoch` latch then prevents re-firing within the same epoch. So a healthy
+  //    progressing seed produces ZERO watchdog audits; the watchdog is the floor for stuck systems.
+  //
+  // Busy epoch lifecycle:
+  //   START: when scheduleReconcile arms a loop that was NOT already running.
+  //   END:   when quiescence timer fires (loop went idle for the full window).
+  //
+  // O(n^2)-AVOIDANCE (F2, from the on-device profile): a relay-bound seed is NOT continuously
+  // busy — index echoes arrive ~1/sec with brief lulls. At the old 2s quiescence window every
+  // lull was read as quiescence -> a full O(n) audit -> audit-count scaled with seed duration
+  // (~n) -> O(n^2). The 15s window (> echo cadence) + the work-aware quiescence gate + the
+  // progress-aware watchdog together make a healthy seed produce O(1) full audits regardless of n.
+
+  /** S6c: a full audit is requested (set by quiescence timer or watchdog). */
+  private auditRequested = false;
+
+  /**
+   * S6c: quiescence debounce timer. Re-armed (clear + set) whenever reconcile
+   * activity occurs. When it fires (loop idle for AUDIT_QUIESCENCE_MS), sets
+   * `auditRequested` and calls `scheduleReconcile()`. Also ends the busy epoch.
+   */
+  private auditQuiescenceTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * S6c/F2: watchdog timer for the current busy epoch. Armed when a new busy epoch starts
+   * (scheduleReconcile arms an idle loop). On fire (after AUDIT_MAX_STALENESS_MS) it is
+   * PROGRESS-AWARE — see {@link armWatchdogTimer}: it re-arms WITHOUT auditing if
+   * `reconcileProgressTick` advanced (system progressing), and fires the audit only on a
+   * genuine STALL (tick unchanged). The latch then blocks re-fire within the epoch.
+   */
+  private auditStaleTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * S6c: one-shot latch for the current busy epoch. Set to `true` when the watchdog
+   * fires an audit; prevents the watchdog from firing again in the same epoch.
+   * Reset to `false` when the epoch ends (the quiescence timer fires).
+   *
+   * NOTE: this INTENTIONALLY persists across epoch boundaries until a quiescence fire resets
+   * it — a stall is ultimately covered by the quiescence path (a stalled loop goes idle ->
+   * quiescence fires -> audit + reset). Do NOT "fix" it into a per-epoch reset; that would
+   * re-open the watchdog double-fire the latch guards against.
+   */
+  private auditedThisBusyEpoch = false;
+
+  /**
+   * F2: monotonic progress counter, bumped on any convergence activity.
+   *
+   * Incremented in three places:
+   *   1. `index.observe` handler — an index event arrived (work incoming).
+   *   2. Scoped-pass loop — a non-empty workset was processed (real work done).
+   *   3. `bindOutbound` remote-update handler — an incoming remote note-doc update
+   *      arrived (the relay is delivering progress).
+   *
+   * The watchdog snapshots this on arm; if the tick has NOT advanced when the watchdog
+   * fires, the system is genuinely STALLED — fire the audit. If it HAS advanced, the
+   * system is making progress (healthy seed) — suppress the audit and re-arm the watchdog
+   * for another window.
+   *
+   * O(1): always just `this.reconcileProgressTick++`. Wrapping at MAX_SAFE_INTEGER is
+   * harmless (the watchdog only cares about `tickNow !== tickAtArm`; a wrap causes at
+   * most one false-stall false-positive every 2^53 ticks — effectively never).
+   */
+  private reconcileProgressTick = 0;
+
   /**
    * The single in-flight rename-transaction settle: a tracked, RE-ARMABLE timer (see
    * {@link scheduleRenameSettle}). Re-arming on each suppressed fallout event keeps the
@@ -321,6 +515,20 @@ export class SyncEngine {
       // prove doc==disk==index agreement before re-advancing its synced stamp. READ-ONLY:
       // reads the vault + hashes; writes nothing.
       diskHashOf: (docId) => this.diskHashOf(docId),
+      // S6a: self-draining backstop seam — fires when a GENUINELY NEW docId enters needsCatchUp
+      // or remoteUpdatedSinceSettle (the "new to set" guard in LazyAttachManager ensures re-adds
+      // do NOT invoke this, which is the anti-spin guarantee). Sets freshBackstopWork and
+      // schedules a wakeup so the reconcile loop re-runs for backstop-only work.
+      //
+      // IMPORTANT: suppressed (via inFullConvergencePass) when the enqueue fires from INSIDE a
+      // runFullConvergencePass call — that call already handles all backstop sets, so scheduling
+      // a parallel observe-loop there would race the full pass and cause false non-settle failures.
+      onBackstopWork: () => {
+        this.freshBackstopWork = true;
+        if (!this.inFullConvergencePass) {
+          this.scheduleReconcile();
+        }
+      },
     });
 
     // 6. Bootstrap: seed local prose that has no index entry yet; then sweep orphans.
@@ -337,20 +545,87 @@ export class SyncEngine {
     //    state. COALESCED (not one chain per transaction) — see {@link scheduleReconcile}.
     //    Stage 2: thread the changed paths into pendingChangedPaths so they are durable across
     //    a thrown pass (no path is ever dropped).
+    //    Stage 4a: BEFORE recording each changed path, capture its CURRENT docId into
+    //    prevEntryByPath so that buildWorkset can resolve a path even after it is removed from
+    //    the live index (tombstoned or re-keyed). The CURRENT docId is snapshotted here, at the
+    //    moment the observe callback fires (the CRDT has applied the change, so index.get(p)
+    //    returns the NEW value — which for a tombstone still carries the docId; for a path now
+    //    absent from the map it returns undefined and we fall back to the prior cached value).
     this.indexUnsub = this.index.observe((changedPaths) => {
-      for (const p of changedPaths) this.pendingChangedPaths.add(p);
+      for (const p of changedPaths) {
+        // Capture the docId from the CURRENT index entry (may be tombstoned or live).
+        const currentDocId = this.index.get(p)?.docId;
+        if (currentDocId !== undefined) {
+          this.prevEntryByPath.set(p, currentDocId);
+        }
+        this.pendingChangedPaths.add(p);
+      }
+      // F2: bump the progress counter on every index event — signals active work incoming.
+      this.reconcileProgressTick++;
       this.scheduleReconcile();
     });
 
     // 9. Initial catch-up so an adopting device pulls everything the index already
     //    lists, then an initial structural reconcile so a tombstone already present
     //    at adopt time is applied.
-    this.track(
-      this.lazyAttach
-        .runCatchUp(this.openDocIds())
-        .then(() => this.structuralReconcile())
-        .then(() => this.lazyAttach.settleCleanDocs()),
-    );
+    //    Stage 4a: routes through runFullConvergencePass() — the named full-chain entry
+    //    point. Startup / flush / waitConverged / the future periodic audit MUST always
+    //    use runFullConvergencePass() (never the scoped helper).
+    //    F1: set startupDone BEFORE tracking the pass so the onStatus handler (subscribed
+    //    in step 10) never fires a SECOND full pass for the initial connect.
+    this.startupDone = true;
+    this.track(this.runFullConvergencePass());
+
+    // 10. F1 reconnect-backstop: subscribe to transport status changes and fire a
+    //     reconnect catch-up on every genuine offline→connected RECONNECT (not the
+    //     initial connect — step 9 covers that). This re-pushes any dirty docs that
+    //     were edited OFFLINE and whose index-observe already drained from
+    //     pendingChangedPaths while offline (catch-up early-returns offline so they
+    //     never entered needsCatchUp). Without this, those offline edits are stranded
+    //     on reconnect → silent data loss.
+    //
+    //     FILTER: fire on the FIRST "connected" after the transport has been "offline"
+    //     since the last connect. We LATCH "saw offline" rather than comparing only the
+    //     IMMEDIATELY-preceding status, because the real Hocuspocus transport reconnects
+    //     via offline -> CONNECTING -> connected (transport-hocuspocus.ts maps
+    //     WebSocketStatus.Connecting -> "connecting"). A guard that required the prior
+    //     status to be exactly "offline" would see "connecting" at the connected event and
+    //     SILENTLY NOT FIRE on a real reconnect — stranding offline edits (the in-process
+    //     mock hides this: goOnline() jumps straight offline->connected). The latch fires
+    //     correctly for both transition shapes. ("unauthorized" is treated like offline:
+    //     a session that recovers from it also needs the re-push.)
+    //
+    //     ACTIVE-BOUND SAFETY: we call runCatchUp with an EMPTY openDocIds (not the
+    //     engine's live openDocIds). Active-bound docs have their editor edits handled
+    //     by the CRDT transport's auto-resync (state-vector exchange on reconnect) and
+    //     do NOT need the dirty-reconcile path here. Including them would advance their
+    //     synced stamp to the merged CRDT text while the index hasn't been bumped for
+    //     the merged content — creating a false-pending latch (stamp != synced forever
+    //     until the editor autosaves + ingest bumps the index). Passing an empty
+    //     openDocIds means open docs are only selected if their stamp != synced (e.g.
+    //     a dirty-and-open doc whose local ingest bumped the stamp while offline — those
+    //     ARE correctly selected and re-pushed).
+    let sawOfflineSinceConnected = transport.status() !== "connected";
+    this.transportUnsub = transport.onStatus((s) => {
+      if (s === "offline" || s === "unauthorized") {
+        sawOfflineSinceConnected = true;
+        return;
+      }
+      if (s === "connected" && sawOfflineSinceConnected && this.startupDone) {
+        // Genuine RECONNECT (offline -> [connecting] -> connected, after startup). Re-push
+        // all dirty docs via catch-up. EMPTY openDocIds: open docs are handled by CRDT
+        // transport resync; including them would falsely advance their synced stamp (see
+        // ACTIVE-BOUND SAFETY). Clear the latch so a later spurious "connected" does not re-fire.
+        //
+        // CATCH-UP-ONLY BY DESIGN: this does NOT run the full structural/settle/orphan chain (a
+        // full pass would force-select active-bound docs and false-latch them). It re-pushes the
+        // dirty content; a tombstone/rename that arrived during the partition is applied by the
+        // next index-observe scoped pass (the index auto-resyncs on reconnect) or, worst case, the
+        // S6c audit — bounded staleness, NOT loss.
+        sawOfflineSinceConnected = false;
+        this.track(this.lazyAttach.runCatchUp(new Set()));
+      }
+    });
   }
 
   async stop(): Promise<void> {
@@ -360,15 +635,27 @@ export class SyncEngine {
     this.vaultUnsub?.();
     this.indexUnsub?.();
     this.blobUnsub?.();
+    this.transportUnsub?.();
     this.vaultUnsub = null;
     this.indexUnsub = null;
     this.blobUnsub = null;
+    this.transportUnsub = null;
 
     for (const pending of this.pendingBumps.values()) {
       if (pending.timer !== null) clearTimeout(pending.timer);
       pending.resolve();
     }
     this.pendingBumps.clear();
+
+    // S6c: clear audit timers so no dangling timer fires after stop().
+    if (this.auditQuiescenceTimer !== null) {
+      clearTimeout(this.auditQuiescenceTimer);
+      this.auditQuiescenceTimer = null;
+    }
+    if (this.auditStaleTimer !== null) {
+      clearTimeout(this.auditStaleTimer);
+      this.auditStaleTimer = null;
+    }
 
     // Resolve any still-armed rename-transaction settle (the vault is now unsubscribed,
     // so no further fallout can re-arm it) so its tracked `done` gate never dangles.
@@ -404,6 +691,75 @@ export class SyncEngine {
   // ──────────────────────────────────────────────────────────────────────────
   // observability / test seams
   // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Stage 3: expose the {@link LazyAttachManager} for direct backstop-set seam access
+   * in tests (`needsCatchUpSnapshot`, `remoteUpdatedSinceSettleSnapshot`, `noteRemoteUpdate`,
+   * `addNeedsCatchUp`). Only available after {@link start} initializes it.
+   */
+  get lazyAttachManager(): LazyAttachManager {
+    return this.lazyAttach;
+  }
+
+  /**
+   * Stage 3: READ-ONLY snapshot of {@link pendingDivergenceDocIds} for test assertions.
+   * Returns a fresh `Set` copy so callers cannot mutate internal state.
+   */
+  pendingDivergenceDocIdsSnapshot(): ReadonlySet<DocId> {
+    return new Set(this.pendingDivergenceDocIds);
+  }
+
+  /**
+   * Stage 3: enqueue a docId into {@link pendingDivergenceDocIds}. TEST-ONLY seam to simulate
+   * "pass recorded a divergence but did not resolve it". Production does NOT call this — it adds
+   * via {@link enqueuePendingDivergenceDocId} in `structuralReconcile`'s `confirmDivergence`
+   * closure. Routes through the private helper so the S6a anti-spin guard applies uniformly.
+   */
+  addPendingDivergenceDocId(docId: DocId): void {
+    this.enqueuePendingDivergenceDocId(docId);
+  }
+
+  /**
+   * Stage 3: drain a docId from {@link pendingDivergenceDocIds}. TEST-ONLY seam to simulate
+   * "divergence observed as resolved (<=1 live path)". Production does NOT call this — the
+   * post-reconcile drain loop in `structuralReconcile` deletes from the field directly.
+   */
+  clearPendingDivergenceDocId(docId: DocId): void {
+    this.pendingDivergenceDocIds.delete(docId);
+  }
+
+  /**
+   * S6a: internal helper — add docId to {@link pendingDivergenceDocIds} with the "genuinely new"
+   * guard. Only sets {@link freshBackstopWork} and calls {@link scheduleReconcile} when the docId
+   * was not already in the set (anti-spin guarantee). Used by the `confirmDivergence` closure in
+   * `structuralReconcile` (the production path) and by {@link addPendingDivergenceDocId} (the
+   * test seam). Must remain private — callers outside this class use the test seam only.
+   */
+  private enqueuePendingDivergenceDocId(docId: DocId): void {
+    if (!this.pendingDivergenceDocIds.has(docId)) {
+      this.pendingDivergenceDocIds.add(docId);
+      this.freshBackstopWork = true;
+      // S6a: suppress scheduleReconcile() when inside runFullConvergencePass — that call already
+      // handles pendingDivergenceDocIds via its structuralReconcile + full workset, so scheduling
+      // a parallel observe-loop from here would race the full pass unnecessarily.
+      if (!this.inFullConvergencePass) {
+        this.scheduleReconcile();
+      }
+    }
+    // Re-add is a no-op for Sets, and we intentionally do NOT set freshBackstopWork for a
+    // re-add — a docId already in the set was already scheduled for a draining pass, and
+    // re-setting the flag would cause an extra pass each time any stability-gate re-sighting
+    // fires on a persistently-divergent docId (spin risk).
+  }
+
+  /**
+   * Stage 3: READ-ONLY snapshot of `lazyAttach.remoteUpdatedSinceSettle` via the manager's
+   * seam. Delegates to {@link LazyAttachManager.remoteUpdatedSinceSettleSnapshot}. Only
+   * valid after {@link start} initializes the manager.
+   */
+  remoteUpdatedSinceSettleSnapshot(): ReadonlySet<DocId> {
+    return this.lazyAttach.remoteUpdatedSinceSettleSnapshot();
+  }
 
   /** Resolves when NO reconcile is in flight (drains the tracked set; flushes bumps first). */
   async whenIdle(): Promise<void> {
@@ -496,20 +852,50 @@ export class SyncEngine {
     for (let round = 0; round < MAX_ROUNDS; round++) {
       await this.drainEagerBlobs();
       await this.whenIdle();
-      if ((await this.pendingDocs()).length === 0) return;
+      // S7: recover ORPHANS (concurrent-create losers) before the convergence check. They are NOT
+      // live entries and are in NO backstop set, so pendingDocs + the backstop sets cannot represent
+      // an un-recovered orphan — and S7 moved the sweep OUT of the scoped hot path, so without this
+      // the check below could falsely report convergence with a loser still stranded in the docStore.
+      // We run ONLY the sweep here (NOT a full catch-up pass): the sweep is idempotent + loop-safe and
+      // does NOT advance synced stamps, so it cannot disturb an active-bound doc whose index is still
+      // pre-merge (running a full catch-up here WOULD — it advances the synced stamp to the editor's
+      // merged text while the index lags, latching a false mismatch). If the sweep recovers a loser,
+      // the new conflict artifact is a live entry → pendingDocs becomes non-empty → the check below
+      // does not return, and the runFullConvergencePass below materializes the artifact to disk.
+      // COST: the per-candidate docStore.load is gated behind a non-empty orphan set, so the common
+      // no-orphan case is just one docStore.list() + an in-memory diff — lower-order than the
+      // pendingDocs() disk scan already on this gate. SAFE before catch-up: orphan discrimination keys
+      // off the index TREE BINDING (which converges via ingest independently of catch-up's synced-
+      // stamp/attach work). Idempotent, so the redundant sweep inside runFullConvergencePass (and the
+      // S6c audit) is harmless.
+      await this.runOrphanSweep();
+      await this.whenIdle();
+      // S6a: do not return while backstop work remains (the sets may hold docIds that have not yet
+      // been given a draining pass — returning early would falsely report convergence). Check all
+      // three backstop sets in addition to pendingDocs.
+      if (
+        (await this.pendingDocs()).length === 0 &&
+        this.pendingDivergenceDocIds.size === 0 &&
+        this.lazyAttach.needsCatchUpSnapshot().size === 0 &&
+        this.lazyAttach.remoteUpdatedSinceSettleSnapshot().size === 0
+      )
+        return;
       // Catch-up THEN structural reconcile (mirrors the index-observe chain): the
       // reconcile's materialization step drives a now-live resurrected entry's
       // content to disk, which the disk-aware pendingDocs check waits on.
-      await this.lazyAttach.runCatchUp(this.openDocIds());
-      await this.structuralReconcile();
-      // Clean-settle (0b-3 Fix 6): re-advance the synced stamp of any doc that has fully
-      // converged (doc==disk==index) but whose synced stamp is latched at an intermediate
-      // merge hash — the symmetric clean-3-way-merge latch the catch-up ack gate cannot clear
-      // once the doc converged via remote updates. Runs AFTER reconcile so disk is materialized.
-      await this.lazyAttach.settleCleanDocs();
+      // Stage 4a: uses runFullConvergencePass() — the named full-chain entry point.
+      // waitConverged MUST always run the FULL chain (never the scoped hot path).
+      await this.runFullConvergencePass();
       await this.drainEagerBlobs();
       await this.whenIdle();
-      if ((await this.pendingDocs()).length === 0) return;
+      // S6a: same backstop check on the second idle in each round.
+      if (
+        (await this.pendingDocs()).length === 0 &&
+        this.pendingDivergenceDocIds.size === 0 &&
+        this.lazyAttach.needsCatchUpSnapshot().size === 0 &&
+        this.lazyAttach.remoteUpdatedSinceSettleSnapshot().size === 0
+      )
+        return;
     }
     const stuck = await this.pendingDocs();
     throw new Error(
@@ -681,6 +1067,17 @@ export class SyncEngine {
       // Headless/daemon docs are never `active-bound`, so this is a no-op there (harness unchanged).
       const path = this.pathOf(doc.id);
       if (path !== undefined && this.isActiveBound(path)) return;
+      // Stage 3: enqueue into remoteUpdatedSinceSettle (after the active-bound guard). O(1); no I/O.
+      // For non-active-bound docs this gives settleCleanDocs a trigger for docs that converge via
+      // remote note-doc updates with NO index-key change (the clean-settle-latch backstop, Risk #1
+      // in the cross-model review). S6a: active-bound docs are excluded — their convergence is driven
+      // by the editor's autosave → ingest chain. Enqueueing them here would fire onBackstopWork and
+      // trigger extra reconcile passes that advance the synced stamp to the merged CRDT hash while
+      // the index stamp is still at the pre-merge value (because the editor edit bypasses ingest),
+      // creating a permanent stamp mismatch that keeps waitConverged spinning forever.
+      this.lazyAttach.noteRemoteUpdate(doc.id);
+      // F2: bump the progress counter — incoming remote note-doc update = relay is delivering work.
+      this.reconcileProgressTick++;
       this.track(this.outbound.onRemoteUpdate(doc));
     });
     this.attachedUnsubs.set(doc.id, unsub);
@@ -754,14 +1151,28 @@ export class SyncEngine {
     // reconcile pushes the content to the relay but does NOT itself confirm receipt (the
     // catch-up ack gate advances the acked base once the relay acks). Keeping the acked base
     // lagging is what preserves the disk edit if THIS push, too, is interrupted by a crash.
-    await this.base.save(docId, {
-      baseText: merged,
-      fileHash: mergedHash,
-      crdtToken: doc.encodeStateVector(),
-      substrate: this.substrate,
-      ackedText: baseRec?.ackedText ?? "",
-      ackedHash: baseRec?.ackedHash ?? (await sha256OfText("")),
-    });
+    // S9 first-sync write-fold: skip this base write when it would persist a record that is
+    // BEHAVIORALLY IDENTICAL to the one already on disk. Every field of the record below is
+    // carried forward from `baseRec` (substrate is constant; ackedText/ackedHash default to
+    // baseRec's) EXCEPT `baseText`/`fileHash` — and `crdtToken`, which is WRITE-ONLY: it is
+    // serialized but never read back anywhere in production (an 0b-2 §A/§B vestige). So when the
+    // merged content already matches the on-disk base (`fileHash === mergedHash`), re-saving here
+    // only flips `crdtToken` null->stateVector, which nothing consumes. On a bulk cold seed the
+    // bootstrap-seeded base already holds this content for EVERY doc, so this skips ~1/3 of the
+    // first-sync base-sidecar writes (the dominant on-device seed cost). SAFE: the on-disk base is
+    // already correct, so the torn-pair rule (base reflects content before the file write below)
+    // still holds; and a GENUINE merge (crash-recovery / offline-drift) changes fileHash, so a
+    // real working-base advance is NEVER skipped.
+    if (baseRec?.fileHash !== mergedHash) {
+      await this.base.save(docId, {
+        baseText: merged,
+        fileHash: mergedHash,
+        crdtToken: doc.encodeStateVector(),
+        substrate: this.substrate,
+        ackedText: baseRec?.ackedText ?? "",
+        ackedHash: baseRec?.ackedHash ?? (await sha256OfText("")),
+      });
+    }
     // Compare the merge result against the RAW (un-canonicalized) disk text so a CRLF file
     // whose canonical content already equals `merged` (LF) is still rewritten to LF — the
     // one-time canonical-LF churn (#35 + hash-identity).
@@ -816,6 +1227,11 @@ export class SyncEngine {
    * the doc text, the re-save is harmless (idempotent durable write).
    */
   private async advanceAckedBase(doc: CrdtDoc): Promise<void> {
+    // F4: count each ack-confirmed convergence as progress so the watchdog does not mis-fire
+    // during the ack-tail (relay acking pushes one-by-one). Each acked doc advances the tick
+    // synchronously (before awaits) → the watchdog re-arms without auditing → O(n^2) tail
+    // audits collapse to at most a handful. O(1) increment; does not change convergence logic.
+    this.reconcileProgressTick++;
     const docId = doc.id;
     const text = doc.getText();
     const hash = await sha256OfText(text);
@@ -899,15 +1315,40 @@ export class SyncEngine {
    *   notice is surfaced (mapped to the `resurrected` inbox kind). Idempotent: once
    *   LIVE, a re-run skips it.
    */
-  private async structuralReconcile(): Promise<void> {
+  private async structuralReconcile(scope?: {
+    workset: ReadonlySet<DocId>;
+    liveByDocId: ReadonlyMap<DocId, VaultPath[]>;
+    allByDocId: ReadonlyMap<DocId, VaultPath[]>;
+  }): Promise<void> {
     // STABILITY GATE bookkeeping (torn-rename race): record THIS pass's divergence
     // signatures while confirming against the PRIOR pass; swap in after the pass so the
     // NEXT pass can confirm. A divergence resolves only when seen on two consecutive passes.
     const currentDivergence = new Map<DocId, string>();
+    // Stage 3: track which docIds this structural pass invokes confirmDivergence on (>1 live
+    // paths). Any docId seen with >1 live paths is: resolved (confirmed) → drain
+    // pendingDivergenceDocIds; or unresolved → enqueue into pendingDivergenceDocIds.
+    // After the pass, any pendingDivergenceDocIds NOT seen with >1 live paths (<=1 live path)
+    // are drained — the divergence dissolved or the entry was deleted.
+    const divergentThisPass = new Set<DocId>();
     const confirmDivergence = (docId: DocId, livePaths: VaultPath[]): boolean => {
       const sig = [...livePaths].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).join("\u0000");
       currentDivergence.set(docId, sig);
-      return this.priorDivergence.get(docId) === sig;
+      divergentThisPass.add(docId);
+      const confirmed = this.priorDivergence.get(docId) === sig;
+      // Stage 3 drain discipline (cross-model review item 4): we do NOT drain
+      // pendingDivergenceDocIds on CONFIRM. Even when confirmed, the docId still has >1 live paths
+      // right now and applyRenameConflictResolution + the post-check have not run. The post-pass
+      // drain loop below (removes docIds NOT in divergentThisPass, i.e. observed with <=1 live
+      // path) is the SOLE drain — one extra pass of latency, correct + safe for S4+. On a
+      // NOT-yet-confirmed sighting, ENQUEUE so the next structural pass revisits this docId even
+      // if no changed path selects it (Risk #3; the stability gate awaits a 2nd consecutive sighting).
+      // S6a: use enqueuePendingDivergenceDocId so the self-draining flag + schedule fires only on
+      // a genuinely-new enqueue (anti-spin: a stability-gate re-sighting on a docId already in the
+      // set does NOT set freshBackstopWork again).
+      if (!confirmed) {
+        this.enqueuePendingDivergenceDocId(docId);
+      }
+      return confirmed;
     };
     await runStructuralReconcile({
       index: this.index,
@@ -928,8 +1369,22 @@ export class SyncEngine {
         });
       },
       confirmDivergence,
+      // S5: thread the workset scope when present (observe-driven path only).
+      // scope === undefined (full path) ⇒ byte-for-byte unchanged behavior.
+      // Use spread to omit the property entirely when unscoped (exactOptionalPropertyTypes).
+      ...(scope !== undefined
+        ? { scope: { workset: scope.workset, allByDocId: scope.allByDocId } }
+        : {}),
     });
     this.priorDivergence = currentDivergence;
+
+    // Stage 3: DRAIN pendingDivergenceDocIds of any docId that was NOT seen with >1 live paths
+    // this pass — it now has <=1 live path (non-divergent, dissolved torn rename, or deleted).
+    for (const docId of this.pendingDivergenceDocIds) {
+      if (!divergentThisPass.has(docId)) {
+        this.pendingDivergenceDocIds.delete(docId);
+      }
+    }
 
     // Materialize any LIVE entry whose attached doc carries content the local disk
     // does not yet reflect. This closes a cross-doc ORDERING race in the C3
@@ -940,13 +1395,20 @@ export class SyncEngine {
     // write — yet catch-up still records the synced stamp, so the device would
     // report quiescence with an EMPTY file. Re-driving the (idempotent, echo-guarded)
     // outbound reconcile once the entry is live guarantees the content reaches disk.
-    await this.materializeLiveDiskContent();
+    await this.materializeLiveDiskContent(scope);
 
-    // Recover any concurrent-create loser orphaned by the index LWW (C2, D5). Run from
-    // the structural pass — NOT only at bootstrap — so a collision that surfaces AFTER
-    // sync (both devices seeded the path offline, then healed) recovers. Idempotent +
-    // loop-safe: a recovered orphan becomes bound, so the next sweep skips it.
-    await this.runOrphanSweep();
+    // S7: orphan sweep is cross-docStore work — a concurrent-create loser's docId is NOT
+    // in the changed-docId closure (only the winner's path got bound in the index), so it
+    // is NOT workset-scopable. Running it per scoped pass would be O(docStore) per pass →
+    // O(n^2) over the ~n-pass seed storm. It runs ONLY in full passes (startup /
+    // waitConverged / the S6c low-frequency quiescence audit via runFullConvergencePass),
+    // which recover concurrent-create losers at quiescence. A loser that surfaces during
+    // scoped passes stays in its docStore snapshot and is recovered at the next full pass
+    // (the S6c audit fires ~AUDIT_QUIESCENCE_MS after the collision settles, or the
+    // watchdog, or waitConverged, or a restart). NEVER drop this call from the full path.
+    if (scope === undefined) {
+      await this.runOrphanSweep();
+    }
   }
 
   /**
@@ -990,12 +1452,69 @@ export class SyncEngine {
    * Idempotent + loop-safe: outbound writes only when disk differs and is
    * echo-guarded — it NEVER touches the index/inbox, so it cannot relay or loop.
    */
-  private async materializeLiveDiskContent(): Promise<void> {
+  private async materializeLiveDiskContent(scope?: {
+    workset: ReadonlySet<DocId>;
+    liveByDocId: ReadonlyMap<DocId, VaultPath[]>;
+  }): Promise<void> {
     const deviceId = this.ports.identity.deviceId();
     // Load the dirty set ONCE before the loop (was re-read per live entry; behavior-identical).
     // A Set, not the array, so the per-entry membership check below is O(1) not O(n) (else the
     // loop is O(n^2) over a large live index).
     const dirty = new Set(await this.ports.engineState.listDirty());
+
+    if (scope !== undefined) {
+      // SCOPED PATH (S4c): iterate only the workset docIds, expanding each to its live paths via
+      // liveByDocId. Every per-entry gate is IDENTICAL to the full path — only WHICH entries are
+      // visited changes. scope === undefined ⇒ the FULL path below (byte-for-byte unchanged).
+      // INVARIANT: the per-entry guard chain below MUST stay identical to the FULL path's chain
+      // (see the loop at "FULL PATH" below). Any guard edit must be applied to BOTH branches —
+      // a divergence is a silent clobber-class data-loss bug (the fuzzer + Scenario 13/14 guard it).
+      for (const docId of scope.workset) {
+        for (const path of scope.liveByDocId.get(docId) ?? []) {
+          const entry = this.index.get(path);
+          // Defensive guards: entry must exist and must be live (not tombstoned).
+          if (entry === undefined || entry.deleted === true) continue;
+
+          const doc = this.attached.get(entry.docId);
+          if (doc === undefined) continue;
+
+          // ACTIVE-BOUND: an open editor owns this file's disk — the CM/yCollab binding renders the
+          // converged content live and the host (Obsidian) autosaves it. Materializing here races
+          // that autosave (disk is briefly "behind" the just-typed CRDT) and trips the host's
+          // "modified externally" auto-merge. Skip; disk reconciles via autosave (ingest) and unbind.
+          if (this.isActiveBound(path)) continue;
+
+          const docStamp = makeStamp(await sha256OfText(doc.getText()), deviceId);
+          if (!stampsEqual(docStamp, entry.stamp)) continue; // CRDT not yet at the indexed content.
+
+          const bytes = await this.ports.vault.read(path);
+          const diskStamp = bytes === null ? null : makeStamp(await sha256OfBytes(bytes), deviceId);
+          if (stampsEqual(diskStamp, entry.stamp)) continue; // disk already canonical.
+
+          // ANTI-CLOBBER GUARD: only write when the disk is genuinely BEHIND the converged
+          // doc — never over a newer un-ingested edit, and never over a DIRTY doc's unpushed
+          // edit (see CLOBBER HAZARD above).
+          if (bytes !== null) {
+            // DIRTY ⇒ this device owes a push; the disk may hold the unpushed (post-crash
+            // recovered) edit. Never materialize over it — the dirty reconcile + re-push own it.
+            if (dirty.has(entry.docId)) continue;
+            const base = await this.base.load(entry.docId);
+            const diskHash = await sha256OfBytes(bytes);
+            // disk ≠ last-reconciled working base ⇒ a newer un-ingested edit (or we cannot prove
+            // it is behind: no base ⇒ `base?.fileHash` is undefined ⇒ never equal) ⇒ SKIP. Ingest
+            // will reconcile it; pendingDocs keeps the loop alive.
+            if (diskHash !== base?.fileHash) continue;
+          }
+
+          await this.outbound.onRemoteUpdate(doc);
+        }
+      }
+      return;
+    }
+
+    // FULL PATH (scope === undefined): byte-for-byte identical to the pre-S4c implementation.
+    // Used by runFullConvergencePass (startup/waitConverged), the rename-fallout handler, and
+    // any future periodic audit. NEVER change this branch as part of S4c.
     for (const [path, entry] of this.index.liveEntries()) {
       const doc = this.attached.get(entry.docId);
       if (doc === undefined) continue;
@@ -1041,6 +1560,75 @@ export class SyncEngine {
   }
 
   /**
+   * F2: whether the scoped-pass backstop sets contain outstanding sync work.
+   *
+   * Returns `true` if ANY of the scoped-path backstop sets are non-empty. Used as the gate
+   * for the quiescence audit: if outstanding work is present in the backstop sets, the scoped
+   * passes will handle it on the next iteration — the full audit is unnecessary right now.
+   * When all sets are empty the engine has processed everything the scoped path can handle,
+   * and the quiescence audit's safety check (orphan sweep, disk-only-change detection) is warranted.
+   *
+   * NOTE: intentionally does NOT gate on the dirty set. Orphaned docs (e.g. the loser docId in a
+   * LWW collision) stay dirty indefinitely because no scoped pass ever catches them up —
+   * gating on dirty would permanently suppress the quiescence audit, preventing the full pass's
+   * orphan sweep from ever running. Dirty docs that CAN be handled by scoped passes manifest as
+   * `needsCatchUp` entries; those ARE included here.
+   *
+   * All checks are O(1) — in-memory set sizes, no I/O.
+   */
+  private hasOutstandingWork(): boolean {
+    if (this.lazyAttach.needsCatchUpSnapshot().size > 0) return true;
+    if (this.lazyAttach.remoteUpdatedSinceSettleSnapshot().size > 0) return true;
+    if (this.pendingDivergenceDocIds.size > 0) return true;
+    return false;
+  }
+
+  /**
+   * F2: arm (or re-arm) the watchdog stale timer with a snapshotted progress tick.
+   *
+   * When the timer fires:
+   *   - If `reconcileProgressTick` advanced since `tickAtArm` → system is PROGRESSING
+   *     (healthy seed, not stuck) → suppress the audit; re-arm for another window.
+   *   - If the tick is unchanged → system is STALLED → fire the audit (safety floor).
+   *
+   * The `auditedThisBusyEpoch` one-shot latch is preserved: once an audit fires in the
+   * current epoch the latch is set, and neither this callback nor a re-arm fires again.
+   * The epoch ends when the quiescence timer fires (resets the latch).
+   *
+   * Re-arms are unbounded while the system keeps progressing; they stop when:
+   *   (a) the epoch ends (quiescence), OR
+   *   (b) a stall is detected (audit fires), OR
+   *   (c) the latch is already set (a prior stall fired the audit).
+   *
+   * NOTE: only called from {@link scheduleReconcile} (initial arm) and from within
+   * the timer callback itself (re-arm on progress). Sets `auditStaleTimer` directly.
+   */
+  private armWatchdogTimer(tickAtArm: number): void {
+    this.auditStaleTimer = setTimeout(() => {
+      this.auditStaleTimer = null;
+      if (this.auditedThisBusyEpoch) return; // latch already set — do nothing
+      if (this.reconcileProgressTick !== tickAtArm) {
+        // F2: tick advanced — system is making progress (healthy seed). Suppress the audit
+        // and re-arm for another window with the updated tick snapshot. The epoch continues.
+        this.armWatchdogTimer(this.reconcileProgressTick);
+      } else {
+        // Tick unchanged — system is genuinely STALLED. Fire the one-shot watchdog audit.
+        this.auditedThisBusyEpoch = true;
+        this.auditRequested = true;
+        // Cancel any pending quiescence timer so a quiescence audit does NOT fire a SECOND
+        // full pass right after this watchdog audit when the storm ends.
+        if (this.auditQuiescenceTimer !== null) {
+          clearTimeout(this.auditQuiescenceTimer);
+          this.auditQuiescenceTimer = null;
+        }
+        // NOTE: this scheduleReconcile is INTENTIONALLY not gated by inFullConvergencePass
+        // (unlike the onBackstopWork seam) — the audit wake-up must fire even mid-full-pass.
+        this.scheduleReconcile();
+      }
+    }, AUDIT_MAX_STALENESS_MS);
+  }
+
+  /**
    * SCHEDULE the durable work-queue reconcile loop (Stage 2 replacement for the boolean coalescer).
    *
    * If the loop is already running, there is nothing to do: the running iteration will check
@@ -1059,6 +1647,30 @@ export class SyncEngine {
     // queueMicrotask ensures a burst of synchronous observe callbacks all land in
     // pendingChangedPaths before the loop fires (same timing guarantee as Stage 1).
     this.reconcileLoopRunning = true;
+
+    // S6c / F2: arm the watchdog stale timer when a NEW busy epoch starts (the loop was
+    // idle and is now being scheduled). If the stale timer is already armed (from a
+    // prior not-yet-fired epoch), do NOT re-arm it — the existing timer is still valid
+    // for the ongoing epoch. This ensures one watchdog audit per epoch at most.
+    //
+    // F2: only arm if there is REAL pending work (index events or backstop work), NOT if
+    // the wake-up is audit-only. The quiescence callback calls scheduleReconcile() to
+    // wake the audit iteration after explicitly ending the epoch (clearing the watchdog
+    // timer and resetting auditedThisBusyEpoch). Without this guard, the audit wake-up
+    // would re-arm the watchdog immediately after the quiescence ended the epoch, causing
+    // the watchdog to fire AGAIN after AUDIT_MAX_STALENESS_MS — a double-audit.
+    //
+    // An audit-only wake has: auditRequested=true AND no pendingChangedPaths AND no
+    // freshBackstopWork. A genuine new epoch that happens to also have an audit pending
+    // will have pendingChangedPaths or freshBackstopWork set (the real work was enqueued
+    // before the audit was requested). So the guard is: arm only when real work is pending
+    // OR when there is NO audit pending (i.e. this is a genuine new epoch start).
+    const isAuditOnlyWake =
+      this.auditRequested && this.pendingChangedPaths.size === 0 && !this.freshBackstopWork;
+    if (this.auditStaleTimer === null && !this.auditedThisBusyEpoch && !isAuditOnlyWake) {
+      this.armWatchdogTimer(this.reconcileProgressTick);
+    }
+
     const loopPromise = new Promise<void>((resolve, reject) => {
       queueMicrotask(() => {
         void this.runReconcileLoop().then(resolve, reject);
@@ -1084,30 +1696,116 @@ export class SyncEngine {
    * for every OTHER tracked caller (emitConflict, onWrite, etc.). Only an UNEXPECTED throw outside
    * the inner try would reject the loop promise and surface as an unhandled rejection (a real bug).
    *
-   * Convergence: passes are still FULL (runCatchUp + structuralReconcile + settleCleanDocs over all
-   * live entries). runningBatch is collected but not used to scope the work yet (later stages).
+   * Convergence: post-S6b the observe path is FULLY SCOPED — S4b scopes runCatchUp; S4c scopes
+   * materializeLiveDiskContent (via structuralReconcile(scope)); S5 scopes the tombstone/rename/
+   * divergent loops; S6b scopes settleCleanDocs. Only runFullConvergencePass remains unscoped.
    */
   private async runReconcileLoop(): Promise<void> {
     let needsReschedule = false;
     try {
+      // S6a: loop while there is pending changed-path work OR new backstop work. An empty
+      // pendingChangedPaths with freshBackstopWork=true means a docId entered a backstop set
+      // with no accompanying index.observe — the flag arms a "backstop-only" pass so that
+      // doc is not stranded until the next unrelated index event.
+      //
+      // S6c: also loop when auditRequested — the quiescence or watchdog audit runs as a special
+      // iteration (the full chain), then continues if more work arrived mid-audit.
+      //
       // A new observe callback adding to pendingChangedPaths while we await inside the loop is
       // picked up by the NEXT iteration — no extra schedule needed (the loop is already running).
-      while (this.pendingChangedPaths.size > 0) {
+      while (this.pendingChangedPaths.size > 0 || this.freshBackstopWork || this.auditRequested) {
+        // S6c: AUDIT ITERATION — checked FIRST, BEFORE any quiescence-timer re-arm.
+        // An audit iteration must NOT re-arm the quiescence timer: re-arming here would
+        // schedule a fresh AUDIT_QUIESCENCE_MS window after every audit, causing the full
+        // convergence pass to repeat indefinitely while the system is idle (a battery/CPU drain
+        // that violates the "low-frequency" O(1)-per-quiescence guarantee). Only genuine
+        // scoped-pass activity (below) should re-arm the timer.
+        if (this.auditRequested) {
+          this.auditRequested = false;
+          // S6a: consume freshBackstopWork too so we don't spin on backstop-only after the audit.
+          // A full convergence pass drains every backstop set, so freshBackstopWork being true
+          // at audit time means the full pass will cover it — clearing it here avoids an extra
+          // backstop-only loop iteration after the audit completes.
+          this.freshBackstopWork = false;
+          try {
+            await this.runFullConvergencePass();
+          } catch {
+            // On audit failure: request another audit on next wakeup (do not re-queue a batch —
+            // there is no batch for an audit iteration) and stop this loop; the fresh loop retried
+            // in the finally will re-run the audit.
+            this.auditRequested = true;
+            needsReschedule = true;
+            break;
+          }
+          continue;
+        }
+
+        // SCOPED-PASS PATH: re-arm the quiescence debounce timer HERE ONLY (genuine activity).
+        // Activity is ongoing; only a FULL idle period (no new iterations) lets the timer fire.
+        // Clear-then-set ensures the window is always measured from the LAST active iteration.
+        // This block is intentionally AFTER the audit-branch so an audit iteration does NOT
+        // re-arm the timer (the fix for the repeated-idle-audit bug — S6c).
+        if (this.auditQuiescenceTimer !== null) clearTimeout(this.auditQuiescenceTimer);
+        this.auditQuiescenceTimer = setTimeout(() => {
+          this.auditQuiescenceTimer = null;
+          // Quiescence reached: end the busy epoch (reset the watchdog one-shot + stale timer)
+          // REGARDLESS of whether we request an audit. Quiescence ending the epoch is
+          // unconditional — it just means the loop went idle for the full window.
+          if (this.auditStaleTimer !== null) {
+            clearTimeout(this.auditStaleTimer);
+            this.auditStaleTimer = null;
+          }
+          this.auditedThisBusyEpoch = false;
+
+          // F2: WORK-AWARE GATE — only request the audit when there is no outstanding work
+          // in the scoped-path backstop sets. During an active seed the receiver device has
+          // needsCatchUp or remoteUpdatedSinceSettle non-empty between relay round-trips; this
+          // correctly suppresses the audit. When all sets are empty the system is genuinely
+          // settled from the scoped path's perspective — the full audit's safety check (orphan
+          // sweep, disk-only-change detection) is warranted. See hasOutstandingWork() for why the
+          // dirty set is intentionally excluded (orphaned dirty docs would permanently block it).
+          if (!this.hasOutstandingWork()) {
+            // Request the audit and wake the loop (which may have gone idle). Like the watchdog,
+            // this scheduleReconcile is INTENTIONALLY not gated by inFullConvergencePass — do not
+            // "harmonize" it with the onBackstopWork seam or the audit wake-up could be suppressed.
+            this.auditRequested = true;
+            this.scheduleReconcile();
+          }
+          // If outstanding work exists: no audit requested. The scoped passes handle it;
+          // the next scoped pass will re-arm the quiescence timer for a fresh window.
+        }, AUDIT_QUIESCENCE_MS);
+
+        // S6a: consume the flag at the TOP of the scoped-pass iteration. A new backstop enqueue
+        // that fires DURING the awaits below sets freshBackstopWork=true again, causing the loop
+        // to continue for one more pass — but ONLY if the re-enqueue is a genuinely-new docId
+        // (the anti-spin guard in LazyAttachManager.enqueueNeedsCatchUp /
+        // enqueuePendingDivergenceDocId).
+        this.freshBackstopWork = false;
+
         // Snapshot-and-drain: transfer all pending paths into runningBatch. New observe callbacks
         // arriving during the awaits below go into pendingChangedPaths (next iteration) — never into
-        // runningBatch. This is the durability boundary.
+        // runningBatch. This is the durability boundary. An empty runningBatch (backstop-only pass)
+        // is intentional — buildWorksetWithMaps still unions the backstop sets into the workset.
         this.runningBatch = new Set(this.pendingChangedPaths);
         this.pendingChangedPaths.clear();
 
         try {
-          // FULL chain — unchanged from Stage 1. `this.runningBatch` is collected for later stages
-          // that will scope the work to changed docIds; for now the chain ignores it (full scans).
-          await this.lazyAttach.runCatchUp(this.openDocIds());
-          await this.structuralReconcile();
-          // Clean-settle (0b-3 Fix 6): re-advance the synced stamp of any doc fully converged
-          // (doc==disk==index) but latched at an intermediate merge hash. Runs AFTER reconcile.
-          await this.lazyAttach.settleCleanDocs();
-          // Success: clear the running batch. Loop continues if pendingChangedPaths is non-empty.
+          // Stage 4b/4c: compute the docId-closure workset + maps from the running batch + backstop
+          // sets, then run the scoped reconcile entry point. The maps are threaded into
+          // runObserveScopedReconcile to scope both computeCatchUpSet (S4b: kills the O(n)
+          // getSyncedStamp-per-entry scan) and materializeLiveDiskContent (S4c: kills the O(n)
+          // vault.read scan — the dominant first-sync read cost).
+          // F1: buildWorksetWithMaps no longer calls listDirty() — it is fully synchronous.
+          // S6a: an empty runningBatch (backstop-only pass) is fine — buildWorksetWithMaps
+          // builds the workset from the backstop unions + open docIds (pure in-memory).
+          const worksetBundle = this.buildWorksetWithMaps(this.runningBatch);
+          // F2: bump the progress counter when we are about to process a non-empty workset.
+          // An empty workset (backstop-only pass on already-drained sets) is a no-op, so only
+          // count genuine work to avoid false-progress on spin-idling passes.
+          if (worksetBundle.workset.size > 0) this.reconcileProgressTick++;
+          await this.runObserveScopedReconcile(worksetBundle);
+          // Success: clear the running batch. Loop continues if pendingChangedPaths is non-empty
+          // OR freshBackstopWork was re-set by a new enqueue that fired during the pass.
           this.runningBatch = new Set();
         } catch {
           // Re-queue the failed batch so no path is dropped, then stop this loop; the fresh loop
@@ -1122,7 +1820,17 @@ export class SyncEngine {
       // Always clear the running flag here. On the error path, arm a fresh loop AFTER clearing it so
       // scheduleReconcile sees reconcileLoopRunning === false and starts the retry with a clean flag.
       this.reconcileLoopRunning = false;
-      if (needsReschedule) this.scheduleReconcile();
+      if (needsReschedule) {
+        this.scheduleReconcile();
+      } else {
+        // S6a: close the lost-wakeup race. A scheduleReconcile() that fired WHILE
+        // reconcileLoopRunning was still true was a no-op (guard at the top of scheduleReconcile).
+        // If new work arrived in that window — either changed paths, fresh backstop work, or a
+        // pending audit — we must arm a fresh loop now that the running flag is clear.
+        if (this.pendingChangedPaths.size > 0 || this.freshBackstopWork || this.auditRequested) {
+          this.scheduleReconcile();
+        }
+      }
     }
   }
 
@@ -1146,6 +1854,235 @@ export class SyncEngine {
       if (entry !== undefined) ids.add(entry.docId);
     }
     return ids;
+  }
+
+  // ── Stage 4a: workset builder + reconcile API split ────────────────────────
+
+  /**
+   * Stage 4a: build the set of docIds a scoped pass must process.
+   *
+   * ALL in-memory, NO I/O. Construction:
+   *   1. Iterate the FULL in-memory index to build `liveByDocId` and `allByDocId` (for
+   *      use by S4b/c per-PATH expansion at iteration time).
+   *   2. For each path in `batch`: resolve docId from `index.get(path)?.docId`, else from
+   *      `prevEntryByPath`. Add to the workset.
+   *   3. Union backstop sets: `needsCatchUp`, `remoteUpdatedSinceSettle` (via the
+   *      LazyAttachManager snapshots), `pendingDivergenceDocIds`, and open docIds.
+   *      NOTE (F1): the dirty-set union is intentionally OMITTED.
+   *
+   * NOTE for S4b/S4c: per-PATH closure (expanding a workset docId to all its live +
+   * tombstoned sibling paths) is applied at ITERATION time by the scoped scans; for S4a
+   * we only build the docId set and leave `liveByDocId`/`allByDocId` available.
+   *
+   * BOUNDED: `prevEntryByPath` is pruned of paths that are back in the index (the new
+   * index entry supersedes the cache) to prevent unbounded growth.
+   *
+   * @returns `Set<DocId>` — the workset for the scoped pass.
+   */
+  buildWorkset(batch: Set<VaultPath>): Set<DocId> {
+    return this.buildWorksetWithMaps(batch).workset;
+  }
+
+  /**
+   * Stage 4a: build the workset AND return the `liveByDocId` / `allByDocId` maps for
+   * use by S4b/c scoped scans. This is the canonical implementation; `buildWorkset` is
+   * a thin wrapper.
+   *
+   * Exposed as a PUBLIC test seam so unit tests can inspect the maps. Production passes
+   * (S4b/c) will call this directly; tests assert the map contents.
+   *
+   * F1: the dirty-set union (`listDirty()`) is intentionally OMITTED from the scoped
+   * workset. Dirty docs are re-pushed via changed-paths, needsCatchUp, or a FULL pass
+   * (startup / reconnect / audit / waitConverged). See the inline comment in Step 3.
+   * This function is now fully synchronous (no async I/O at all).
+   *
+   * noUncheckedIndexedAccess compliance: all Map.get() results are guarded (=== undefined
+   * checks or conditional pushes). No `!` non-null assertions are used.
+   */
+  buildWorksetWithMaps(batch: Set<VaultPath>): {
+    workset: Set<DocId>;
+    liveByDocId: Map<DocId, VaultPath[]>;
+    allByDocId: Map<DocId, VaultPath[]>;
+  } {
+    // ── Step 1: build liveByDocId and allByDocId from the FULL in-memory index ──
+    // Pure iteration — NO vault I/O. Needed at S4b/c iteration time to expand a workset
+    // docId to all its live/tombstoned sibling paths.
+    const liveByDocId = new Map<DocId, VaultPath[]>();
+    const allByDocId = new Map<DocId, VaultPath[]>();
+
+    for (const [p, entry] of this.index.entries()) {
+      // Skip the empty-docId sentinel: IndexDoc.delete() lays a { docId: "", deleted: true }
+      // placeholder for paths that were observed but never had a real docId assigned. Including
+      // the sentinel in the maps would pollute liveByDocId/"" and allByDocId/"" with unresolvable
+      // entries and could silently include it in the workset. Filter it here at the source.
+      if (entry.docId === "") continue;
+
+      // allByDocId: all entries, including tombstones.
+      const allPaths = allByDocId.get(entry.docId);
+      if (allPaths === undefined) {
+        allByDocId.set(entry.docId, [p]);
+      } else {
+        allPaths.push(p);
+      }
+
+      // liveByDocId: live (non-tombstoned) entries only.
+      if (entry.deleted !== true) {
+        const livePaths = liveByDocId.get(entry.docId);
+        if (livePaths === undefined) {
+          liveByDocId.set(entry.docId, [p]);
+        } else {
+          livePaths.push(p);
+        }
+      }
+    }
+
+    // ── Step 2: resolve docIds for each path in the batch ─────────────────────
+    const workset = new Set<DocId>();
+
+    for (const p of batch) {
+      // index.get() returns both live and tombstoned entries — docId is preserved on
+      // tombstones. Try it first: for a DELETED path the tombstone still has the docId.
+      const currentDocId = this.index.get(p)?.docId;
+      if (currentDocId !== undefined) {
+        // Skip the empty-docId sentinel (IndexDoc.delete() placeholder for never-seen paths).
+        if (currentDocId !== "") {
+          workset.add(currentDocId);
+          // Update prevEntryByPath with the current mapping (keeps cache fresh).
+          this.prevEntryByPath.set(p, currentDocId);
+        }
+      } else {
+        // Path completely absent from the index CRDT map (safety net for paths that left the
+        // CRDT map entirely — in practice tombstones keep the docId resolvable, so this branch
+        // is forward-insurance; prevEntryByPath is the fallback). prevEntryByPath is the safety net.
+        const cachedDocId = this.prevEntryByPath.get(p);
+        if (cachedDocId !== undefined) {
+          workset.add(cachedDocId);
+        }
+      }
+    }
+
+    // BOUNDED pruning: remove prevEntryByPath entries whose path is present in the index
+    // (live or tombstoned — the index is authoritative in both cases). Paths completely
+    // absent from the index remain in the cache as the fallback for future resolutions.
+    for (const [p] of this.prevEntryByPath) {
+      if (this.index.get(p) !== undefined) {
+        this.prevEntryByPath.delete(p);
+      }
+    }
+
+    // ── Step 3: union backstop sets (all in-memory, no vault I/O) ─────────────
+    // needsCatchUp: docIds whose catch-up did not prove stamp equality.
+    for (const docId of this.lazyAttach.needsCatchUpSnapshot()) {
+      workset.add(docId);
+    }
+    // remoteUpdatedSinceSettle: docIds with a pending remote-origin note-doc update.
+    for (const docId of this.lazyAttach.remoteUpdatedSinceSettleSnapshot()) {
+      workset.add(docId);
+    }
+    // pendingDivergenceDocIds: docIds with a recorded-but-unresolved divergence.
+    for (const docId of this.pendingDivergenceDocIds) {
+      workset.add(docId);
+    }
+    // NOTE (F1): the full listDirty() union is intentionally OMITTED here.
+    // A dirty doc is re-pushed via:
+    //   (a) changed-path (fresh local edit bumps index → observe → workset), OR
+    //   (b) needsCatchUp (ack failure/timeout enqueues it), OR
+    //   (c) a FULL pass (startup step 9 / reconnect full-pass / S6c audit /
+    //       waitConverged) whose computeCatchUpSet FULL branch keeps listDirty().
+    // Adding listDirty() here would make every scoped pass O(n) during a first sync
+    // (all n docs are dirty), defeating the O(n^2) → O(n) fix. Offline-edit re-push
+    // on reconnect is covered by the onStatus reconnect full-pass added to start().
+    // Open (active-bound) docIds: always in scope.
+    for (const docId of this.openDocIds()) {
+      workset.add(docId);
+    }
+
+    return { workset, liveByDocId, allByDocId };
+  }
+
+  /**
+   * FULL convergence pass — the existing chain, ALWAYS unscoped.
+   *
+   * Runs: `runCatchUp(openDocIds()) → structuralReconcile() → settleCleanDocs()`
+   * iterating EVERYTHING (no scoping). Used by:
+   *   - `start()` step 9 — initial catch-up on adopt
+   *   - `waitConverged()` — bounded convergence loop
+   *   - (future) periodic audit pass
+   *
+   * Calls `structuralReconcile()` with NO scope so `materializeLiveDiskContent` runs
+   * the FULL path (S4c does not scope this code path — only the observe path is scoped).
+   * NEVER called from the hot observe loop (`runReconcileLoop`) — that uses
+   * `runObserveScopedReconcile`.
+   */
+  async runFullConvergencePass(): Promise<void> {
+    // S6a: set inFullConvergencePass to suppress spurious scheduleReconcile() calls from the
+    // onBackstopWork seam while this full-chain pass is in progress. A full pass already processes
+    // ALL backstop sets (via computeCatchUpSet's full-path loop + settleCleanDocs), so scheduling
+    // a parallel observe-loop is harmful rather than helpful.
+    this.inFullConvergencePass = true;
+    try {
+      await this.lazyAttach.runCatchUp(this.openDocIds());
+      await this.structuralReconcile();
+      // Clean-settle (0b-3 Fix 6): re-advance the synced stamp of any doc that has fully
+      // converged (doc==disk==index) but whose synced stamp is latched at an intermediate
+      // merge hash. Runs AFTER structural reconcile so disk is materialized.
+      await this.lazyAttach.settleCleanDocs();
+    } finally {
+      this.inFullConvergencePass = false;
+    }
+  }
+
+  /**
+   * Stage 4b/4c/S5: OBSERVE-SCOPED reconcile entry point — the HOT PATH.
+   *
+   * Called from `runReconcileLoop` with the workset + maps bundle computed from the
+   * changed batch and the backstop sets.
+   *
+   * S4b: `runCatchUp` is scoped to only the workset docIds (kills the O(n)
+   * getSyncedStamp-per-entry scan on the hot path).
+   *
+   * S4c: `materializeLiveDiskContent` is scoped to the workset via `structuralReconcile(scope)`
+   * (kills the O(n) vault.read scan — the dominant first-sync read cost).
+   *
+   * S5: `runStructuralReconcile`'s tombstone loops (rename, resurrect, delete) and the
+   * divergent-rename loop are scoped to the workset via `scope.allByDocId` (the docId
+   * closure expands each workset docId to its live + tombstoned sibling paths, so a
+   * rename's old-key tombstone is reachable from the changed new key).
+   *
+   * S6b: `settleCleanDocs` is scoped to the workset (kills the O(n) getSyncedStamp +
+   * getAttached + sha256OfText + diskHashOf scan on the hot path). `runFullConvergencePass`
+   * still calls `settleCleanDocs()` with NO scope — the full path is unchanged.
+   *
+   * CONVERGENCE: byte-identical because the workset is a SUPERSET of every docId the full
+   * scans would select (workset ⊇ {open ∪ dirty ∪ needsCatchUp ∪ changed-paths ∪ divergence
+   * ∪ remoteUpdated}). Only the iteration order and the set of entries visited change —
+   * not which docIds are selected or what is done to them.
+   *
+   * @param bundle - Result of `buildWorksetWithMaps`: workset + liveByDocId + allByDocId.
+   */
+  async runObserveScopedReconcile(bundle: {
+    workset: Set<DocId>;
+    liveByDocId: Map<DocId, VaultPath[]>;
+    allByDocId: Map<DocId, VaultPath[]>;
+  }): Promise<void> {
+    // S4b: scope computeCatchUpSet to the workset.
+    await this.lazyAttach.runCatchUp(this.openDocIds(), {
+      workset: bundle.workset,
+      liveByDocId: bundle.liveByDocId,
+    });
+    // S4c: scope materializeLiveDiskContent to the workset via structuralReconcile(scope).
+    // S5: scope runStructuralReconcile's tombstone/divergent loops to the workset via
+    // scope.allByDocId (the docId closure expansion to live + tombstoned sibling paths).
+    // S6b: scope settleCleanDocs to the workset so the hot path is O(workset), not O(n).
+    await this.structuralReconcile({
+      workset: bundle.workset,
+      liveByDocId: bundle.liveByDocId,
+      allByDocId: bundle.allByDocId,
+    });
+    await this.lazyAttach.settleCleanDocs({
+      workset: bundle.workset,
+      liveByDocId: bundle.liveByDocId,
+    });
   }
 
   private authorityFor(path: VaultPath): FileAuthority {

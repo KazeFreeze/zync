@@ -180,6 +180,17 @@ export class InProcessTransport implements TransportPort {
     this.emitStatus();
   }
 
+  /**
+   * TEST SEAM (F1 regression): emit a "connecting" status event WITHOUT actually
+   * changing the connected flag. This simulates the intermediate step the real
+   * Hocuspocus transport emits during reconnect (offline → connecting → connected).
+   * Must be called AFTER goOffline() and BEFORE goOnline() to test the latch guard.
+   * Does NOT resync — the transport is still not exchanging; only the status event fires.
+   */
+  signalConnecting(): void {
+    for (const cb of this.statusListeners) cb("connecting");
+  }
+
   /** Sever a SINGLE doc id for this transport (partial partition). */
   partition(id: DocId): void {
     this.partitioned.add(id);

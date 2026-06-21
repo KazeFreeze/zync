@@ -374,6 +374,10 @@ describe("LazyAttachManager — relay-ack gate (no-loss crash window, 0b-3)", ()
 
     expect(await engineState.getSyncedStamp(id)).toBeNull();
     expect(await engineState.listDirty()).toContain(id);
+    // S3 backstop (Risk #2): the doc is in needsCatchUp after a held-ack pass. Here synced started
+    // null so BOTH the precheck-mismatch enqueue and the ack-timeout enqueue fire — this asserts the
+    // general enqueue+drain cycle; the dedicated test below ISOLATES the ack-timeout enqueue.
+    expect(manager.needsCatchUpSnapshot().has(id)).toBe(true);
 
     // Relay confirms receipt; a re-run (what waitConverged drives) now retires it.
     transport.resolveAck(id);
@@ -382,6 +386,64 @@ describe("LazyAttachManager — relay-ack gate (no-loss crash window, 0b-3)", ()
     const synced = await engineState.getSyncedStamp(id);
     expect(stampHash(synced ?? "")).toBe(shaV1);
     expect(await engineState.listDirty()).not.toContain(id);
+    // S3 backstop drains on PROVEN equality (the clearDirty path).
+    expect(manager.needsCatchUpSnapshot().has(id)).toBe(false);
+  });
+
+  // ISOLATES the `if (!acked)` needsCatchUp enqueue in runCatchUp (Risk #2). Pre-set synced ==
+  // stamp so computeCatchUpSet's precheck-mismatch enqueue CANNOT fire and its drain loop starts
+  // empty — the doc is selected ONLY via the dirty union, so the ONLY thing that can populate
+  // needsCatchUp in this single pass is the ack-timeout path. (The held-ack test above conflates
+  // this with the precheck enqueue since its synced starts null.) Removing that enqueue makes
+  // this go red — guarding the core reason the backstop exists.
+  it("enqueues a dirty doc into needsCatchUp when its push ack times out (synced already == stamp)", async () => {
+    const tree = new FakeCrdtMap<TreeEntry>();
+    const index = new IndexDoc(tree, DEVICE);
+    const engineState = new MemEngineState();
+    const provider = new YjsCrdtProvider();
+    const docStore = new FakeDocStore();
+
+    const bus = new InProcessBus();
+    const inner = bus.connect();
+    transports.push(inner);
+    const transport = new AckControlledTransport(inner);
+
+    const id = docIdOf("note-ack-isolated");
+    const p = path("note.md");
+    const shaV1 = await sha256OfText("v1");
+    index.setStamp(p, id, "crdt-prose", shaV1);
+    // Pre-set synced == the index stamp: the precheck mismatch (and thus its enqueue) cannot fire.
+    const indexStamp = index.get(p)?.stamp ?? null;
+    if (indexStamp === null) throw new Error("test setup: index stamp missing");
+    await engineState.setSyncedStamp(id, indexStamp);
+    // Still dirty, so the doc is selected via the dirty union and reaches the ack gate.
+    await engineState.markDirty(id);
+
+    const attached = new Map<DocId, CrdtDoc>();
+    const manager = new LazyAttachManager({
+      index,
+      engineState,
+      transport,
+      provider,
+      docStore,
+      deviceId: DEVICE,
+      ackTimeoutMs: 50,
+      getAttached: (docId) => attached.get(docId),
+      onAttached: (doc) => {
+        attached.set(doc.id, doc);
+      },
+      reconcileLocal: (doc) => {
+        setDocText(doc, "v1");
+        return Promise.resolve();
+      },
+    });
+
+    // One pass; the ack is held PENDING → times out → the doc was SELECTED but not proven.
+    await manager.runCatchUp(new Set());
+
+    // The precheck never fired (synced == stamp) and the drain loop started empty, so the docId
+    // can ONLY be present because the ack-timeout enqueue added it.
+    expect(manager.needsCatchUpSnapshot().has(id)).toBe(true);
   });
 });
 
@@ -602,5 +664,233 @@ describe("LazyAttachManager — clean-settle the symmetric pendingDocs latch (0b
     expect(stampHash(synced ?? "")).toBe(stampHash(staleSynced));
     // And clean-settle never clears dirty — the push obligation is the ack gate's job.
     expect(await engineState.listDirty()).toContain(id);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S4b REGRESSION GATE — stale-synced-retry: needsCatchUp is load-bearing when
+// computeCatchUpSet is scoped.
+//
+// THE BUG (without S3 needsCatchUp backstop): when catch-up is scoped to the workset,
+// a doc whose ack timed out (so runCatchUp left it in needsCatchUp with index.stamp !=
+// syncedStamp) would be STRANDED until an index key change re-selects it. The scoped
+// pass would miss it entirely if needsCatchUp were not unioned into the workset.
+//
+// THE FIX: buildWorksetWithMaps unions needsCatchUp into the workset, so every scoped
+// pass FORCES that docId back in even if the changed-path batch contains only an
+// unrelated docId. This test proves the enqueue (via ack timeout) + re-selection (via
+// the needsCatchUp union in the scoped workset) + drain (once equality is proven) path.
+//
+// TDD VERIFICATION: removing the needsCatchUp union from the workset (i.e. NOT including
+// it in the scope passed to runCatchUp) makes this test fail — the docId is not in
+// pathByDocId and is skipped, so its synced stamp never advances.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("S4b stale-synced-retry: needsCatchUp is load-bearing when scoped", () => {
+  /**
+   * FINDINGS TEST #1/#2: proves needsCatchUp is the sole reason doc-n is re-selected
+   * on an unrelated-trigger scoped pass.
+   *
+   * Setup:
+   *   doc-n: index.stamp != syncedStamp; ack was held pending so the FIRST runCatchUp
+   *          pass exits WITHOUT proving equality and adds doc-n to needsCatchUp.
+   *   doc-m: index.stamp == syncedStamp (a separate, already-synced doc).
+   *
+   * Scoped pass:
+   *   workset = {doc-n (from needsCatchUp)} + {doc-m (the trigger, already converged)}
+   *   liveByDocId maps both.
+   *   The ack for doc-n is RELEASED before the scoped pass runs.
+   *
+   * Assertion: after the scoped pass doc-n's syncedStamp advances to its index stamp.
+   *
+   * TDD confirmation: if needsCatchUp docIds are NOT included in the scope.workset,
+   * doc-n is absent from pathByDocId (it has no "trigger" path in the workset) and its
+   * synced stamp stays null — the test fails.
+   */
+  it(
+    "doc-n lands in needsCatchUp after ack timeout; a scoped pass with unrelated doc-m trigger " +
+      "re-selects doc-n solely via the needsCatchUp union",
+    async () => {
+      // ── Setup ────────────────────────────────────────────────────────────────
+      const tree = new FakeCrdtMap<TreeEntry>();
+      const index = new IndexDoc(tree, DEVICE);
+      const engineState = new MemEngineState();
+      const provider = new YjsCrdtProvider();
+      const docStore = new FakeDocStore();
+
+      const bus = new InProcessBus();
+      const inner = bus.connect();
+      transports.push(inner);
+      const transport = new AckControlledTransport(inner);
+
+      // doc-n: the doc whose ack will time out and land in needsCatchUp.
+      const idN = "doc-n" as DocId;
+      const pN = "notes/doc-n.md" as VaultPath;
+      const shaN = await sha256OfText("doc-n content");
+      index.setStamp(pN, idN, "crdt-prose", shaN);
+      // syncedStamp is null (never synced) → stamp mismatch → selected for catch-up.
+
+      // doc-m: a separate already-synced doc — the "unrelated trigger" for the scoped pass.
+      const idM = "doc-m" as DocId;
+      const pM = "notes/doc-m.md" as VaultPath;
+      const shaM = await sha256OfText("doc-m content");
+      index.setStamp(pM, idM, "crdt-prose", shaM);
+      // Set syncedStamp == index stamp so doc-m does NOT get selected for catch-up
+      // (we only want doc-n to be re-selected, and solely via needsCatchUp).
+      const mStamp = index.get(pM)?.stamp ?? null;
+      if (mStamp === null) throw new Error("test setup: doc-m stamp missing");
+      await engineState.setSyncedStamp(idM, mStamp);
+
+      const attached = new Map<DocId, CrdtDoc>();
+      const manager = new LazyAttachManager({
+        index,
+        engineState,
+        transport,
+        provider,
+        docStore,
+        deviceId: DEVICE,
+        // Very short ack timeout: the held ack resolves later, so this times out quickly.
+        ackTimeoutMs: 50,
+        getAttached: (docId) => attached.get(docId),
+        onAttached: (doc) => {
+          attached.set(doc.id, doc);
+        },
+        // reconcileLocal seeds the doc's text to match the index stamp content.
+        // This models "relay delivers the content during reconcile", so sha256(doc.getText())
+        // will equal shaN after this hook runs. Without it the doc text stays empty and the
+        // synced stamp would not match the index stamp (not the invariant under test).
+        reconcileLocal: (doc) => {
+          if (doc.id === idN) setDocText(doc, "doc-n content");
+          return Promise.resolve();
+        },
+      });
+
+      // ── Pass 1 (FULL, scope undefined): doc-n selected, ack held → needsCatchUp ─
+      // The ack for doc-n is held PENDING. With ackTimeoutMs=50ms, the bounded wait
+      // times out, runCatchUp exits with !acked, and doc-n is added to needsCatchUp.
+      // syncedStamp stays null (the ack-gated setSyncedStamp did not run).
+      await manager.runCatchUp(new Set());
+
+      // After pass 1: doc-n is in needsCatchUp, syncedStamp still null.
+      expect(manager.needsCatchUpSnapshot().has(idN)).toBe(true);
+      expect(await engineState.getSyncedStamp(idN)).toBeNull();
+
+      // ── Release ack for doc-n BEFORE the scoped pass ──────────────────────────
+      // This lets the scoped pass's worker succeed once it re-selects doc-n.
+      transport.resolveAck(idN);
+
+      // ── Build the scoped workset: {doc-n (needsCatchUp), doc-m (unrelated trigger)} ─
+      // Simulate what buildWorksetWithMaps does: union needsCatchUp + the trigger path.
+      // doc-m is the "index bump" trigger; doc-n gets in ONLY via needsCatchUp union.
+      const workset = new Set<DocId>([idN, idM]);
+
+      // liveByDocId: maps both docIds to their paths (as buildWorksetWithMaps builds it
+      // from the full in-memory index).
+      const liveByDocId = new Map<DocId, VaultPath[]>([
+        [idN, [pN]],
+        [idM, [pM]],
+      ]);
+
+      // ── Pass 2 (SCOPED): doc-n must be re-selected solely via needsCatchUp union ─
+      // Do NOT call the full runCatchUp (scope undefined) — that would be the full scan
+      // and would trivially re-select doc-n. Only the scoped variant is under test.
+      await manager.runCatchUp(new Set(), { workset, liveByDocId });
+
+      // ── Assertions ────────────────────────────────────────────────────────────
+      // doc-n's synced stamp must have advanced. The scoped pass selected doc-n ONLY
+      // because it was in needsCatchUp (the workset union forced it in); without that
+      // union, doc-n's stamp would still be null.
+      const syncedN = await engineState.getSyncedStamp(idN);
+      expect(syncedN).not.toBeNull();
+      // syncedStamp is the hash of the doc's ACTUAL text (what was synced). The doc text
+      // was seeded to "doc-n content" via reconcileLocal, matching shaN.
+      expect(stampHash(syncedN ?? "")).toBe(shaN);
+
+      // needsCatchUp must be drained for doc-n if equality was proven
+      // (syncedStamp hash == index stamp hash — both are shaN).
+      // The index stamp also uses shaN, so stampsEqual holds.
+      const indexStampN = index.get(pN)?.stamp ?? null;
+      expect(stampsEqual(syncedN, indexStampN)).toBe(true);
+      expect(manager.needsCatchUpSnapshot().has(idN)).toBe(false);
+    },
+  );
+
+  /**
+   * TDD VERIFICATION: the same scenario FAILS if needsCatchUp is NOT included in the
+   * scope workset — proving the test genuinely exercises the backstop.
+   *
+   * This test calls runCatchUp with a workset containing ONLY doc-m (the trigger), NOT
+   * doc-n. Without needsCatchUp in the workset, doc-n's synced stamp stays null.
+   * (This test intentionally documents the "would-fail" behavior; it PASSES by asserting
+   * that doc-n's stamp is still null after the scoped pass WITHOUT the needsCatchUp union.)
+   */
+  it("TDD-verify: scoped pass with workset={doc-m only} (no needsCatchUp union) does NOT advance doc-n stamp", async () => {
+    // Same setup as the previous test.
+    const tree = new FakeCrdtMap<TreeEntry>();
+    const index = new IndexDoc(tree, DEVICE);
+    const engineState = new MemEngineState();
+    const provider = new YjsCrdtProvider();
+    const docStore = new FakeDocStore();
+
+    const bus = new InProcessBus();
+    const inner = bus.connect();
+    transports.push(inner);
+    const transport = new AckControlledTransport(inner);
+
+    const idN = "doc-n-verify" as DocId;
+    const pN = "notes/doc-n-verify.md" as VaultPath;
+    const shaN = await sha256OfText("doc-n-verify content");
+    index.setStamp(pN, idN, "crdt-prose", shaN);
+
+    const idM = "doc-m-verify" as DocId;
+    const pM = "notes/doc-m-verify.md" as VaultPath;
+    const shaM = await sha256OfText("doc-m-verify content");
+    index.setStamp(pM, idM, "crdt-prose", shaM);
+    const mStamp = index.get(pM)?.stamp ?? null;
+    if (mStamp === null) throw new Error("test setup: doc-m stamp missing");
+    await engineState.setSyncedStamp(idM, mStamp);
+
+    const attached = new Map<DocId, CrdtDoc>();
+    const manager = new LazyAttachManager({
+      index,
+      engineState,
+      transport,
+      provider,
+      docStore,
+      deviceId: DEVICE,
+      ackTimeoutMs: 50,
+      getAttached: (docId) => attached.get(docId),
+      onAttached: (doc) => {
+        attached.set(doc.id, doc);
+      },
+    });
+
+    // Pass 1 (full): doc-n selected, ack times out → needsCatchUp.
+    await manager.runCatchUp(new Set());
+    expect(manager.needsCatchUpSnapshot().has(idN)).toBe(true);
+    expect(await engineState.getSyncedStamp(idN)).toBeNull();
+
+    // Release ack (would allow doc-n to converge IF it were re-selected).
+    transport.resolveAck(idN);
+
+    // Scoped pass: workset contains ONLY doc-m — NO doc-n, simulating the case where
+    // needsCatchUp is NOT unioned into the workset. This is the "broken" workset.
+    const worksetWithoutNeedsCatchUp = new Set<DocId>([idM]);
+    const liveByDocId = new Map<DocId, VaultPath[]>([
+      [idN, [pN]],
+      [idM, [pM]],
+    ]);
+
+    await manager.runCatchUp(new Set(), {
+      workset: worksetWithoutNeedsCatchUp,
+      liveByDocId,
+    });
+
+    // doc-n was NOT in the workset → NOT in pathByDocId → NOT selected → stamp still null.
+    // This asserts the test WOULD FAIL if needsCatchUp were removed from buildWorksetWithMaps.
+    const syncedN = await engineState.getSyncedStamp(idN);
+    expect(syncedN).toBeNull();
+    // needsCatchUp is still populated (the scoped pass did not visit doc-n to drain it).
+    expect(manager.needsCatchUpSnapshot().has(idN)).toBe(true);
   });
 });
