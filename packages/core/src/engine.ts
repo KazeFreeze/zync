@@ -9,6 +9,7 @@ import type {
   EngineStateStore,
   AttachedDoc,
   CrdtDoc,
+  DeviceId,
   DocId,
   Sha256,
   Unsubscribe,
@@ -26,7 +27,9 @@ import { IngestPipeline } from "./bridge/ingest.js";
 import { OutboundPipeline } from "./bridge/outbound.js";
 import { recordTombstone } from "./bridge/tombstone.js";
 import { applyRename } from "./bridge/rename.js";
+import { matchRenames } from "./protocol/rename-match.js";
 import { IndexDoc } from "./protocol/index-doc.js";
+import type { TreeEntry } from "./protocol/index-doc.js";
 import { LazyAttachManager } from "./protocol/lazy-attach.js";
 import { runStructuralReconcile } from "./protocol/structural-reconcile.js";
 import { applyBootstrap } from "./protocol/bootstrap.js";
@@ -35,7 +38,7 @@ import { orphanSweep, type OrphanMeta } from "./protocol/orphan-sweep.js";
 import { makeStamp, stampHash, stampsEqual } from "./protocol/stamp.js";
 import { BlobEngine, type BlobFetchPolicy, type BlobManifestEntry } from "./blobs/blob-engine.js";
 import { Inbox } from "./conflicts/inbox.js";
-import { writeConflictArtifact } from "./conflicts/artifact.js";
+import { conflictArtifactPath, writeConflictArtifact } from "./conflicts/artifact.js";
 import { canonicalizeProse, sha256OfBytes, sha256OfText } from "./hash.js";
 import { diffToEdits, merge3 } from "./bridge/merge.js";
 
@@ -68,6 +71,20 @@ export interface EngineConfig {
    */
   renameSettleMs?: number;
   /**
+   * M3 live-rename coalescer: base debounce window (ms) for the rename-signal buffer. A
+   * bound-live prose `delete` (rename SOURCE) and a write to an unbound path (rename TARGET) are
+   * held for this long (RE-ARMED on each newly-buffered signal) then drained through the same
+   * pure `matchRenames` core as bootstrap. Default 300 (the M1-settled value). Configurable like
+   * {@link renameSettleMs}.
+   */
+  renameWindowMs?: number;
+  /**
+   * M3 live-rename coalescer: HARD CAP (ms) on the debounce window so a folder-move BURST always
+   * drains as one batch rather than splitting delete/create pairs across drains. Measured from the
+   * first armed signal. Default 1000.
+   */
+  renameWindowCapMs?: number;
+  /**
    * Projector mode (0b-3 Part C): when `true`, the engine NEVER ingests a local file
    * write — {@link SyncEngine.onWrite} early-returns. Remote→disk outbound and
    * bootstrap-seed are unaffected. Rationale: a plaintext projector co-located on the
@@ -80,8 +97,33 @@ export interface EngineConfig {
 const utf8 = (s: string): Uint8Array => new TextEncoder().encode(s);
 const decode = (b: Uint8Array): string => new TextDecoder().decode(b);
 const DEFAULT_DEBOUNCE_MS = 1500;
+
+/** Atomic-write / temp-file churn must never be treated as a rename target. */
+function isTempPath(path: string): boolean {
+  return path.includes(".tmp");
+}
 /** Default rename-transaction settle window (ms) — see {@link EngineConfig.renameSettleMs}. */
 const DEFAULT_RENAME_SETTLE_MS = 60;
+/** Default M3 live-rename coalescer debounce + cap (ms) — see {@link EngineConfig.renameWindowMs}. */
+const DEFAULT_RENAME_WINDOW_MS = 300;
+const DEFAULT_RENAME_WINDOW_CAP_MS = 1000;
+
+/**
+ * An unmatched-lost entry (live prose, file absent, base present, NOT a rename) DEFERRED past the
+ * bootstrap seed loop so a later task can let the seed loop consume an in-place collision first.
+ * Carries everything the post-seed-loop handler needs to replay the M1a/M1b decision WITHOUT
+ * re-reading base: the LOCAL base text (materialize source) + the persisted materializedHash (the
+ * M1b clean-delete signal). `hash` is the LOCAL base.fileHash (== sha256OfText(baseText)).
+ */
+interface DeferredLost {
+  path: VaultPath;
+  docId: DocId;
+  hash: string;
+  baseText: string;
+  materializedHash: Sha256 | undefined;
+}
+/** Two deferred-lost entries share a content hash → the hash is not a unique key (used by a later task). */
+const AMBIGUOUS = Symbol("ambiguous-lost-content");
 
 /**
  * S6c: Quiescence debounce (ms). After the reconcile loop goes idle, wait this long
@@ -406,6 +448,44 @@ export class SyncEngine {
     resolve: () => void;
   } | null = null;
 
+  /**
+   * M3 live-rename coalescer buffer. {@link onVaultEvent} holds the two rename SIGNALS — a bound-live
+   * prose `delete` (a SOURCE: capture `docId` + `base.fileHash`) and a write to an UNBOUND path (a
+   * TARGET) — for a debounced+capped window, then {@link drainRenameBuffer} resolves them through the
+   * SAME pure `matchRenames` core as bootstrap (re-key a content-matched pair with docId continuity;
+   * no spurious delete propagated). `draining` single-flights the drain. Part of quiescence (Task 4):
+   * buffered signals count toward {@link pendingDocs}; {@link whenIdle} force-drains it.
+   */
+  private renameBuf: {
+    sources: Map<VaultPath, { docId: DocId; hash: Sha256 }>;
+    targets: Set<VaultPath>;
+    // In-flight source-buffer promises (each awaits a base.load). A timer-driven drain awaits these
+    // before snapshotting so it never acts on a half-populated buffer (F1).
+    pendingSources: Set<Promise<void>>;
+    // Targets a drain has snapshotted (removed from `targets`) but not yet finished reading. `requestRename`
+    // consults this too so it cannot clobber an external target whose bytes are mid-drain (F2).
+    drainingTargets: Set<VaultPath>;
+    // Barrier clause 1: a source's path is owned across base.load (pendingSourcePaths) and the drain
+    // (drainingSources), bridging the gaps where `sources` is empty (during load / after snapshot).
+    pendingSourcePaths: Set<VaultPath>;
+    drainingSources: Set<VaultPath>;
+    timer: ReturnType<typeof setTimeout> | null;
+    firstArmedAt: number | null;
+    draining: Promise<void> | null;
+  } = {
+    sources: new Map(),
+    targets: new Set(),
+    pendingSources: new Set(),
+    drainingTargets: new Set(),
+    pendingSourcePaths: new Set(),
+    drainingSources: new Set(),
+    timer: null,
+    firstArmedAt: null,
+    draining: null,
+  };
+  private readonly renameWindowMs: number; // base debounce (default 300)
+  private readonly renameWindowCapMs: number; // hard cap so a burst always drains (default 1000)
+
   constructor(ports: EnginePorts, config: EngineConfig) {
     this.ports = ports;
     this.config = config;
@@ -413,6 +493,8 @@ export class SyncEngine {
     this.caps = { maxProseBytes: config.maxProseBytes, configDir: config.configDir };
     this.debounceMs = config.stampDebounceMs ?? DEFAULT_DEBOUNCE_MS;
     this.renameSettleMs = config.renameSettleMs ?? DEFAULT_RENAME_SETTLE_MS;
+    this.renameWindowMs = config.renameWindowMs ?? DEFAULT_RENAME_WINDOW_MS;
+    this.renameWindowCapMs = config.renameWindowCapMs ?? DEFAULT_RENAME_WINDOW_CAP_MS;
     this.base = new BaseStore(ports.vault, config.configDir);
   }
 
@@ -657,6 +739,13 @@ export class SyncEngine {
       this.auditStaleTimer = null;
     }
 
+    // M3: clear the live-rename debounce timer so no dangling drain fires after stop() (whenIdle above
+    // already force-drained the buffer; this only releases an armed-but-not-yet-fired timer).
+    if (this.renameBuf.timer !== null) {
+      clearTimeout(this.renameBuf.timer);
+      this.renameBuf.timer = null;
+    }
+
     // Resolve any still-armed rename-transaction settle (the vault is now unsubscribed,
     // so no further fallout can re-arm it) so its tracked `done` gate never dangles.
     if (this.renameSettle !== null) {
@@ -764,9 +853,119 @@ export class SyncEngine {
   /** Resolves when NO reconcile is in flight (drains the tracked set; flushes bumps first). */
   async whenIdle(): Promise<void> {
     this.flushBumps();
-    while (this.inflight.size > 0) {
-      await Promise.allSettled([...this.inflight]);
+    // M3: FORCE-DRAIN any buffered rename signals (cancel the debounce, drain NOW) before sampling
+    // idle, so a flush/convergence pass never acts on the half-state (old path live, file gone). The
+    // buffering itself is async (a source awaits `base.load`) and tracked in `inflight`, so we MUST
+    // drain `inflight` FIRST (let the source land in the buffer), THEN force-drain — otherwise the
+    // drain could run with a half-populated buffer (a target but not yet its matching source) and
+    // mis-route them. The drain is single-flight + tracked in `inflight`, so its own fallout
+    // (onWrite/onDelete) is awaited by the loop too. Loop until both are fully quiescent.
+    for (;;) {
+      while (this.inflight.size > 0) {
+        await Promise.allSettled([...this.inflight]);
+      }
+      if (
+        this.renameBuf.sources.size === 0 &&
+        this.renameBuf.targets.size === 0 &&
+        this.renameBuf.draining === null
+      ) {
+        return;
+      }
+      await this.runRenameDrain();
     }
+  }
+
+  /**
+   * The user confirmed a held closed-app delete (a `pending-delete` inbox entry). Tombstone with the
+   * CONFIRMED-on-disk hash (materializedHash), remove the materialized-back file, and resolve the
+   * entry. The removal's delete event hits {@link onDelete}, which early-returns on the now-tombstoned
+   * entry. Idempotent: a no-op (just resolve) if the entry is already gone/tombstoned.
+   */
+  async confirmPendingDelete(path: VaultPath): Promise<void> {
+    const entry = this.index.get(path);
+    if (entry === undefined || entry.deleted === true) {
+      this.resolvePendingDeleteInbox(path);
+      return;
+    }
+    const rec = await this.base.load(entry.docId);
+    // Re-read after the await: a concurrent confirm may have already tombstoned + deleted the base.
+    // Tombstone ONLY with the confirmed-on-disk materializedHash — NEVER a fileHash/empty fallback, which
+    // could overwrite a correct tombstone with a hash peers don't match and make them RESURRECT.
+    const current = this.index.get(path);
+    if (current === undefined || current.deleted === true || rec?.materializedHash === undefined) {
+      this.resolvePendingDeleteInbox(path);
+      return;
+    }
+    await this.tombstoneAndCleanup(path, current.docId, current.type, rec.materializedHash);
+    await this.ports.vault.remove(path);
+    this.resolvePendingDeleteInbox(path);
+  }
+
+  /**
+   * The user chose to KEEP a held closed-app delete: leave the (materialized-back) file + clear the
+   * inbox entry. The next bootstrap re-confirms materializedHash for the present file.
+   */
+  dismissPendingDelete(path: VaultPath): Promise<void> {
+    this.resolvePendingDeleteInbox(path);
+    return Promise.resolve();
+  }
+
+  private resolvePendingDeleteInbox(path: VaultPath): void {
+    for (const e of this.inbox.list()) {
+      if (e.kind === "pending-delete" && e.path === path) this.inbox.resolve(e.id);
+    }
+  }
+
+  /**
+   * M2 engine-mediated rename guard (refuse-before-move). Before physically moving the file, REFUSE a
+   * rename whose target is an OCCUPIED live path bound to a DIFFERENT docId — the OS move would clobber
+   * the occupant's bytes and lose content. Surfaces one inbox notice and does NOT move. Returns true if
+   * the rename proceeded, false if refused. (External renames bypass this entirely — they arrive as
+   * delete+create through the watcher and are handled by the bootstrap displacement detector.)
+   */
+  async requestRename(from: VaultPath, to: VaultPath): Promise<boolean> {
+    const fromEntry = this.index.get(from);
+    const toEntry = this.index.get(to);
+    // Refuse a DIRECTORY rename: requestRename is single-path only (its synthetic `rename` no-ops in
+    // onRename when `from` has no entry). A dir move must arrive via the external-mv path (dir-delete
+    // expansion). Subtree-rename-via-requestRename is the deferred plugin path (G).
+    if (this.liveChildrenUnder(from).length > 0) {
+      this.inbox.add({
+        id: `conflict:rename-refused:${to}`,
+        kind: "conflict",
+        path: to,
+        detail: `Rename of ${from} to ${to} was refused: ${from} is a folder.`,
+      });
+      return false;
+    }
+    // M3: refuse a rename whose target is a BUFFERED rename target. The target is physically present
+    // (an external write the coalescer is still reconciling) but intentionally still unbound, so the
+    // index-only guard below would not catch it — and `vault.rename` would clobber the buffered file's
+    // bytes before the matcher reads them (data loss). `drainingTargets` extends this to a target a drain
+    // has snapshotted-but-not-yet-read (F2): the snapshot clears `targets`, so without it a requestRename
+    // landing mid-drain would slip past and clobber. Surface one notice and do NOT move. NOTE: we
+    // intentionally guard only the TARGET (the dangerous, clobbering side); a buffered SOURCE `from` is
+    // a benign no-op rename of an already-gone file, so it needs no guard here.
+    if (this.renameBuf.targets.has(to) || this.renameBuf.drainingTargets.has(to)) {
+      this.inbox.add({
+        id: `conflict:rename-refused:${to}`,
+        kind: "conflict",
+        path: to,
+        detail: `Rename of ${from} to ${to} was refused: an external file is being reconciled there.`,
+      });
+      return false;
+    }
+    if (toEntry !== undefined && toEntry.deleted !== true && toEntry.docId !== fromEntry?.docId) {
+      this.inbox.add({
+        id: `conflict:rename-refused:${to}`,
+        kind: "conflict",
+        path: to,
+        detail: `Rename of ${from} to ${to} was refused: ${to} already exists.`,
+      });
+      return false;
+    }
+    await this.ports.vault.rename(from, to);
+    return true;
   }
 
   /**
@@ -829,6 +1028,14 @@ export class SyncEngine {
     // DocId, so it names the in-flight rename in a stuck dump; once the settle fires it
     // closes and this clears. READ-ONLY: reads the transaction bookkeeping only.
     for (const txn of this.renameTxn.openTransactions()) pending.add(txn.docId);
+    // M3 LIVE-RENAME BUFFER: a buffered rename signal leaves the index inconsistent with disk (a
+    // source: old path live, file gone; a target: file present, unbound) — quiescence must not pass
+    // until the window drains. A source carries the doc's real docId; a target carries none yet, so add
+    // a stable DIAGNOSTIC token (`rename-target:<path>`) — pendingDocs is consumed only by `.length`/
+    // `.join` (count + the waitConverged stuck-dump), never resolved back to a doc. At steady state the
+    // buffer is EMPTY (whenIdle force-drains it before any sample), so this never wedges convergence.
+    for (const [, s] of this.renameBuf.sources) pending.add(s.docId);
+    for (const t of this.renameBuf.targets) pending.add(`rename-target:${t}` as DocId);
     return [...pending];
   }
 
@@ -1171,6 +1378,8 @@ export class SyncEngine {
         substrate: this.substrate,
         ackedText: baseRec?.ackedText ?? "",
         ackedHash: baseRec?.ackedHash ?? (await sha256OfText("")),
+        // M1b: preserve the durable confirmed-on-disk signal across a fresh-record save.
+        materializedHash: baseRec?.materializedHash,
       });
     }
     // Compare the merge result against the RAW (un-canonicalized) disk text so a CRLF file
@@ -1245,6 +1454,10 @@ export class SyncEngine {
       substrate: this.substrate,
       ackedText: text,
       ackedHash: hash,
+      // M1b: a fresh-record save must PRESERVE materializedHash (the durable confirmed-on-disk
+      // signal). Without carrying it forward, the post-bootstrap ack-flush would clobber the
+      // value the bootstrap observe just recorded.
+      materializedHash: prior?.materializedHash,
     });
     await this.ports.docStore.save(docId, doc.encodeSnapshot());
   }
@@ -1358,6 +1571,7 @@ export class SyncEngine {
         return bytes === null ? null : await sha256OfBytes(bytes);
       },
       markDirty: (docId) => this.ports.engineState.markDirty(docId),
+      markDeleted: (docId) => this.ports.engineState.markDeleted(docId),
       deleteBase: (docId) => this.base.delete(docId),
       deleteSnapshot: (docId) => this.ports.docStore.delete(docId),
       onInboxNotice: (notice) => {
@@ -1507,6 +1721,7 @@ export class SyncEngine {
             if (diskHash !== base?.fileHash) continue;
           }
 
+          if (bytes === null && this.shouldDeferMissingLive(path)) continue; // BARRIER (Part B)
           await this.outbound.onRemoteUpdate(doc);
         }
       }
@@ -1548,8 +1763,26 @@ export class SyncEngine {
         if (diskHash !== base?.fileHash) continue;
       }
 
+      if (bytes === null && this.shouldDeferMissingLive(path)) continue; // BARRIER (Part B)
       await this.outbound.onRemoteUpdate(doc);
     }
+  }
+
+  /** Barrier (Part B): should `materializeLiveDiskContent` DEFER re-creating this live+disk-absent path? */
+  private shouldDeferMissingLive(path: VaultPath): boolean {
+    // Clause 1: owned as a rename source in ANY phase (pending base.load / buffered / draining). The drain
+    // re-keys it; re-materializing here would recreate the source (signal destruction + duplication).
+    // NOTE: if bufferRenameSource's base.load returns null it routes to onDelete (not a rename) and the
+    // path leaves pendingSourcePaths -> the barrier intentionally does not cover that non-rename path.
+    // A blanket "clause 2" first-observation grace (defer EVERY live+disk-absent materialize) was
+    // considered and DROPPED: it broke the M2 displacement detector, which needs a PROMPT
+    // materialize-to-disk to observe a delete-then-reuse collision. The pre-buffer race it would have
+    // covered is a documented residual (rare concurrent trigger in the ~20ms watcher-coalesce window).
+    return (
+      this.renameBuf.pendingSourcePaths.has(path) ||
+      this.renameBuf.sources.has(path) ||
+      this.renameBuf.drainingSources.has(path)
+    );
   }
 
   /** Add a fire-and-forget promise to the inflight set; auto-remove on settle. */
@@ -1805,6 +2038,16 @@ export class SyncEngine {
           // count genuine work to avoid false-progress on spin-idling passes.
           if (worksetBundle.workset.size > 0) this.reconcileProgressTick++;
           await this.runObserveScopedReconcile(worksetBundle);
+          // M2: after the pass settles the index for this batch, record the durable lastLivePath for
+          // every changed path whose CURRENT index entry is LIVE. This is the runtime maintenance seam
+          // for the synchronous onRename (whose re-key flows here via index.observe) and re-records the
+          // ingest bind. A tombstoned/absent path is skipped (it is no longer live). Idempotent.
+          for (const cp of this.runningBatch) {
+            const entry = this.index.get(cp);
+            if (entry !== undefined && entry.deleted !== true) {
+              await this.noteLiveBinding(entry.docId, cp);
+            }
+          }
           // Success: clear the running batch. Loop continues if pendingChangedPaths is non-empty
           // OR freshBackstopWork was re-set by a new enqueue that fired during the pass.
           this.runningBatch = new Set();
@@ -2176,6 +2419,10 @@ export class SyncEngine {
     this.pendingBumps.delete(path);
     if (pending.timer !== null) clearTimeout(pending.timer);
     this.index.setStamp(path, pending.docId, pending.route, pending.sha);
+    // M2: record the durable lastLivePath at the ingest bind. firePending is SYNC (called from
+    // flushBumps + the debounce timers), so track the durable write instead of awaiting it — whenIdle
+    // drains the inflight set. The index.observe → reconcile pass also re-records this path (idempotent).
+    this.track(this.noteLiveBinding(pending.docId, path));
     pending.resolve();
   }
 
@@ -2338,6 +2585,325 @@ export class SyncEngine {
     return { text: doc.getText(), doc };
   }
 
+  // M1b quarantine thresholds. A WRONG hold is a no-op (the file stays); a wrong auto-propagate is
+  // an unrecoverable false delete (spec section 3.6) — so these err toward holding.
+  private static readonly MASS_DELETE_MIN = 10; // only apply the fraction test above this denominator
+  private static readonly MASS_DELETE_FRACTION = 0.5;
+  private static readonly SUBTREE_DROP_MIN = 3; // >=N missing siblings under one parent => a folder op
+
+  /** A delete batch the engine should NOT auto-propagate even on a durable adapter. */
+  private isSuspiciousDeleteBatch(paths: VaultPath[], confirmedLiveProseCount: number): boolean {
+    if (paths.length === 0) return false;
+    if (
+      confirmedLiveProseCount >= SyncEngine.MASS_DELETE_MIN &&
+      paths.length > SyncEngine.MASS_DELETE_FRACTION * confirmedLiveProseCount
+    ) {
+      return true; // mass wipe
+    }
+    // Subtree drop: count candidates under EACH ancestor directory (not only the immediate parent), so a
+    // recursive folder delete scattered across sub-subfolders is still caught.
+    const byAncestor = new Map<string, number>();
+    for (const path of paths) {
+      const segments = path.split("/");
+      for (let i = 1; i < segments.length; i++) {
+        const ancestor = segments.slice(0, i).join("/");
+        byAncestor.set(ancestor, (byAncestor.get(ancestor) ?? 0) + 1);
+      }
+    }
+    for (const count of byAncestor.values()) if (count >= SyncEngine.SUBTREE_DROP_MIN) return true;
+    return false;
+  }
+
+  /** M2: record that `docId` is now LIVE at `path` (durable, for displacement detection), and clear any
+   *  stale delete-observation (a re-bind means it is not deleted). The bootstrap backstop (start of
+   *  reconcileOfflineStructural) re-derives this from the converged index, so a missed runtime update
+   *  self-heals on the next start. */
+  private async noteLiveBinding(docId: DocId, path: VaultPath): Promise<void> {
+    await this.ports.engineState.setLastLivePath(docId, path);
+    await this.ports.engineState.clearDeleted(docId);
+  }
+
+  /**
+   * OFFLINE STRUCTURAL RECONCILE — M1a. A startup disk-vs-index pre-pass for changes made while the engine
+   * was NOT running (no watcher events). RE-KEYS offline renames INLINE (docId continuity) and RETURNS the
+   * remaining vanished-synced-file set (`deferred`) + a content-hash index (`lostByHash`) for the
+   * post-seed-loop handler {@link applyDeferredLost} to materialize / delete-route — deferred so a later
+   * task can let the seed loop consume an in-place collision FIRST. It NEVER tombstones and NEVER deletes
+   * base/docStore here: "synced entry + file absent" is ambiguous between a user delete and a torn/
+   * never-written doc, so safely propagating a closed-app delete needs a durable signal (handled later).
+   * Runs BEFORE the seed loop so a re-keyed `to` path is seen as already-bound and converges.
+   */
+  private async reconcileOfflineStructural(): Promise<{
+    deferred: DeferredLost[];
+    lostByHash: Map<string, DeferredLost | typeof AMBIGUOUS>;
+    livePresentHashes: Set<string>;
+    confirmedLiveProseCount: number;
+  }> {
+    // M2: backstop the durable lastLivePath from the converged index, so displacement detection has a
+    // baseline even for bindings created before this device upgraded or missed by a runtime update. A
+    // DISPLACED loser is NOT live here (it keeps its pre-collision lastLivePath from a prior session).
+    // Use noteLiveBinding (setLastLivePath + clearDeleted) so a LIVE doc carrying a stale deleteObserved
+    // (e.g. deleted then resurrected/recreated where the re-bind seam missed it) has the flag cleared —
+    // otherwise a future collision of that doc would be wrongly skipped by the displacement detector and
+    // the loser would be lost. A live entry is by definition not deleted, so clearing it is correct.
+    // Both writes are skip-if-unchanged, so a converged steady-state restart still does ~zero durable writes.
+    for (const [path, entry] of this.index.liveEntries()) {
+      await this.noteLiveBinding(entry.docId, path);
+    }
+
+    const diskList = await this.ports.vault.list();
+    const diskPaths = new Set<string>(diskList.map((e) => e.path));
+
+    const lost: { path: VaultPath; docId: DocId; hash: string }[] = [];
+    // The LOCAL base text per lost docId, kept aside so the materialize step writes the latest local
+    // content (not a stale docStore snapshot). Engine-side so the pure matchRenames core stays content-free.
+    // Keyed by docId: live index paths are one-docId-each; a same-docId-at-two-live-paths collision is an
+    // M2 path-collision concern (guarded against in the rename loop below), not reachable here.
+    const baseTextByDocId = new Map<DocId, string>();
+    const materializedByDocId = new Map<DocId, Sha256>();
+    const livePresentHashes = new Set<string>();
+    const liveSet = new Set<string>();
+    let liveProseCount = 0;
+    for (const [path, entry] of this.index.liveEntries()) {
+      liveSet.add(path);
+      if (entry.type !== "crdt-prose") continue;
+      liveProseCount++;
+      if (diskPaths.has(path)) {
+        // The live-elsewhere guard uses the index stamp (free, no I/O) rather than base.fileHash:
+        // it is an exact match in steady state and only a CONSERVATIVE miss after an offline edit to
+        // a still-live file (a missed guard at worst allows a re-key that just moves a docId — no loss).
+        livePresentHashes.add(stampHash(entry.stamp));
+        continue;
+      }
+      const base = await this.base.load(entry.docId);
+      if (base === null) continue; // never materialized (fresh adopt) → catch-up materializes it normally
+      // hash from the LOCAL base (base.fileHash == sha256OfText(base.baseText), an engine invariant); keep
+      // the base text aside (keyed by docId) for the materialize step — see the materialize loop below.
+      lost.push({ path, docId: entry.docId, hash: base.fileHash });
+      baseTextByDocId.set(entry.docId, base.baseText);
+      if (base.materializedHash !== undefined)
+        materializedByDocId.set(entry.docId, base.materializedHash);
+    }
+    if (lost.length === 0)
+      return {
+        deferred: [],
+        lostByHash: new Map(),
+        livePresentHashes,
+        confirmedLiveProseCount: liveProseCount, // no lost ⇒ all live prose is present/confirmed
+      };
+
+    const emptyHash = await sha256OfText("");
+    const created: { path: VaultPath; hash: string }[] = [];
+    for (const { path } of diskList) {
+      if (liveSet.has(path)) continue;
+      const bytes = await this.ports.vault.read(path);
+      if (bytes === null) continue;
+      if (classify(path, bytes, this.caps).route !== "crdt-prose") continue;
+      created.push({ path, hash: await sha256OfText(canonicalizeProse(decode(bytes))) });
+    }
+
+    const { matches, unmatchedLost } = matchRenames(lost, created, {
+      isExcludedPath: isTempPath,
+      isTrivialHash: (h) => h === emptyHash,
+      isLiveElsewhere: (h) => livePresentHashes.has(h),
+    });
+
+    // RENAME (M1a): re-key the docId to the new path. COLLISION GUARD: never re-key into a path holding a
+    // DIFFERENT live docId (the M2 path-collision case) — skip it; a tombstoned target IS fine.
+    for (const m of matches) {
+      const target = this.index.get(m.to);
+      if (target !== undefined && target.deleted !== true && target.docId !== m.docId) continue;
+      applyRename(this.index, m.from, m.to);
+      await this.noteLiveBinding(m.docId, m.to);
+    }
+
+    // UNMATCHED LOST (M1a/M1b): a vanished synced file that is NOT a rename. RATHER than materialize /
+    // delete-route INLINE here, DEFER the whole set past the bootstrap seed loop (applyDeferredLost) so a
+    // later task can let the seed loop consume an in-place collision (a created file that resolved this
+    // exact docId's content) FIRST. Behaviour-equivalent for now: the seed loop consumes nothing yet, so
+    // the deferred set is the full unmatched-lost set and applyDeferredLost replays the identical decision.
+    // Record EVERYTHING the deferred handler needs (LOCAL base text + materializedHash) so it never
+    // re-reads base; also index by content hash so a later task can detect an in-place collision.
+    const deferred: DeferredLost[] = [];
+    const lostByHash = new Map<string, DeferredLost | typeof AMBIGUOUS>();
+    for (const l of unmatchedLost) {
+      const d: DeferredLost = {
+        path: l.path,
+        docId: l.docId,
+        hash: l.hash,
+        baseText: baseTextByDocId.get(l.docId) ?? "",
+        materializedHash: materializedByDocId.get(l.docId),
+      };
+      deferred.push(d);
+      lostByHash.set(l.hash, lostByHash.has(l.hash) ? AMBIGUOUS : d);
+    }
+    // Mass-wipe denominator: count only the CONFIRMED population (present-on-disk + vanished-but-
+    // materialized), NOT never-materialized-vanished docs (a fresh adopt never written to this disk was
+    // never "here", so it must not dilute the suspicious-delete fraction). `lost` is the vanished prose;
+    // those WITHOUT a materializedHash are the never-confirmed ones to exclude. A smaller denominator only
+    // makes a mass wipe MORE likely to be caught — consistent with the err-toward-holding bias.
+    const confirmedLiveProseCount = liveProseCount - (lost.length - materializedByDocId.size);
+    return { deferred, lostByHash, livePresentHashes, confirmedLiveProseCount };
+  }
+
+  /**
+   * POST-SEED-LOOP unmatched-lost handler (M1a/M1b). Replays the EXACT decision the former inline
+   * reconcileOfflineStructural loop made — read-recheck absence, the SAME M1b clean-delete gate, materialize
+   * (M1a) or delete-route (auto-propagate on a durable adapter vs hold-for-confirm) — but RUN AFTER the
+   * bootstrap seed loop so a later task can let the seed loop consume an in-place collision first.
+   *
+   * LOAD-BEARING (the #1 M1b non-regression): the former inline materialize ran BEFORE the seed loop, so
+   * the seed loop OBSERVED the materialized file and recorded `materializedHash` (its ~markMaterialized
+   * step). That recorded signal is what lets the NEXT closed-app delete AUTO-PROPAGATE. Deferred past the
+   * seed loop, that observe never happens — so this handler MUST mirror it: after a materialize, re-check
+   * the live entry and call base.markMaterialized itself, else M1b closed-app deletes silently stop
+   * propagating.
+   */
+  private async applyDeferredLost(
+    deferred: DeferredLost[],
+    confirmedLiveProseCount: number,
+  ): Promise<void> {
+    const deleteCandidates: {
+      path: VaultPath;
+      docId: DocId;
+      hash: string;
+      materializedHash: Sha256;
+    }[] = [];
+    let listingUnreliable = false;
+    for (const l of deferred) {
+      // READ-RECHECK (M1b): list() said absent — confirm with a DISK read AT HANDLING TIME (a file may
+      // have appeared during the seed loop). read() hits disk via the adapter fallback, so a non-null
+      // result means the LISTING was incomplete, NOT a delete.
+      if ((await this.ports.vault.read(l.path)) !== null) {
+        listingUnreliable = true; // an incomplete listing → hold any real candidates this batch
+        continue; // present on disk: the bootstrap seed/adopt loop handled it; do NOT materialize over it
+      }
+      const entry = this.index.get(l.path);
+      const mh = l.materializedHash;
+      // A genuine delete candidate requires the confirmed-on-disk hash to match the index stamp AND the
+      // working base (l.hash === materializedHash) AND the doc to be clean. If the working base is AHEAD
+      // (an offline, debounced/unpushed edit — the index stamp can still be the old hash) or the doc is
+      // dirty, this is NOT a clean delete: tombstoning would destroy the only copy of the unpushed edit.
+      // Fall through to materialize (M1a), which writes base.baseText back and preserves it.
+      if (
+        mh !== undefined &&
+        entry !== undefined &&
+        entry.deleted !== true &&
+        stampHash(entry.stamp) === mh &&
+        l.hash === mh &&
+        !(await this.ports.engineState.isDirty(l.docId))
+      ) {
+        deleteCandidates.push({ path: l.path, docId: l.docId, hash: l.hash, materializedHash: mh });
+        continue; // a confirmed delete candidate — do NOT materialize here
+      }
+      // STALE / UNCONFIRMED (no materializedHash, or it != the current stamp) → MATERIALIZE (M1a) from the
+      // LOCAL base text (echo-guarded). NOT a delete. We materialize from base.baseText, NOT a docStore
+      // snapshot: an unattached DIRTY doc keeps its unpushed edit in baseText but its snapshot is
+      // stale/absent (review B2). l.hash == sha256OfText(baseText), so the echo guard is exact.
+      this.echo.recordWrite(l.path, l.hash);
+      await this.ports.vault.writeAtomic(l.path, utf8(l.baseText));
+      // MIRROR the seed-loop markMaterialized observe (load-bearing — else M1b closed-app deletes stop
+      // auto-propagating). The seed loop no longer sees this materialize (it ran before us), so record
+      // the OBSERVED-present signal here, gated the SAME way (present file's hash == the bound index stamp).
+      const live = this.index.get(l.path);
+      if (live !== undefined && live.deleted !== true && stampHash(live.stamp) === l.hash) {
+        // l.hash IS a Sha256 at the source (DeferredLost.hash carries base.fileHash, a Sha256), but the
+        // interface keeps it as `string` to stay content-format-agnostic — narrow it back here.
+        await this.base.markMaterialized(live.docId, l.hash as Sha256);
+      }
+    }
+
+    if (deleteCandidates.length > 0) {
+      const durable = this.ports.vault.durabilityTrusted?.() === true;
+      const suspicious =
+        listingUnreliable ||
+        this.isSuspiciousDeleteBatch(
+          deleteCandidates.map((c) => c.path),
+          confirmedLiveProseCount,
+        );
+      const autoPropagate = durable && !suspicious;
+      for (const c of deleteCandidates) {
+        if (autoPropagate) {
+          // Genuine delete on a trusted adapter: tombstone with the CONFIRMED-on-disk hash (never
+          // base.fileHash — the working base can be ahead of disk) + propagate. The file is already
+          // absent, so nothing to remove.
+          await this.tombstoneAndCleanup(c.path, c.docId, "crdt-prose", c.materializedHash);
+        } else {
+          // HOLD (non-durable adapter or a suspicious batch): materialize back (M1a — fail-safe, the
+          // file reappears, no wedge, no data loss) and surface ONE pending-delete entry per path.
+          // Confirmation, not recoverability, is the safety net (spec section 3.6).
+          this.echo.recordWrite(c.path, c.hash);
+          const rec = await this.base.load(c.docId);
+          if (rec !== null) await this.ports.vault.writeAtomic(c.path, utf8(rec.baseText));
+          this.inbox.add({
+            id: `pending-delete:${c.path}:${c.materializedHash.slice(0, 8)}`,
+            kind: "pending-delete",
+            path: c.path,
+            docId: c.docId,
+            detail: `${c.path} appears to have been deleted while the app was closed. Confirm to remove it on all devices, or keep it.`,
+          });
+        }
+      }
+    }
+  }
+
+  /**
+   * Recover an in-place collision (external `mv incoming → P`, closed-app) detected by the bootstrap seed
+   * loop: P is present + bound LIVE but its disk content == a deferred-LOST doc's content (the incoming).
+   * RE-KEY the incoming's content to a DEVICE-INDEPENDENT conflict artifact (reuse its docId — NOT
+   * tombstoneAndCleanup, which would propagate a delete and lose the doc) and RESTORE the occupant from its
+   * base. Both survive; the artifact path is deterministic (createdBy/createdTs from the incoming's
+   * replicated create-meta), so every device converges to the SAME artifact after sync.
+   */
+  private async recoverInPlaceCollision(
+    incoming: DeferredLost,
+    occupantPath: VaultPath,
+    occupantDocId: DocId,
+    occupantBaseText: string,
+    occupantBaseHash: Sha256,
+  ): Promise<void> {
+    const meta = await this.loadCreateMeta(incoming.docId);
+    // Fallbacks are CONTENT-derived (device-independent) so two devices converge to the SAME artifact even
+    // when the incoming's create-meta is unreadable (e.g. a zero-attach-adopted doc with no docStore snapshot).
+    const ts = meta?.createdTs ?? incoming.hash.slice(0, 8);
+    const by = meta?.createdBy ?? (`mv-${incoming.hash.slice(8, 16)}` as DeviceId);
+    const artifactPath = conflictArtifactPath(occupantPath, by, ts);
+    // Park the incoming's content at the artifact, RE-KEYED (reuse docId; NOT tombstoneAndCleanup).
+    // (recordWrite takes a plain string; setStamp needs a Sha256 — incoming.hash is base.fileHash, a Sha256.)
+    this.echo.recordWrite(artifactPath, incoming.hash);
+    await this.ports.vault.writeAtomic(artifactPath, utf8(incoming.baseText));
+    this.index.setStamp(artifactPath, incoming.docId, "crdt-prose", incoming.hash as Sha256);
+    this.index.delete(incoming.path); // tombstone the incoming's old key (logical re-key)
+    await this.noteLiveBinding(incoming.docId, artifactPath);
+    await this.ports.engineState.markDirty(incoming.docId);
+    this.inbox.add({
+      id: `conflict:${artifactPath}:${incoming.docId}`,
+      kind: "conflict",
+      path: artifactPath,
+      docId: incoming.docId,
+      detail: `An external move landed on ${occupantPath}; the incoming note was kept as ${artifactPath}.`,
+    });
+    // Restore the occupant's content at P (echo-guarded) so the seed loop sees it converged.
+    this.echo.recordWrite(occupantPath, occupantBaseHash);
+    await this.ports.vault.writeAtomic(occupantPath, utf8(occupantBaseText));
+    await this.base.markMaterialized(occupantDocId, occupantBaseHash);
+  }
+
+  /**
+   * Load a doc's replicated `create` {@link OrphanMeta} (createdBy/createdTs) from the docStore snapshot,
+   * matching {@link runOrphanSweep}'s `orphanData` access (crdt.loadDoc → meta map). Used to derive a
+   * DEVICE-INDEPENDENT artifact path for an in-place collision recovery. Returns undefined if no snapshot
+   * or no create-meta (a doc seeded before create-meta existed) — the caller falls back to the content hash.
+   */
+  private async loadCreateMeta(docId: DocId): Promise<OrphanMeta | undefined> {
+    const snap = await this.ports.docStore.load(docId);
+    if (snap === null) return undefined;
+    const d = this.ports.crdt.loadDoc(docId, snap);
+    const meta = d.getMap<OrphanMeta>("meta").get("create");
+    d.destroy();
+    return meta;
+  }
+
   /**
    * Genesis/bootstrap (design §9.4). EVERY local prose file — bound OR unbound — is
    * routed through {@link applyBootstrap}, then acted on by its decision:
@@ -2363,6 +2929,12 @@ export class SyncEngine {
    */
   private async bootstrap(): Promise<void> {
     const deviceId = this.ports.identity.deviceId();
+    // M1a: offline rename re-key happens INLINE; the unmatched-lost set is DEFERRED past the seed loop
+    // (applyDeferredLost). The seed loop now CONSUMES an in-place collision first (an external mv onto an
+    // occupied live path): `lostByHash`/`livePresentHashes` are the detection inputs for that.
+    const { deferred, lostByHash, livePresentHashes, confirmedLiveProseCount } =
+      await this.reconcileOfflineStructural();
+    const emptyHash = await sha256OfText("");
     for (const { path } of await this.ports.vault.list()) {
       const bytes = await this.ports.vault.read(path);
       if (bytes === null) continue;
@@ -2401,6 +2973,41 @@ export class SyncEngine {
       // touches prose. The seed/adopt/import decisions below all hash/seed THIS text into
       // the CRDT/base/index stamp, so LF must be canonical from here. See canonicalizeProse.
       const text = canonicalizeProse(decode(bytes));
+      const diskHash = await sha256OfText(text);
+
+      // IN-PLACE COLLISION (external mv onto an occupied live path, closed-app): this present path is bound
+      // LIVE but its disk content diverged from its stamp, AND that disk content is exactly a deferred-LOST
+      // doc's content → an `mv incoming → P` overwrote the occupant. Recover instead of ingesting the bytes
+      // as an occupant edit. Guards: not trivial; UNIQUE (not AMBIGUOUS); NOT live elsewhere; occupant base present.
+      if (
+        existing !== undefined &&
+        existing.deleted !== true &&
+        stampHash(existing.stamp) !== diskHash
+      ) {
+        const incoming = lostByHash.get(diskHash);
+        if (
+          incoming !== undefined &&
+          incoming !== AMBIGUOUS &&
+          diskHash !== emptyHash &&
+          !livePresentHashes.has(diskHash)
+        ) {
+          const occBase = await this.base.load(existing.docId);
+          if (occBase !== null) {
+            await this.recoverInPlaceCollision(
+              incoming,
+              path,
+              existing.docId,
+              occBase.baseText,
+              occBase.fileHash,
+            );
+            const i = deferred.indexOf(incoming);
+            if (i >= 0) deferred.splice(i, 1); // consume — applyDeferredLost must not also handle it
+            lostByHash.set(diskHash, AMBIGUOUS); // consumed — a second occupied path must NOT re-key it
+            continue; // P is restored on disk (occupant content == stamp); skip normal processing.
+          }
+        }
+      }
+
       const treeStamp = existing?.stamp ?? null;
       const docId = existing?.docId ?? this.mintDocId();
       const result = await applyBootstrap(
@@ -2430,8 +3037,8 @@ export class SyncEngine {
           this.writeCreateMeta(doc, path);
           await this.ports.docStore.save(docId, doc.encodeSnapshot());
           doc.destroy();
-          const sha = await sha256OfText(text);
-          this.index.setStamp(path, docId, "crdt-prose", sha);
+          this.index.setStamp(path, docId, "crdt-prose", diskHash);
+          await this.noteLiveBinding(docId, path);
           break;
         }
         case "supervised-import": {
@@ -2485,12 +3092,54 @@ export class SyncEngine {
           }
           break;
       }
+
+      // M1b: record that this docId's CURRENT content was OBSERVED present on disk this boot — but
+      // only when the present file's hash equals the bound index stamp (so a delete next boot can be
+      // told apart from a never-confirmed/torn doc). Idempotent: a no-op on an unchanged re-open.
+      const live = this.index.get(path);
+      if (live !== undefined && live.deleted !== true && stampHash(live.stamp) === diskHash) {
+        await this.base.markMaterialized(live.docId, diskHash);
+      }
+
+      // M2: this docId is bound LIVE on disk this boot (its present file matches the persisted base),
+      // so clear any stale deleteObserved it carries (e.g. deleted then recreated/resurrected where the
+      // re-bind seam missed it). The reconcileOfflineStructural backstop clears it from a CONVERGED index
+      // (the relay-synced restart populates liveEntries before bootstrap) — but a from-disk OFFLINE restart
+      // takes the zero-attach "converge" decision and never re-lists the entry in the in-memory index, so
+      // the flag must also be cleared HERE, keyed off the bootstrap docId + base, not the index entry.
+      // Else a future collision of this doc would be wrongly skipped by the displacement detector and the
+      // loser lost. Gated on a present file whose hash matches the base (a genuinely-live doc) so a
+      // truly-deleted doc keeps its observation; skip-if-unchanged keeps a steady-state restart ~zero-write.
+      const rec = await this.base.load(docId);
+      if (rec !== null && rec.fileHash === diskHash) {
+        await this.ports.engineState.clearDeleted(docId);
+      }
     }
+
+    // DEFERRED UNMATCHED-LOST (M1a/M1b): now that the seed loop has run (and a later task can let it
+    // consume an in-place collision first), replay the materialize / delete-route decision for any
+    // vanished synced file that was NOT a rename and NOT consumed by the seed loop.
+    await this.applyDeferredLost(deferred, confirmedLiveProseCount);
 
     // Orphan sweep: recover any docId in the doc-set not bound by a live tree entry.
     // (Also re-run from the structural pass so a collision that surfaces AFTER sync
     // recovers — see {@link runOrphanSweep}.)
     await this.runOrphanSweep();
+
+    // FIRST-SEEN DIRTY-ORPHAN PRUNE: a SIGKILL in the bumpStamp debounce window can leave a freshly-minted
+    // docId marked dirty BEFORE its index entry (and snapshot) became durable. After the orphan sweep — which
+    // recovers any dirty docId that DOES have a snapshot (binding it live) — a dirty docId with NO live
+    // binding AND NO docStore snapshot is unreachable cruft: catch-up can't reach it (no live entry) and
+    // there is nothing to push (no snapshot). Left alone it counts toward pendingDocs and WEDGES
+    // waitConverged forever. Clear it; the file re-seeds under a fresh docId, so no content is lost. (A
+    // legitimate unpushed edit always has a live entry OR a snapshot, so it is never pruned.)
+    const liveDocIds = new Set<DocId>(this.index.liveEntries().map(([, e]) => e.docId));
+    const snapshotDocIds = new Set<DocId>(await this.ports.docStore.list());
+    for (const dirty of await this.ports.engineState.listDirty()) {
+      if (!liveDocIds.has(dirty) && !snapshotDocIds.has(dirty)) {
+        await this.ports.engineState.clearDirty(dirty);
+      }
+    }
   }
 
   /**
@@ -2513,7 +3162,7 @@ export class SyncEngine {
    */
   private async runOrphanSweep(): Promise<void> {
     const { crdt, docStore } = this.ports;
-    await orphanSweep(
+    const { recovered } = await orphanSweep(
       {
         vault: this.ports.vault,
         echo: this.echo,
@@ -2538,34 +3187,306 @@ export class SyncEngine {
           d.destroy();
           if (meta === undefined) return null;
 
-          // DISCRIMINATE a concurrent-create LOSER from a merely-deleted doc. A loser's
-          // original path is currently bound LIVE to a DIFFERENT (winner) docId — it
-          // genuinely lost the create race. A deleted note's original path is tombstoned
-          // (no live entry), so recovering it would wrongly resurrect a deleted file as a
-          // conflict artifact. Only the former is recovered.
-          const live = this.index.get(meta.originalPath);
-          if (live === undefined || live.deleted === true || live.docId === docId) return null;
+          // M2 precise displacement detection: skip a genuinely-deleted doc; recover an orphan whose
+          // LAST-LIVE path is now bound to a DIFFERENT live docId (a path collision displaced it). For a
+          // create-loser lastLivePath == meta.originalPath (behavior preserved); a rename-loser (whose
+          // create path is tombstoned) is now recovered too. Recovery path stays meta.originalPath-based
+          // (device-independent => deterministic).
+          if (await this.ports.engineState.wasDeleted(docId)) return null;
+          const lastPath = await this.ports.engineState.getLastLivePath(docId);
+          if (lastPath === null) return null;
+          const occupant = this.index.get(lastPath);
+          if (occupant === undefined || occupant.deleted === true || occupant.docId === docId)
+            return null;
 
           return { text, type: "crdt-prose" as Route, meta };
         },
       },
     );
+    // M2: a recovered orphan is now bound LIVE at its conflict path — record the durable baseline.
+    for (const rec of recovered) await this.noteLiveBinding(rec.docId, rec.path);
   }
 
   // ── vault events ───────────────────────────────────────────────────────────
 
+  /**
+   * M3 live-rename coalescer dispatch. The watcher has no native external-rename event: an external
+   * `mv old new` arrives as `delete(old)` + `modify/create(new)`. Rather than tombstone+propagate
+   * `old` and ingest `new` as a fresh docId (losing continuity), we BUFFER the two rename SIGNALS for
+   * a debounced window and resolve them through the same pure `matchRenames` core as bootstrap
+   * (re-key on a content match). Everything else dispatches immediately, exactly as before.
+   *
+   * - synthetic `rename` (engine-mediated `vault.rename`) → {@link onRename} as today (bypasses buffer).
+   * - `delete` of a bound-live prose path → buffer as a rename SOURCE (capture docId + base.fileHash).
+   * - `modify`/`create` to an UNBOUND path → buffer as a rename TARGET.
+   * - `modify`/`create` to a bound-live path (a normal edit) → {@link onWrite} immediately.
+   * - `delete` of a not-bound-live path → {@link onDelete} immediately (early-returns if tombstoned).
+   *
+   * Coalescing is OFF in projector mode (`ingestDisabled`): a read-only projector mutates no index.
+   */
   private onVaultEvent(e: VaultEvent): void {
-    switch (e.type) {
-      case "create":
-      case "modify":
-        this.track(this.onWrite(e.path));
+    if (e.type === "rename") {
+      this.onRename(e.oldPath, e.path);
+      return;
+    }
+    const coalesce = this.config.ingestDisabled !== true;
+    if (e.type === "delete") {
+      const entry = this.index.get(e.path);
+      // DIR-DELETE EXPANSION (F4: no LIVE entry — undefined OR tombstoned — but live children under it):
+      // an external `mv <dir>` arrives as delete(old-dir) + create(new-subtree) with NO per-child source
+      // events. Synthesize a per-child delete for each live child and re-dispatch through THIS routing
+      // (prose -> bufferRenameSource; quarantined -> suppressed; blob -> onDelete). Children have a live
+      // entry so they never re-enter this branch (no recursion).
+      if (coalesce && (entry === undefined || entry.deleted === true)) {
+        const children = this.liveChildrenUnder(e.path); // snapshot array BEFORE re-dispatch
+        if (children.length > 0) {
+          for (const child of children) this.onVaultEvent({ type: "delete", path: child });
+          return;
+        }
+      }
+      const isRenameSource =
+        coalesce &&
+        entry !== undefined &&
+        entry.deleted !== true &&
+        entry.type === "crdt-prose" &&
+        !this.renameTxn.suppressDelete(e.path);
+      if (isRenameSource) this.track(this.bufferRenameSource(e.path, entry));
+      else this.track(this.onDelete(e.path));
+      return;
+    }
+    // create | modify
+    const entry = this.index.get(e.path);
+    const isRenameTarget = coalesce && (entry === undefined || entry.deleted === true);
+    if (isRenameTarget) this.bufferRenameTarget(e.path);
+    else this.track(this.onWrite(e.path)); // normal edit to a bound-live path
+  }
+
+  /** Test seam: drives the REAL vault-event handler (so a test simulates the watcher honestly). */
+  onVaultEventForTest(e: VaultEvent): void {
+    this.onVaultEvent(e);
+  }
+
+  /**
+   * Live (non-tombstoned) child paths strictly under `dir/`. The live INDEX is the authoritative
+   * known-paths oracle for dir-delete expansion: an external `mv <dir>` fires only `delete <dir>`
+   * (no per-child source events), so we recover the moved-away sources from here.
+   */
+  private liveChildrenUnder(dir: VaultPath): VaultPath[] {
+    const prefix = (dir.endsWith("/") ? dir.slice(0, -1) : dir) + "/"; // F7: trim trailing slash
+    const out: VaultPath[] = [];
+    for (const [path] of this.index.liveEntries()) {
+      if (path.startsWith(prefix)) out.push(path); // `notes/` matches notes/a.md, never notes-backup/x.md
+    }
+    return out;
+  }
+
+  /**
+   * Buffer a bound-live prose `delete` as a rename SOURCE. The file is GONE, so the source hash is the
+   * doc's `base.fileHash` (mirrors bootstrap's lost-set construction). No base ⇒ not a rename source
+   * (nothing to re-key) ⇒ fall through to the normal delete path.
+   */
+  private bufferRenameSource(path: VaultPath, entry: TreeEntry): Promise<void> {
+    // The base.load (for the moved-content hash) is ASYNC and could be outrun by the debounce timer,
+    // leaving a drain with a target but not its still-loading source — splitting a real rename into a
+    // fresh-docId ingest + clean-delete (F1). Register the in-flight buffering in `pendingSources` so a
+    // timer-driven `drainRenameBuffer` awaits it before snapshotting. (whenIdle already drains `inflight`
+    // first; this closes the timer path.)
+    this.renameBuf.pendingSourcePaths.add(path); // clause-1 ownership across the async base.load
+    const pen = (async () => {
+      const rec = await this.base.load(entry.docId);
+      if (rec === null) {
+        this.track(this.onDelete(path));
         return;
-      case "delete":
-        this.track(this.onDelete(e.path));
-        return;
-      case "rename":
-        this.onRename(e.oldPath, e.path);
-        return;
+      }
+      this.renameBuf.sources.set(path, { docId: entry.docId, hash: rec.fileHash });
+      this.armRenameWindow();
+    })();
+    this.renameBuf.pendingSources.add(pen);
+    void pen.finally(() => {
+      this.renameBuf.pendingSources.delete(pen);
+      this.renameBuf.pendingSourcePaths.delete(path);
+    });
+    return pen;
+  }
+  /** Buffer a write to an UNBOUND path as a rename TARGET (read + hashed at drain). */
+  private bufferRenameTarget(path: VaultPath): void {
+    this.renameBuf.targets.add(path);
+    this.armRenameWindow();
+  }
+  /**
+   * Arm (or re-arm) the debounce window. RE-ARMED on each newly-buffered signal, but HARD-CAPPED from
+   * the first armed signal so a folder-move burst always drains as one batch (rather than splitting
+   * delete/create pairs across drains). When the cap is reached, drain immediately.
+   */
+  private armRenameWindow(): void {
+    const now = this.ports.clock.now();
+    this.renameBuf.firstArmedAt ??= now;
+    if (this.renameBuf.timer !== null) clearTimeout(this.renameBuf.timer);
+    const delay = this.renameDrainDelay(now, this.renameBuf.firstArmedAt);
+    this.renameBuf.timer = setTimeout(() => {
+      this.track(this.runRenameDrain());
+    }, delay);
+  }
+  /**
+   * The debounce delay for the next drain, given `now` and when the window was first armed. The base
+   * window is CLAMPED to the remaining cap budget (F4): a steady sub-window event cadence would otherwise
+   * keep re-arming a full window and push the drain a whole window PAST `firstArmedAt + cap`. Clamping
+   * makes the cap a HARD ceiling — the batch always drains BY the cap. Never negative.
+   */
+  private renameDrainDelay(now: number, firstArmedAt: number): number {
+    const capRemaining = Math.max(0, this.renameWindowCapMs - (now - firstArmedAt));
+    return Math.min(this.renameWindowMs, capRemaining);
+  }
+  /** Single-flight drain: a re-arm during an in-flight drain reuses the same promise. */
+  private runRenameDrain(): Promise<void> {
+    if (this.renameBuf.draining !== null) return this.renameBuf.draining;
+    const drain = this.drainRenameBuffer().finally(() => {
+      this.renameBuf.draining = null;
+      this.renameBuf.drainingTargets = new Set(); // F2: release the target reservation when the drain ends
+      this.renameBuf.drainingSources = new Set();
+
+      // LIVENESS: a signal buffered WHILE this drain was in flight re-armed a debounce timer; if that
+      // timer already fired (its callback saw `draining !== null` and returned this drain WITHOUT
+      // re-processing) the buffer is left refilled with a DEAD timer. Re-arm so it drains — otherwise
+      // the refill is stranded until the next vault event or a whenIdle/waitConverged force-drain.
+      if (this.renameBuf.sources.size > 0 || this.renameBuf.targets.size > 0)
+        this.armRenameWindow();
+    });
+    this.renameBuf.draining = drain;
+    return drain;
+  }
+  /**
+   * Drain the rename buffer: build `lost`/`created`, run the SAME pure `matchRenames` core as bootstrap,
+   * re-key each content-matched pair (docId continuity, no delete propagated), and route the remainder.
+   * (Task 1 keeps behaviour parity for the non-matched remainder; Tasks 2/3 refine it.)
+   */
+  private async drainRenameBuffer(): Promise<void> {
+    // F1: await any in-flight source buffering (its async base.load) BEFORE snapshotting, so a
+    // timer-driven drain never reads a half-populated buffer (a target without its still-loading source)
+    // and splits the rename. Signals that arrive DURING this await belong to the next window — the
+    // single-flight + finally re-arm in runRenameDrain picks them up.
+    if (this.renameBuf.pendingSources.size > 0) {
+      await Promise.allSettled([...this.renameBuf.pendingSources]);
+    }
+    if (this.renameBuf.timer !== null) {
+      clearTimeout(this.renameBuf.timer);
+      this.renameBuf.timer = null;
+    }
+    const sources = [...this.renameBuf.sources];
+    const targets = [...this.renameBuf.targets];
+    this.renameBuf.sources = new Map();
+    this.renameBuf.targets = new Set();
+    // F2: RESERVE the snapshotted targets (synchronously, before any await) so a concurrent
+    // `requestRename` cannot vault.rename onto one mid-drain and clobber its still-unread bytes.
+    // `runRenameDrain`'s finally releases the reservation when the drain ends.
+    this.renameBuf.drainingTargets = new Set(targets);
+    this.renameBuf.drainingSources = new Set(sources.map(([pth]) => pth));
+    this.renameBuf.firstArmedAt = null;
+    if (sources.length === 0 && targets.length === 0) return;
+
+    const emptyHash = await sha256OfText("");
+    const lost = sources.map(([path, s]) => ({ path, docId: s.docId, hash: s.hash }));
+    const created: { path: VaultPath; hash: string }[] = [];
+    for (const path of targets) {
+      const bytes = await this.ports.vault.read(path);
+      if (bytes === null) continue; // vanished during the window
+      if (classify(path, bytes, this.caps).route !== "crdt-prose") {
+        this.track(this.onWrite(path)); // non-prose target → normal ingest, never a re-key
+        continue;
+      }
+      created.push({ path, hash: await sha256OfText(canonicalizeProse(decode(bytes))) });
+    }
+    // livePresentHashes: stamp-hashes of CURRENT live prose, EXCLUDING the buffered sources (in-memory,
+    // no I/O — mirrors bootstrap engine.ts ~2533-2537). Guards a re-key that would steal a docId whose
+    // content is still live elsewhere.
+    // TODO(m3-followup): share the matchRenames wiring with reconcileOfflineStructural to prevent drift.
+    const sourceSet = new Set(sources.map(([pth]) => pth));
+    const livePresentHashes = new Set<string>();
+    for (const [pth, ent] of this.index.liveEntries()) {
+      if (ent.type !== "crdt-prose" || sourceSet.has(pth)) continue;
+      livePresentHashes.add(stampHash(ent.stamp));
+    }
+    const { matches, unmatchedLost, unmatchedCreated } = matchRenames(lost, created, {
+      isExcludedPath: isTempPath,
+      isTrivialHash: (h) => h === emptyHash,
+      isLiveElsewhere: (h) => livePresentHashes.has(h),
+    });
+    for (const m of matches) {
+      // RE-VALIDATE `from` (§4.2): a REMOTE op during the window may have tombstoned or re-bound it.
+      // `IndexDoc.rename` unconditionally sets the target `deleted:false`, so a naive `applyRename`
+      // would RESURRECT a remotely-tombstoned docId. If `from` is no longer LIVE under the SAME docId,
+      // abandon the match — the remote delete wins — and ingest the target as a fresh file (content
+      // preserved). The target was held unbound, so onWrite gives it a new docId, not the dead one.
+      const cur = this.index.get(m.from);
+      if (cur === undefined || cur.deleted === true || cur.docId !== m.docId) {
+        this.track(this.onWrite(m.to));
+        continue;
+      }
+      // TARGET-OCCUPANCY GUARD (F3 — mirror the bootstrap matched-rename guard, engine.ts ~2662): a
+      // REMOTE op during the window may have re-bound `m.to` to a DIFFERENT live docId. `IndexDoc.rename`
+      // overwrites `to` unconditionally, so an un-guarded `applyRename` would CLOBBER that live binding.
+      // Refuse the re-key; the source's file is gone, so route it as a genuine delete (no live-but-missing
+      // wedge). (Full M2-style conflict recovery of the displaced source is the runtime path-collision
+      // follow-on; this floor just refuses to destroy the occupant's binding.)
+      const occupant = this.index.get(m.to);
+      if (occupant !== undefined && occupant.deleted !== true && occupant.docId !== m.docId) {
+        await this.gatedLiveDelete(m.from, m.docId);
+        continue;
+      }
+      applyRename(this.index, m.from, m.to);
+      await this.noteLiveBinding(m.docId, m.to);
+    }
+    // Unmatched lost = a genuine delete → GATED delete (clean propagate / dirty materialize-back).
+    for (const l of unmatchedLost) await this.gatedLiveDelete(l.path, l.docId);
+    // Unmatched created = a genuine new file → ingest now. `matchRenames` returns DISJOINT
+    // matches/unmatchedCreated, so no `m.to` appears here (and an abandoned match's `m.to` is already
+    // onWrite-ingested in the re-validate branch above) — ingest each directly.
+    for (const c of unmatchedCreated) this.track(this.onWrite(c.path));
+  }
+
+  /**
+   * Unmatched buffered source = a genuine delete. The watcher delivered an EXPLICIT `delete` event for
+   * a file that WAS on disk, so — unlike the closed-app listing (ambiguous between a real delete and a
+   * torn/incomplete listing, hence its `durable`/suspicious gate) — the runtime signal is unambiguous:
+   * a CLEAN doc → tombstone + propagate (matching the pre-M3 `onDelete`, which had no durability gate).
+   * The ONLY runtime hazard the gate guards is the edit-then-mv race (§4.3 / key insight): a DIRTY doc,
+   * or one whose working base is AHEAD of its bound index stamp (an unpushed offline edit), must NOT be
+   * tombstoned — that would destroy the only copy of the edit. Such a doc MATERIALIZES BACK from base
+   * (M1a fail-safe: echo-guarded re-write of base.baseText at the path, preserving the unpushed edit and
+   * avoiding a live-but-missing entry that would wedge runtime quiescence).
+   *
+   * CLEAN is `base.fileHash === stampHash(entry.stamp)` — the working base equals the BOUND index
+   * content, so there is NO divergent edit to lose; the delete is unambiguous and propagates. We do NOT
+   * also require `!isDirty`: `dirty` only means "not yet PUSHED" (e.g. an offline create/edit-then-
+   * delete), not "has content diverging from the bound stamp" — and a delete must still win over an
+   * unpushed-but-non-divergent change (the tombstone simply propagates the removal). Only a base AHEAD
+   * of the stamp (`base.fileHash !== stamp` — a real unpushed edit, incl. one a concurrent remote edit
+   * advanced into base via catch-up; the edit-beats-delete key insight) blocks the tombstone. This does
+   * NOT key off `materializedHash` (a synced RECEIVER never records it at runtime — only the bootstrap
+   * observe does — so requiring it would wrongly hold every receiver's genuine delete). We re-load the
+   * base here so a base advance DURING the window is reflected (the captured buffer-time hash is stale).
+   */
+  private async gatedLiveDelete(path: VaultPath, docId: DocId): Promise<void> {
+    const entry = this.index.get(path);
+    if (entry === undefined || entry.deleted === true) return; // already handled / re-bound
+    const rec = await this.base.load(docId);
+    if (rec === null) return; // no base to reason about — leave the live entry (next bootstrap resolves)
+    const clean = rec.fileHash === stampHash(entry.stamp);
+    if (clean) {
+      // Genuine clean delete: tombstone with the bound content hash + propagate. The file is already
+      // absent, so nothing to remove. (rec.fileHash === the bound index stamp here, by the clean gate.)
+      await this.tombstoneAndCleanup(path, docId, entry.type, rec.fileHash);
+      return;
+    }
+    // DIRTY / base-ahead (an unpushed edit) → MATERIALIZE-BACK (M1a, echo-guarded) from the LOCAL base
+    // text. The edit survives at the old path and pushes from there; the file reappears (no wedge).
+    this.echo.recordWrite(path, rec.fileHash);
+    await this.ports.vault.writeAtomic(path, utf8(rec.baseText));
+    // MIRROR the bootstrap markMaterialized observe, gated the SAME way (the present file's hash == the
+    // bound index stamp) — keeps a later closed-app delete of this doc auto-propagating.
+    const live = this.index.get(path);
+    if (live !== undefined && live.deleted !== true && stampHash(live.stamp) === rec.fileHash) {
+      await this.base.markMaterialized(live.docId, rec.fileHash);
     }
   }
 
@@ -2658,6 +3579,34 @@ export class SyncEngine {
     }
   }
 
+  /**
+   * Lay an edit-beats-delete tombstone for a BOUND docId + run the local cleanup (clear echo, clear
+   * the stranded dirty flag, drop base + docStore snapshot). Shared by the live-delete path
+   * ({@link onDelete}, which passes the working-base hash) and M1b's closed-app delete propagation
+   * (which passes the confirmed-on-disk materializedHash). Bound-docId-only — never a concurrent-
+   * create loser — so the orphan sweep's recovery snapshot is never removed here.
+   *
+   * The dirty flag is cleared because a deleted note has no live index path, so catch-up's
+   * computeCatchUpSet can never map that dirty docId back to a path to clear it — left dirty it
+   * would report pending forever and wedge waitConverged. Resurrection re-marks dirty via the
+   * normal inbound ingest path, not this stale flag.
+   */
+  private async tombstoneAndCleanup(
+    path: VaultPath,
+    docId: DocId,
+    type: Route,
+    contentSha: Sha256,
+  ): Promise<void> {
+    recordTombstone(this.index, path, docId, type, this.ports.identity.deviceId(), contentSha);
+    this.echo.clear(path);
+    // M2: record the delete DURABLY before removing the snapshot, so a delete racing a path-reuse (or a
+    // crash mid-cleanup) is never resurrected by the displacement detector.
+    await this.ports.engineState.markDeleted(docId);
+    await this.ports.engineState.clearDirty(docId);
+    await this.base.delete(docId);
+    await this.ports.docStore.delete(docId);
+  }
+
   /** A delete: lay an edit-beats-delete tombstone keyed on the doc's last content hash. */
   private async onDelete(path: VaultPath): Promise<void> {
     // RENAME-TRANSACTION SUPPRESSION (0b-3): a real recursive watcher emits ASYNC,
@@ -2677,29 +3626,6 @@ export class SyncEngine {
     if (entry === undefined || entry.deleted === true) return;
     const rec = await this.base.load(entry.docId);
     const sha = rec?.fileHash ?? (await sha256OfBytes(utf8("")));
-    recordTombstone(this.index, path, entry.docId, entry.type, this.ports.identity.deviceId(), sha);
-    this.echo.clear(path);
-    // Clear any STRANDED dirty flag for the now-tombstoned doc. A dirty flag (set by
-    // a prior local ingest) is a promise to re-push this device's content; a deleted
-    // note has no live index path, so catch-up's `computeCatchUpSet` can never map
-    // that dirty docId back to a path → it would never `clearDirty` it. Left dirty,
-    // `pendingDocs()` (which unions the dirty set) reports the doc pending FOREVER →
-    // `waitConverged` never settles. This bites a create-then-delete inside ONE
-    // offline window (catch-up is a no-op offline, so the create's dirty flag is
-    // still set when the delete tombstones the entry). Resurrection is unaffected: an
-    // edit-beats-delete revival arrives as an inbound index change + note-doc content
-    // and re-marks dirty through the normal ingest/reconcile path, not this stale flag.
-    await this.ports.engineState.clearDirty(entry.docId);
-    // Remove the now-tombstoned doc's base record so it is not orphaned. (The inbound-tombstone
-    // path cleans up via structural reconcile's `deleteBase` seam, since that removal echoes a
-    // "delete" onto an already-tombstoned entry and early-returns above.)
-    await this.base.delete(entry.docId);
-    // Likewise remove the doc's docStore (CRDT) snapshot so it is not orphaned in IDB forever.
-    // SAFE re: orphan recovery: onDelete only fires for a docId BOUND to a live path being deleted
-    // (a winner / already-recovered doc) -- NEVER an unrecovered concurrent-create LOSER (which is
-    // never bound to a deletable live path), so the snapshot the orphan sweep materializes from is
-    // never removed here. An edit-beats-delete resurrection re-attaches the doc from the relay and
-    // re-persists a fresh snapshot, so revival is unaffected.
-    await this.ports.docStore.delete(entry.docId);
+    await this.tombstoneAndCleanup(path, entry.docId, entry.type, sha);
   }
 }

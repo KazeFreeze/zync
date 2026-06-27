@@ -91,6 +91,8 @@ export async function recoverOrphan(
       substrate,
       ackedText: "",
       ackedHash: await sha256OfText(""),
+      // M1b: preserve the durable confirmed-on-disk signal across a fresh-record save.
+      materializedHash: existingBase?.materializedHash,
     });
   }
 

@@ -346,3 +346,25 @@ describe("headless-client daemon control API", () => {
     expect(statusBody.ingestCount).toBe(0);
   });
 });
+
+describe("headless-client daemon — durability-trust wiring", () => {
+  it("defaults to a durability-TRUSTED vault (a real local FS root)", async () => {
+    await boot();
+    if (daemon === null) throw new Error("daemon not booted");
+    expect(daemon.vault.durabilityTrusted()).toBe(true);
+  });
+
+  it("config.durabilityTrusted=false constructs a NON-trusted vault (FUSE/cloud root)", async () => {
+    await boot({ durabilityTrusted: false });
+    if (daemon === null) throw new Error("daemon not booted");
+    expect(daemon.vault.durabilityTrusted()).toBe(false);
+  });
+
+  it("configFromEnv: ZYNC_DURABILITY_TRUSTED=false -> durabilityTrusted false", () => {
+    expect(configFromEnv({ ZYNC_DURABILITY_TRUSTED: "false" }).durabilityTrusted).toBe(false);
+  });
+
+  it("configFromEnv: unset -> durabilityTrusted true (trust a real local root by default)", () => {
+    expect(configFromEnv({}).durabilityTrusted).toBe(true);
+  });
+});

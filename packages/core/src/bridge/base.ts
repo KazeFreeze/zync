@@ -27,6 +27,16 @@ export interface BaseRecord {
    */
   ackedText?: string;
   ackedHash?: Sha256; // the last-acked content's hash (the recovery anchor for the disk-ahead guard)
+  /**
+   * M1b: the content hash this device last OBSERVED present on disk for this docId — the durable
+   * signal that later lets a closed-app delete be told apart from a never-written doc.
+   *
+   * UNLIKE the `acked*` fields above, this is NOT defaulted on load: an absent value stays absent
+   * (`undefined`), because "never confirmed present" MUST stay distinguishable from a confirmed
+   * delete. Defaulting it would silently assert presence the device never observed. The explicit
+   * `| undefined` (under exactOptionalPropertyTypes) lets load/save round-trip an absent value.
+   */
+  materializedHash?: Sha256 | undefined;
 }
 
 interface SerializedBase {
@@ -36,6 +46,7 @@ interface SerializedBase {
   substrate: string;
   ackedText?: string; // absent in pre-0b-3 records ⇒ defaults to baseText on load
   ackedHash?: Sha256; // absent in pre-0b-3 records ⇒ defaults to fileHash on load
+  materializedHash?: Sha256 | undefined; // M1b: NOT defaulted on load — absent must stay absent
 }
 
 /**
@@ -45,6 +56,9 @@ interface SerializedBase {
  * Writes base BEFORE the note file so a torn pair recovers safely.
  */
 export class BaseStore {
+  /** Per-doc serialization: chains all reads/writes of a given docId so a load-modify-save can't race. */
+  private readonly locks = new Map<DocId, Promise<unknown>>();
+
   constructor(
     private readonly vault: VaultPort,
     private readonly configDir: string,
@@ -54,7 +68,70 @@ export class BaseStore {
     return `${this.configDir}/zync/base/${docId}.json` as VaultPath;
   }
 
-  async load(docId: DocId): Promise<BaseRecord | null> {
+  private withDocLock<T>(docId: DocId, fn: () => Promise<T>): Promise<T> {
+    const prev = this.locks.get(docId) ?? Promise.resolve();
+    const next = prev.then(fn, fn);
+    this.locks.set(
+      docId,
+      next.then(
+        () => undefined,
+        () => undefined,
+      ),
+    );
+    return next;
+  }
+
+  load(docId: DocId): Promise<BaseRecord | null> {
+    return this.withDocLock(docId, () => this.loadUnlocked(docId));
+  }
+
+  save(docId: DocId, rec: BaseRecord): Promise<void> {
+    return this.withDocLock(docId, () => this.saveUnlocked(docId, rec));
+  }
+
+  /**
+   * Remove a doc's base record — the delete/tombstone cleanup (otherwise a deleted note leaves an
+   * orphaned `<docId>.json` behind forever). Idempotent: every {@link VaultPort.remove} implementation
+   * is a no-op on a missing file, so calling this for a doc that never had a base record is safe.
+   */
+  delete(docId: DocId): Promise<void> {
+    return this.withDocLock(docId, () => this.vault.remove(this.path(docId)));
+  }
+
+  /** Atomic-ordering helper: base first, then the note file. */
+  saveThenFile(
+    docId: DocId,
+    rec: BaseRecord,
+    notePath: VaultPath,
+    noteBytes: Uint8Array,
+  ): Promise<void> {
+    return this.withDocLock(docId, async () => {
+      await this.saveUnlocked(docId, rec);
+      await this.vault.writeAtomic(notePath, noteBytes);
+    });
+  }
+
+  /** Serialized read-modify-write of a doc's base record. `fn` returns the record to persist, or
+   *  null to leave it untouched. Callers MUST spread the loaded record to preserve every field. */
+  async mutate(docId: DocId, fn: (rec: BaseRecord | null) => BaseRecord | null): Promise<void> {
+    await this.withDocLock(docId, async () => {
+      const cur = await this.loadUnlocked(docId);
+      const next = fn(cur);
+      if (next === null) return;
+      await this.saveUnlocked(docId, next);
+    });
+  }
+
+  /** M1b: record that this docId's content (hash) was observed present on disk, preserving all
+   *  other fields. Idempotent: a no-op (no write) if the record is missing or already has this hash. */
+  async markMaterialized(docId: DocId, hash: Sha256): Promise<void> {
+    await this.mutate(docId, (rec) => {
+      if (rec === null || rec.materializedHash === hash) return null;
+      return { ...rec, materializedHash: hash };
+    });
+  }
+
+  private async loadUnlocked(docId: DocId): Promise<BaseRecord | null> {
     const bytes = await this.vault.read(this.path(docId));
     if (bytes === null) return null;
     const s = JSON.parse(new TextDecoder().decode(bytes)) as SerializedBase;
@@ -66,10 +143,12 @@ export class BaseStore {
       // Pre-0b-3 records have no acked* fields ⇒ treat the working base as fully-acked.
       ackedText: s.ackedText ?? s.baseText,
       ackedHash: s.ackedHash ?? s.fileHash,
+      // M1b: NOT defaulted — absent must stay absent (never-confirmed vs confirmed-delete).
+      materializedHash: s.materializedHash,
     };
   }
 
-  async save(docId: DocId, rec: BaseRecord): Promise<void> {
+  private async saveUnlocked(docId: DocId, rec: BaseRecord): Promise<void> {
     const s: SerializedBase = {
       baseText: rec.baseText,
       fileHash: rec.fileHash,
@@ -78,28 +157,9 @@ export class BaseStore {
       // Default an omitted acked base to the working base (fully-acked, steady-state semantics).
       ackedText: rec.ackedText ?? rec.baseText,
       ackedHash: rec.ackedHash ?? rec.fileHash,
+      materializedHash: rec.materializedHash,
     };
     await this.vault.writeAtomic(this.path(docId), new TextEncoder().encode(JSON.stringify(s)));
-  }
-
-  /**
-   * Remove a doc's base record — the delete/tombstone cleanup (otherwise a deleted note leaves an
-   * orphaned `<docId>.json` behind forever). Idempotent: every {@link VaultPort.remove} implementation
-   * is a no-op on a missing file, so calling this for a doc that never had a base record is safe.
-   */
-  async delete(docId: DocId): Promise<void> {
-    await this.vault.remove(this.path(docId));
-  }
-
-  /** Atomic-ordering helper: base first, then the note file. */
-  async saveThenFile(
-    docId: DocId,
-    rec: BaseRecord,
-    notePath: VaultPath,
-    noteBytes: Uint8Array,
-  ): Promise<void> {
-    await this.save(docId, rec);
-    await this.vault.writeAtomic(notePath, noteBytes);
   }
 }
 

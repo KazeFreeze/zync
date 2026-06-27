@@ -322,8 +322,8 @@ async function fsRename(deps: ControlApiDeps, raw: unknown): Promise<JsonRespons
   if (typeof body.from !== "string" || typeof body.to !== "string") {
     throw new HttpError(400, "from and to are required");
   }
-  await deps.vault.rename(vp(body.from), vp(body.to));
-  return { status: 200, body: { ok: true } };
+  const renamed = await deps.engine.requestRename(vp(body.from), vp(body.to));
+  return { status: 200, body: { ok: true, renamed } };
 }
 
 interface FsDeleteBody {

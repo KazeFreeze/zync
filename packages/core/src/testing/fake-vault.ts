@@ -9,6 +9,19 @@ export class FakeVault implements VaultPort {
   private files = new Map<string, Entry>();
   private listeners = new Set<(e: VaultEvent) => void>();
   private clock = 0;
+  private readonly hidden = new Set<string>();
+
+  constructor(private readonly opts: { durable?: boolean } = {}) {}
+
+  durabilityTrusted(): boolean {
+    return this.opts.durable === true;
+  }
+
+  /** TEST HOOK: make `path` invisible to list() while read() still returns its bytes (models an
+   *  incomplete getFiles() listing — Obsidian index lag / cloud mount). */
+  hideFromList(path: VaultPath): void {
+    this.hidden.add(path);
+  }
 
   read(path: VaultPath): Promise<Uint8Array | null> {
     return Promise.resolve(this.files.get(path)?.data ?? null);
@@ -36,10 +49,21 @@ export class FakeVault implements VaultPort {
     return Promise.resolve();
   }
 
+  /** TEST HOOK: relocate `from`'s bytes to `to` WITHOUT emitting any event — models a raw external
+   *  `mv` that the live watcher only ever sees as a SEPARATE delete(old) + modify(new) pair (a test
+   *  drives those via the engine's onEvent listeners directly). Unlike {@link rename}, fires nothing. */
+  relocateSilently(from: VaultPath, to: VaultPath): void {
+    const e = this.files.get(from);
+    if (e === undefined) return;
+    this.files.delete(from);
+    this.files.set(to, e);
+  }
+
   list(prefix?: VaultPath): Promise<{ path: VaultPath; size: number; mtime: number }[]> {
     const out: { path: VaultPath; size: number; mtime: number }[] = [];
     for (const [path, e] of this.files) {
       if (prefix !== undefined && !path.startsWith(prefix)) continue;
+      if (this.hidden.has(path)) continue;
       out.push({ path: path as VaultPath, size: e.data.length, mtime: e.mtime });
     }
     return Promise.resolve(out);

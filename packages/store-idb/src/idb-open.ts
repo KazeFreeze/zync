@@ -22,6 +22,10 @@ import type { Stamp } from "@zync/core";
 export interface EngineStateRecord {
   syncedStamp: Stamp | null;
   dirty: boolean;
+  /** M2 path-collision: path this device last saw the doc LIVE at. `undefined` once cleared. */
+  lastLivePath?: string | undefined;
+  /** M2: durable delete-observed flag, set before delete-cleanup. */
+  deleted?: boolean;
 }
 
 export interface ZyncSchema extends DBSchema {

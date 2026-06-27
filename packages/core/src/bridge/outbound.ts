@@ -60,6 +60,11 @@ export class OutboundPipeline {
     //    relay-acked. Advance BOTH the working base AND the acked/recovery base to it (0b-3
     //    crash-window no-loss): a crash after this leaves the recovery base at genuinely-acked
     //    content, never at an unpushed local edit.
+    // M1b: a fresh-record save must PRESERVE materializedHash (the durable confirmed-on-disk
+    // signal recorded at bootstrap). Without carrying it forward, a remote-update reconcile would
+    // clobber it. Step 4 below conditionally writes `newText` to disk; the materialize/settle path
+    // owns recording the new content's materializedHash, so we only carry the prior value here.
+    const priorBase = await d.base.load(docId);
     await d.base.save(docId, {
       baseText: newText,
       fileHash: newHash,
@@ -67,6 +72,7 @@ export class OutboundPipeline {
       substrate: d.substrate,
       ackedText: newText,
       ackedHash: newHash,
+      materializedHash: priorBase?.materializedHash,
     });
 
     // 4. Write to disk ONLY if it differs — and echo-record IMMEDIATELY before the write.

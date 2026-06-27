@@ -1,11 +1,13 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
-import type { DocId } from "@zync/core";
+import type { DocId, VaultPath } from "@zync/core";
 import { FsEngineStateStore } from "./fs-engine-state.js";
+import * as fsu from "./fs-utils.js";
 
 const id = (s: string): DocId => s as DocId;
+const p = (s: string): VaultPath => s as VaultPath;
 
 async function makeTmpState(): Promise<{ store: FsEngineStateStore; filePath: string }> {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "zync-state-test-"));
@@ -125,5 +127,53 @@ describe("FsEngineStateStore — crash-survival (re-open)", () => {
 
     const store2 = await FsEngineStateStore.open(filePath);
     expect(await store2.listDirty()).toEqual([id("d2")]);
+  });
+});
+
+describe("FsEngineStateStore — skip-if-unchanged (no O(n^2) backstop rewrite)", () => {
+  it("setLastLivePath / clearDeleted skip the durable write when unchanged", async () => {
+    const { store } = await makeTmpState();
+    const spy = vi.spyOn(fsu, "atomicWriteBytes");
+    try {
+      await store.setLastLivePath(id("d"), p("notes/a.md")); // changed → 1 write
+      const afterFirst = spy.mock.calls.length;
+      expect(afterFirst).toBe(1);
+
+      await store.setLastLivePath(id("d"), p("notes/a.md")); // unchanged → NO write
+      expect(spy.mock.calls.length).toBe(afterFirst);
+
+      await store.clearDeleted(id("d")); // never marked → NO write
+      expect(spy.mock.calls.length).toBe(afterFirst);
+
+      await store.markDeleted(id("d")); // changed → 1 write
+      expect(spy.mock.calls.length).toBe(afterFirst + 1);
+
+      await store.markDeleted(id("d")); // unchanged → NO write
+      expect(spy.mock.calls.length).toBe(afterFirst + 1);
+
+      // Behavior is unchanged — final state matches the requested values.
+      expect(await store.getLastLivePath(id("d"))).toBe(p("notes/a.md"));
+      expect(await store.wasDeleted(id("d"))).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("clearLastLivePath skips the durable write when already absent", async () => {
+    const { store } = await makeTmpState();
+    const spy = vi.spyOn(fsu, "atomicWriteBytes");
+    try {
+      await store.clearLastLivePath(id("ghost")); // never set → NO write
+      expect(spy.mock.calls.length).toBe(0);
+
+      await store.setLastLivePath(id("d"), p("notes/a.md")); // 1 write
+      await store.clearLastLivePath(id("d")); // present → 1 write
+      expect(spy.mock.calls.length).toBe(2);
+
+      await store.clearLastLivePath(id("d")); // now absent → NO write
+      expect(spy.mock.calls.length).toBe(2);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

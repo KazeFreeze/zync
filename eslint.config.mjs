@@ -7,6 +7,10 @@ export default tseslint.config(
       "**/dist/**",
       "**/build/**",
       "**/node_modules/**",
+      // Isolated feature-build worktrees (gitignored, see .gitignore) are nested CHECKOUTS;
+      // linting them from the main checkout applies the wrong (default) config to their
+      // duplicate package files. Exclude so `pnpm verify` is clean while a worktree exists.
+      ".worktrees/**",
       "packages/plugin/**",
       // Harness fixtures are synthetic test DATA, not typed source. The routing
       // fixture's deterministic 5 MB-blob generator is a plain Node `.mjs` script

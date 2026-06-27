@@ -12,7 +12,7 @@
  * (a set: a docId appears at most once). All of this is durable across reopen
  * because it lives in IndexedDB — the engine's crash-restart guarantee.
  */
-import type { DocId, EngineStateStore, Stamp } from "@zync/core";
+import type { DocId, EngineStateStore, Stamp, VaultPath } from "@zync/core";
 import { ENGINE_STATE_STORE, type EngineStateRecord, type ZyncDb } from "./idb-open.js";
 
 function emptyRecord(): EngineStateRecord {
@@ -60,6 +60,40 @@ export class IdbEngineState implements EngineStateStore {
   async isDirty(id: DocId): Promise<boolean> {
     const rec = await this.db.get(ENGINE_STATE_STORE, id);
     return rec?.dirty ?? false;
+  }
+
+  async getLastLivePath(id: DocId): Promise<VaultPath | null> {
+    const rec = await this.db.get(ENGINE_STATE_STORE, id);
+    return (rec?.lastLivePath as VaultPath | undefined) ?? null;
+  }
+
+  async setLastLivePath(id: DocId, path: VaultPath): Promise<void> {
+    const rec = await this.db.get(ENGINE_STATE_STORE, id);
+    if (rec?.lastLivePath === path) return; // skip-if-unchanged (avoid a needless readwrite tx)
+    await this.mutate(id, (r) => ({ ...r, lastLivePath: path }));
+  }
+
+  async clearLastLivePath(id: DocId): Promise<void> {
+    const rec = await this.db.get(ENGINE_STATE_STORE, id);
+    if (rec?.lastLivePath === undefined) return; // skip-if-unchanged
+    await this.mutate(id, (r) => ({ ...r, lastLivePath: undefined }));
+  }
+
+  async markDeleted(id: DocId): Promise<void> {
+    const rec = await this.db.get(ENGINE_STATE_STORE, id);
+    if (rec?.deleted === true) return; // skip-if-unchanged
+    await this.mutate(id, (r) => ({ ...r, deleted: true }));
+  }
+
+  async wasDeleted(id: DocId): Promise<boolean> {
+    const rec = await this.db.get(ENGINE_STATE_STORE, id);
+    return rec?.deleted ?? false;
+  }
+
+  async clearDeleted(id: DocId): Promise<void> {
+    const rec = await this.db.get(ENGINE_STATE_STORE, id);
+    if (!(rec?.deleted ?? false)) return; // skip-if-unchanged (hot in noteLiveBinding)
+    await this.mutate(id, (r) => ({ ...r, deleted: false }));
   }
 
   /**

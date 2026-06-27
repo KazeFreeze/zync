@@ -75,6 +75,13 @@ export interface DaemonConfig {
    */
   blobPolicy?: BlobFetchPolicy;
   /**
+   * Whether the engine may TRUST this root's "absent at bootstrap" signal enough to auto-propagate a
+   * closed-app delete (see {@link NodeFsVault.durabilityTrusted}). Omitted ⇒ the NodeFsVault default
+   * (`true`, a real local FS). Set `false` for a FUSE / cloud-mounted vault (Dropbox, gocryptfs, network
+   * share) — there an absent file may be a not-yet-synced placeholder, so deletes are held for confirm.
+   */
+  durabilityTrusted?: boolean;
+  /**
    * Open a real socket. `false` for in-process offline tests so `start()` runs fully
    * offline and bootstrap seeds locally (no relay needed).
    */
@@ -103,7 +110,14 @@ const DEFAULT_MAX_PROSE_BYTES = 1_000_000;
  * so in-process tests can run fully offline.
  */
 export async function createDaemon(config: DaemonConfig): Promise<Daemon> {
-  const vault = new NodeFsVault(config.vaultDir);
+  // Only pass the option when set so the NodeFsVault default (true) applies otherwise — and so an
+  // explicit `undefined` is never passed under exactOptionalPropertyTypes.
+  const vault = new NodeFsVault(
+    config.vaultDir,
+    config.durabilityTrusted !== undefined
+      ? { durabilityTrusted: config.durabilityTrusted }
+      : undefined,
+  );
   const docStore = new FsDocStore(config.docStoreDir);
   const engineState = await FsEngineStateStore.open(config.stateFile);
   const blobs = new HttpBlobStore(config.serverHttp, config.token);
@@ -244,6 +258,8 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): DaemonConfi
     // the server store. Only `"lazy"` opts out (fetch-on-open); any other value falls back
     // to eager so a typo never silently disables materialization.
     blobPolicy: env.ZYNC_BLOB_POLICY === "lazy" ? "lazy" : "eager",
+    // Trust a real local root by default; only an explicit `false` opts out (FUSE/cloud mounts).
+    durabilityTrusted: env.ZYNC_DURABILITY_TRUSTED !== "false",
     // The relay socket opens by default; tests override with `connect: false`.
     connect: env.ZYNC_CONNECT !== "false",
   };

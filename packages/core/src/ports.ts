@@ -56,6 +56,13 @@ export interface VaultPort {
   rename(from: VaultPath, to: VaultPath): Promise<void>;
   list(prefix?: VaultPath): Promise<{ path: VaultPath; size: number; mtime: number }[]>;
   onEvent(cb: (e: VaultEvent) => void): Unsubscribe;
+  /**
+   * M1b: may the engine TRUST an "absent at bootstrap" signal from this adapter enough to propagate
+   * a closed-app delete WITHOUT user confirmation? True only for adapters with fsync-grade writes AND
+   * a complete directory listing (NodeFsVault). Obsidian (non-fsync writes + in-memory getFiles()) →
+   * false → closed-app deletes are held for one-tap confirmation. Absent ⇒ treated as false.
+   */
+  durabilityTrusted?(): boolean;
 }
 
 export type ConnStatus = "connected" | "connecting" | "offline" | "unauthorized";
@@ -134,6 +141,22 @@ export interface EngineStateStore {
    * store is a full cursor scan → O(n) per note → O(n^2) over a first sync of an n-note vault.
    */
   isDirty(id: DocId): Promise<boolean>;
+  /**
+   * M2 path-collision: the path this device last OBSERVED `id` LIVE at. Durable (survives restart) so
+   * the bootstrap orphan sweep can tell a path-collision DISPLACEMENT (lastLivePath now bound to a
+   * DIFFERENT live docId) from a delete (its own tombstone). Set on every live bind.
+   */
+  getLastLivePath(id: DocId): Promise<VaultPath | null>;
+  setLastLivePath(id: DocId, path: VaultPath): Promise<void>;
+  clearLastLivePath(id: DocId): Promise<void>;
+  /**
+   * M2: durably record that `id` was DELETED — written BEFORE delete-cleanup so a crash mid-cleanup
+   * still suppresses a false resurrect. Cleared when `id` is re-bound LIVE so a later legitimate
+   * collision of the same docId is still recovered.
+   */
+  markDeleted(id: DocId): Promise<void>;
+  wasDeleted(id: DocId): Promise<boolean>;
+  clearDeleted(id: DocId): Promise<void>;
 }
 export interface ClockPort {
   now(): number;

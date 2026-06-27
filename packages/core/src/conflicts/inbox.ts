@@ -1,6 +1,6 @@
 import type { CrdtMap, DocId, Unsubscribe, VaultPath } from "../ports.js";
 
-export type InboxKind = "conflict" | "resurrected" | "supervised-import";
+export type InboxKind = "conflict" | "resurrected" | "supervised-import" | "pending-delete";
 
 /**
  * One inbox entry. The `id` is DETERMINISTIC (e.g. `${kind}:${path}:${discriminator}`)

@@ -38,3 +38,18 @@ describe("FakeVault", () => {
     expect(firstCall?.[0].type).toBe("modify");
   });
 });
+
+describe("FakeVault test capabilities (M1b)", () => {
+  it("durabilityTrusted reflects the constructor flag (default false)", () => {
+    expect(new FakeVault().durabilityTrusted()).toBe(false);
+    expect(new FakeVault({ durable: true }).durabilityTrusted()).toBe(true);
+  });
+
+  it("hideFromList hides a path from list() but read() still returns its bytes", async () => {
+    const v = new FakeVault();
+    await v.writeAtomic(p("notes/x.md"), enc("hello"));
+    v.hideFromList(p("notes/x.md"));
+    expect((await v.list()).map((e) => e.path)).not.toContain("notes/x.md");
+    expect(await v.read(p("notes/x.md"))).not.toBeNull();
+  });
+});

@@ -231,6 +231,26 @@ describe("NodeFsVault — list()", () => {
   });
 });
 
+describe("NodeFsVault — durabilityTrusted", () => {
+  it("defaults to true (fsync-grade local FS, full directory walk)", async () => {
+    const dir = await makeTmpDir();
+    const vault = track(new NodeFsVault(dir));
+    expect(vault.durabilityTrusted()).toBe(true);
+  });
+
+  it("can be opted out via constructor for FUSE/cloud-mounted roots", async () => {
+    const dir = await makeTmpDir();
+    const vault = track(new NodeFsVault(dir, { durabilityTrusted: false }));
+    expect(vault.durabilityTrusted()).toBe(false);
+  });
+
+  it("an explicit true option is honoured", async () => {
+    const dir = await makeTmpDir();
+    const vault = track(new NodeFsVault(dir, { durabilityTrusted: true }));
+    expect(vault.durabilityTrusted()).toBe(true);
+  });
+});
+
 describe("NodeFsVault — external watcher events", () => {
   it("detects an externally created file and emits an event", async () => {
     const dir = await makeTmpDir();

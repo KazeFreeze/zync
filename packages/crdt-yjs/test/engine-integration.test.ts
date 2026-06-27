@@ -254,12 +254,14 @@ describe("SyncEngine §15 integration (deterministic — engine promises only)",
     expect(await a.engine.pendingDocs()).toEqual([]);
     expect(await b.engine.pendingDocs()).toEqual([]);
 
-    // Both vaults are IDENTICAL and the winner is DETERMINISTIC (CRDT LWW picks
-    // one side; here the engine consistently lands on the A-authored line).
+    // Both vaults are IDENTICAL and converge to a SINGLE winner (CRDT LWW picks one side). WHICH side
+    // wins is RACE-dependent — the two writes + their ingests interleave non-deterministically (the perf
+    // history records §15-3's winner flipping when hot-loop timing changed), so we assert convergence to
+    // ONE of the two valid winners — never a garbled merge, never a duplicate.
     const finalA = await readNote(a, A_MD);
     const finalB = await readNote(b, A_MD);
     expect(finalA).toBe(finalB);
-    expect(finalA).toBe("A-WINS\nmiddle\ntail");
+    expect(["A-WINS\nmiddle\ntail", "B-WINS\nmiddle\ntail"]).toContain(finalA);
 
     // A genuine same-line conflict was recorded as an artifact on BOTH inboxes
     // (the synced inbox converges the entry to every device).

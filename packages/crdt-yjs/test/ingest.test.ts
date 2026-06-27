@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   IngestPipeline,
   type IngestDeps,
@@ -54,6 +54,7 @@ interface SetupOpts {
   recordEchoFor?: string; // pre-record an echo for the disk text (echo-skip case)
   authorityBound?: boolean; // FileAuthority active-bound (detach-merge-rebind)
   writeNote?: boolean; // write the note file at all? (false ⇒ deleted)
+  seedIndex?: boolean; // pre-seed the index entry? (false ⇒ ingest is a FIRST-SEEN create that mints a docId)
 }
 
 async function setup(opts: SetupOpts): Promise<Harness> {
@@ -66,6 +67,7 @@ async function setup(opts: SetupOpts): Promise<Harness> {
     recordEchoFor,
     authorityBound = false,
     writeNote = true,
+    seedIndex = true,
   } = opts;
 
   const vault = new FakeVault();
@@ -76,8 +78,8 @@ async function setup(opts: SetupOpts): Promise<Harness> {
   const engineState = new MemEngineState();
   const provider = new YjsCrdtProvider();
 
-  // Pre-seed the index entry (docId, type, stamp).
-  index.setStamp(NOTE, DOC, indexType, await sha256OfText(baseText));
+  // Pre-seed the index entry (docId, type, stamp). Skipped for a FIRST-SEEN create (ingest mints a docId).
+  if (seedIndex) index.setStamp(NOTE, DOC, indexType, await sha256OfText(baseText));
 
   // Pre-seed the base record.
   await baseStore.save(DOC, {
@@ -164,6 +166,53 @@ describe("IngestPipeline.onVaultWrite (file → CRDT)", () => {
     expect(r).toEqual<IngestResult>({ action: "skipped-not-prose" });
     expect(h.bumps).toHaveLength(0);
     expect(await h.engineState.listDirty()).toHaveLength(0);
+  });
+
+  it("P1 crash-ordering: markDirty is persisted BEFORE base.save (no base-advanced-without-dirty window)", async () => {
+    // A clean offline edit that ADVANCES the working base + marks the doc dirty (crdt == base, so the
+    // merge takes the new disk content). The CONTRACT: the dirty flag must hit durable storage BEFORE
+    // the working base advances — otherwise a crash between them leaves base-advanced-but-not-dirty, and
+    // on restart bootstrap's offline-drift guard sees disk==base (so does NOT mark dirty) while the
+    // stamp still matches synced (so catch-up skips) → the unpushed edit WEDGES (the P1 crash window).
+    h = await setup({ base: "v1\n", disk: "v2\n", crdt: "v1\n" });
+    const dirtySpy = vi.spyOn(h.engineState, "markDirty");
+    const saveSpy = vi.spyOn(h.base, "save");
+
+    const r = await h.pipeline.onVaultWrite(NOTE);
+    expect(r.action).toBe("ingested-clean"); // sanity: the edit actually advanced the base
+    expect(dirtySpy).toHaveBeenCalledTimes(1);
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+
+    const dirtyOrder = dirtySpy.mock.invocationCallOrder[0];
+    const saveOrder = saveSpy.mock.invocationCallOrder[0];
+    if (dirtyOrder === undefined || saveOrder === undefined) {
+      throw new Error("expected both markDirty and base.save to be recorded");
+    }
+    expect(dirtyOrder).toBeLessThan(saveOrder);
+  });
+
+  it("P1 leaves the first-seen-create ordering unchanged (markDirty stays after base.save)", async () => {
+    // P1 only reorders the EXISTING-doc path (dirty before base). A FIRST-SEEN create (no pre-seeded index
+    // entry → ingest mints a docId) keeps its ORIGINAL ordering: markDirty right AFTER base.save. NOTE: a
+    // separate, PRE-EXISTING first-seen dirty-orphan wedge exists because bumpStamp is debounced (the minted
+    // docId's live index entry isn't durable when markDirty fires) — out of P1's scope, tracked separately;
+    // this test just guards that the existing-doc reorder did NOT perturb the first-seen path.
+    h = await setup({ base: "", disk: "a brand-new note body\n", crdt: "", seedIndex: false });
+    const dirtySpy = vi.spyOn(h.engineState, "markDirty");
+    const saveSpy = vi.spyOn(h.base, "save");
+
+    const r = await h.pipeline.onVaultWrite(NOTE);
+    expect(r.action).toBe("ingested-clean");
+    expect(h.mintedIds).toHaveLength(1); // sanity: a first-seen create minted a docId
+    expect(dirtySpy).toHaveBeenCalledTimes(1);
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+
+    const dirtyOrder = dirtySpy.mock.invocationCallOrder[0];
+    const saveOrder = saveSpy.mock.invocationCallOrder[0];
+    if (dirtyOrder === undefined || saveOrder === undefined) {
+      throw new Error("expected both markDirty and base.save to be recorded");
+    }
+    expect(saveOrder).toBeLessThan(dirtyOrder); // first-seen: markDirty stays right after base.save (unchanged by P1)
   });
 
   it("skipped-echo: our own write — echo consumed first, nothing else happens", async () => {

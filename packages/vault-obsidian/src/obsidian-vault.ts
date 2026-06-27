@@ -230,6 +230,10 @@ export class ObsidianVaultPort implements VaultPort {
     };
   }
 
+  durabilityTrusted(): boolean {
+    return false;
+  }
+
   /** Detach all Obsidian event handlers + listeners. Call from the plugin's onunload. */
   close(): void {
     this.closed = true;

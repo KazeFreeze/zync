@@ -20,11 +20,13 @@ function makeIndex(): IndexDoc {
 interface Harness {
   deps: StructuralReconcileDeps;
   dirtied: DocId[];
+  deleted: DocId[];
   notices: ResurrectedNotice[];
 }
 
 function harness(index: IndexDoc, vault: FakeVault): Harness {
   const dirtied: DocId[] = [];
+  const deleted: DocId[] = [];
   const notices: ResurrectedNotice[] = [];
   const deps: StructuralReconcileDeps = {
     index,
@@ -37,11 +39,15 @@ function harness(index: IndexDoc, vault: FakeVault): Harness {
       dirtied.push(id);
       return Promise.resolve();
     },
+    markDeleted: (id) => {
+      deleted.push(id);
+      return Promise.resolve();
+    },
     onInboxNotice: (n) => {
       notices.push(n);
     },
   };
-  return { deps, dirtied, notices };
+  return { deps, dirtied, deleted, notices };
 }
 
 /** Lay an uncontested tombstone at `path` whose stamp hash == sha256(content). */
@@ -306,6 +312,7 @@ describe("runStructuralReconcile — S5 scoped ≡ full equivalence", () => {
         dirtyA.push(id);
         return Promise.resolve();
       },
+      markDeleted: () => Promise.resolve(),
       onInboxNotice: (n) => {
         noticesA.push(n);
       },
@@ -329,6 +336,7 @@ describe("runStructuralReconcile — S5 scoped ≡ full equivalence", () => {
         dirtyB.push(id);
         return Promise.resolve();
       },
+      markDeleted: () => Promise.resolve(),
       onInboxNotice: (n) => {
         noticesB.push(n);
       },

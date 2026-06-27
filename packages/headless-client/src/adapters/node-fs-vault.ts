@@ -35,9 +35,20 @@ export class NodeFsVault implements VaultPort {
   /** Coalesce timer per path (deduplicate rapid duplicate events). */
   private readonly coalesceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private closed = false;
+  private readonly durabilityTrustedFlag: boolean;
 
-  constructor(root: string) {
+  /**
+   * @param root vault root directory.
+   * @param opts.durabilityTrusted Whether the engine may TRUST an "absent at bootstrap" signal from
+   *   this root enough to auto-propagate a closed-app delete (see {@link durabilityTrusted}). Defaults
+   *   to `true` (a real local FS: fsync-grade atomic writes + a complete directory walk). Set `false`
+   *   for FUSE / cloud-mounted roots (Dropbox, gocryptfs, network shares) where an absent file may be a
+   *   not-yet-synced placeholder rather than a durable deletion — closed-app deletes are then held for
+   *   one-tap confirmation instead.
+   */
+  constructor(root: string, opts?: { durabilityTrusted?: boolean }) {
     this.root = path.resolve(root);
+    this.durabilityTrustedFlag = opts?.durabilityTrusted ?? true;
     this.startWatcher();
   }
 
@@ -125,6 +136,10 @@ export class NodeFsVault implements VaultPort {
     return () => {
       this.listeners.delete(cb);
     };
+  }
+
+  durabilityTrusted(): boolean {
+    return this.durabilityTrustedFlag;
   }
 
   // ---------------------------------------------------------------------------

@@ -781,6 +781,30 @@ class BlockedSyncedStampState implements EngineStateStore {
   isDirty(id: DocId): Promise<boolean> {
     return this.inner.isDirty(id);
   }
+
+  getLastLivePath(id: DocId): Promise<VaultPath | null> {
+    return this.inner.getLastLivePath(id);
+  }
+
+  setLastLivePath(id: DocId, p: VaultPath): Promise<void> {
+    return this.inner.setLastLivePath(id, p);
+  }
+
+  clearLastLivePath(id: DocId): Promise<void> {
+    return this.inner.clearLastLivePath(id);
+  }
+
+  markDeleted(id: DocId): Promise<void> {
+    return this.inner.markDeleted(id);
+  }
+
+  wasDeleted(id: DocId): Promise<boolean> {
+    return this.inner.wasDeleted(id);
+  }
+
+  clearDeleted(id: DocId): Promise<void> {
+    return this.inner.clearDeleted(id);
+  }
 }
 
 /**

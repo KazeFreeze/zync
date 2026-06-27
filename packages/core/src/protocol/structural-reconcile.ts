@@ -46,6 +46,11 @@ export interface StructuralReconcileDeps {
    * seam the receiver's IDB snapshot would be orphaned forever. Optional (no-op default).
    */
   deleteSnapshot?: (docId: DocId) => Promise<void>;
+  /**
+   * Record the delete DURABLY (M2) before the docStore snapshot is removed, so an inbound delete that
+   * races a path-reuse (or crashes mid-cleanup) is never resurrected by the displacement detector.
+   */
+  markDeleted: (docId: DocId) => Promise<void>;
   /** Surface a resurrection notice to the user's inbox (Concern 2). */
   onInboxNotice: (notice: ResurrectedNotice) => void;
   /**
@@ -158,7 +163,7 @@ export interface StructuralReconcileDeps {
  * hash-only (the device suffix differs, the hashes match).
  */
 export async function runStructuralReconcile(deps: StructuralReconcileDeps): Promise<void> {
-  const { index, vault, localHashOf, markDirty, onInboxNotice } = deps;
+  const { index, vault, localHashOf, markDirty, markDeleted, onInboxNotice } = deps;
   const deleteBase = deps.deleteBase ?? ((): Promise<void> => Promise.resolve());
   const deleteSnapshot = deps.deleteSnapshot ?? ((): Promise<void> => Promise.resolve());
 
@@ -365,6 +370,9 @@ export async function runStructuralReconcile(deps: StructuralReconcileDeps): Pro
       const diskHash = await localHashOf(path);
       if (diskHash === null) continue; // no local file → nothing to remove.
       if (resolveTombstone(entry, diskHash) === "delete") {
+        // M2: record the delete DURABLY BEFORE any removal, so a crash mid-cleanup leaves a
+        // durable delete-observation and the displacement sweep cannot resurrect a reused path.
+        await markDeleted(entry.docId);
         await vault.remove(path);
         // Clean up the now-deleted doc's base record AND docStore snapshot. The fired "delete"
         // event reaches an already-tombstoned entry, so `onDelete` early-returns without removing
@@ -381,6 +389,9 @@ export async function runStructuralReconcile(deps: StructuralReconcileDeps): Pro
       const diskHash = await localHashOf(path);
       if (diskHash === null) continue; // no local file → nothing to remove.
       if (resolveTombstone(entry, diskHash) === "delete") {
+        // M2: record the delete DURABLY BEFORE any removal, so a crash mid-cleanup leaves a
+        // durable delete-observation and the displacement sweep cannot resurrect a reused path.
+        await markDeleted(entry.docId);
         await vault.remove(path);
         // Clean up the now-deleted doc's base record AND docStore snapshot. The fired "delete"
         // event reaches an already-tombstoned entry, so `onDelete` early-returns without removing

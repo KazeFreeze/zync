@@ -178,6 +178,17 @@ export class IngestPipeline {
     // edit instead of reverting it (the data-loss the prior ack-gate fix did not close).
     const newHash = await sha256OfText(newText);
     const prior = baseRec; // the record loaded in step 5 (may be null on a first-seen path).
+    // CRASH-ORDERING (P1). For an EXISTING (already-bound) doc, persist the DIRTY flag BEFORE advancing the
+    // working base: a crash between these durable writes must never leave the base ADVANCED-but-NOT-dirty —
+    // that wedges on restart (bootstrap's offline-drift guard sees disk==base so does NOT mark dirty, and
+    // catch-up skips a clean, stamp-matched doc → the unpushed edit is stranded). Dirty-before-base means a
+    // crash leaves at-worst dirty-WITHOUT-the-new-base, which RECOVERS (catch-up selects the doc;
+    // reconcileDirtyDoc merges the disk edit). FIRST-SEEN creates are LEFT UNCHANGED (dirty right after
+    // base.save, below) — P1 deliberately does not touch them. NOTE: a SEPARATE, PRE-EXISTING first-seen
+    // dirty-orphan wedge exists because `bumpStamp` is DEBOUNCED — the minted docId's live index entry is
+    // not durable when markDirty fires, so a crash in the debounce window leaves a dirty docId with no live
+    // entry (pendingDocs counts it; catch-up can't reach it). Out of P1's scope; tracked for its own fix.
+    if (!firstSeen) await d.engineState.markDirty(docId);
     await d.base.save(docId, {
       baseText: newText,
       fileHash: newHash,
@@ -187,8 +198,12 @@ export class IngestPipeline {
       // first-seen path has no prior record ⇒ nothing is acked yet ⇒ empty acked base.
       ackedText: prior?.ackedText ?? "",
       ackedHash: prior?.ackedHash ?? (await sha256OfText("")),
+      // M1b: preserve the durable confirmed-on-disk signal across a fresh-record save.
+      materializedHash: prior?.materializedHash,
     });
-    await d.engineState.markDirty(docId);
+    // FIRST-SEEN create: mark dirty right after base.save — UNCHANGED from the original ordering (P1 only
+    // reorders the existing-doc path). The separate first-seen dirty-orphan is noted above.
+    if (firstSeen) await d.engineState.markDirty(docId);
 
     // 7b. Persist the EDITED CRDT snapshot for an ALREADY-ATTACHED doc (0b-3 crash-window
     //     no-loss). The local edit was applied to the attached doc's Y.Text above, but the

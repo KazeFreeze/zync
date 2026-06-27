@@ -302,6 +302,17 @@ export async function heal(name: DeviceName): Promise<void> {
   await execa("docker", ["network", "connect", SYNCNET, container]);
 }
 
+/**
+ * OUT-OF-BAND filesystem op inside a device's `/vault`, via `docker exec`. Use it (with the daemon
+ * STOPPED via `device.stop()`) to model changes made while the app was CLOSED — e.g. an AI/terminal
+ * `rm`/`mv` in the vault dir. These bypass the engine + the watcher entirely, so on the next
+ * `/sync/start` they are seen ONLY by bootstrap. Example: `vaultExec("device-a", ["rm", "/vault/notes/x.md"])`.
+ */
+export async function vaultExec(name: DeviceName, argv: string[]): Promise<void> {
+  const container = await resolveContainer(name);
+  await execa("docker", ["exec", container, ...argv]);
+}
+
 /** SIGKILL a device container (no graceful shutdown). */
 export async function crash(name: DeviceName): Promise<void> {
   const container = await resolveContainer(name);

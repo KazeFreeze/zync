@@ -74,4 +74,63 @@ describe("BaseStore", () => {
     );
     expect(order).toEqual([".obsidian/zync/base/doc1.json", "notes/a.md"]);
   });
+
+  it("round-trips materializedHash when present, and keeps it ABSENT when omitted", async () => {
+    const v = new FakeVault();
+    const store = new BaseStore(v, ".obsidian");
+    await store.save(id("doc-mh"), {
+      baseText: "body\n",
+      fileHash: sha("h1"),
+      crdtToken: null,
+      substrate: "yjs",
+      materializedHash: sha("mh1"),
+    });
+    expect((await store.load(id("doc-mh")))?.materializedHash).toBe("mh1");
+
+    await store.save(id("doc-none"), {
+      baseText: "body\n",
+      fileHash: sha("h1"),
+      crdtToken: null,
+      substrate: "yjs",
+    });
+    expect((await store.load(id("doc-none")))?.materializedHash).toBeUndefined();
+  });
+
+  it("markMaterialized sets ONLY materializedHash and preserves every other field (incl. lagging acked base)", async () => {
+    const v = new FakeVault();
+    const store = new BaseStore(v, ".obsidian");
+    const rec: BaseRecord = {
+      baseText: "edited (unpushed)\n",
+      fileHash: sha("h-edit"),
+      crdtToken: new Uint8Array([7]),
+      substrate: "yjs",
+      ackedText: "pristine (last acked)\n",
+      ackedHash: sha("h-pristine"),
+    };
+    await store.save(id("doc-x"), rec);
+    await store.markMaterialized(id("doc-x"), sha("mh-x"));
+    expect(await store.load(id("doc-x"))).toEqual({ ...rec, materializedHash: sha("mh-x") });
+  });
+
+  it("markMaterialized is idempotent: a no-op (no write) when the hash is unchanged", async () => {
+    const v = new FakeVault();
+    const store = new BaseStore(v, ".obsidian");
+    await store.save(id("doc-i"), {
+      baseText: "b\n",
+      fileHash: sha("h"),
+      crdtToken: null,
+      substrate: "yjs",
+      materializedHash: sha("mh"),
+    });
+    const writes: string[] = [];
+    v.onEvent((e) => writes.push(e.path));
+    await store.markMaterialized(id("doc-i"), sha("mh"));
+    expect(writes).toEqual([]);
+  });
+
+  it("markMaterialized on an unknown doc is a no-op (no record created)", async () => {
+    const store = new BaseStore(new FakeVault(), ".obsidian");
+    await store.markMaterialized(id("ghost"), sha("mh"));
+    expect(await store.load(id("ghost"))).toBeNull();
+  });
 });
