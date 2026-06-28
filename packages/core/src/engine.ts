@@ -34,7 +34,7 @@ import { LazyAttachManager } from "./protocol/lazy-attach.js";
 import { runStructuralReconcile } from "./protocol/structural-reconcile.js";
 import { applyBootstrap } from "./protocol/bootstrap.js";
 import { supervisedImport } from "./conflicts/supervised-import.js";
-import { orphanSweep, type OrphanMeta } from "./protocol/orphan-sweep.js";
+import { orphanSweep, orphanRecoveryPath, type OrphanMeta } from "./protocol/orphan-sweep.js";
 import { makeStamp, stampHash, stampsEqual } from "./protocol/stamp.js";
 import { BlobEngine, type BlobFetchPolicy, type BlobManifestEntry } from "./blobs/blob-engine.js";
 import { Inbox } from "./conflicts/inbox.js";
@@ -1703,20 +1703,16 @@ export class SyncEngine {
           const diskStamp = bytes === null ? null : makeStamp(await sha256OfBytes(bytes), deviceId);
           if (stampsEqual(diskStamp, entry.stamp)) continue; // disk already canonical.
 
-          // ANTI-CLOBBER GUARD: only write when the disk is genuinely BEHIND the converged
-          // doc — never over a newer un-ingested edit, and never over a DIRTY doc's unpushed
-          // edit (see CLOBBER HAZARD above).
-          if (bytes !== null) {
-            // DIRTY ⇒ this device owes a push; the disk may hold the unpushed (post-crash
-            // recovered) edit. Never materialize over it — the dirty reconcile + re-push own it.
-            if (dirty.has(entry.docId)) continue;
-            const base = await this.base.load(entry.docId);
-            const diskHash = await sha256OfBytes(bytes);
-            // disk ≠ last-reconciled working base ⇒ a newer un-ingested edit (or we cannot prove
-            // it is behind: no base ⇒ `base?.fileHash` is undefined ⇒ never equal) ⇒ SKIP. Ingest
-            // will reconcile it; pendingDocs keeps the loop alive.
-            if (diskHash !== base?.fileHash) continue;
-          }
+          // ANTI-CLOBBER GUARD: only write when the disk is provably NOT a newer un-ingested
+          // external edit — either BEHIND the converged doc, or a relocated concurrent-create
+          // sibling. The decision lives in the SHARED safeToOverwriteStaleLive helper (the full
+          // branch below calls the SAME one), so the scoped + full guards CANNOT diverge — the old
+          // duplicated-guard hazard is structurally eliminated.
+          if (
+            bytes !== null &&
+            !(await this.safeToOverwriteStaleLive(path, entry.docId, bytes, dirty))
+          )
+            continue;
 
           if (bytes === null && this.shouldDeferMissingLive(path)) continue; // BARRIER (Part B)
           await this.outbound.onRemoteUpdate(doc);
@@ -1745,24 +1741,93 @@ export class SyncEngine {
       const diskStamp = bytes === null ? null : makeStamp(await sha256OfBytes(bytes), deviceId);
       if (stampsEqual(diskStamp, entry.stamp)) continue; // disk already canonical.
 
-      // ANTI-CLOBBER GUARD: only write when the disk is genuinely BEHIND the converged
-      // doc — never over a newer un-ingested edit, and never over a DIRTY doc's unpushed
-      // edit (see CLOBBER HAZARD above).
-      if (bytes !== null) {
-        // DIRTY ⇒ this device owes a push; the disk may hold the unpushed (post-crash
-        // recovered) edit. Never materialize over it — the dirty reconcile + re-push own it.
-        if (dirty.has(entry.docId)) continue;
-        const base = await this.base.load(entry.docId);
-        const diskHash = await sha256OfBytes(bytes);
-        // disk ≠ last-reconciled working base ⇒ a newer un-ingested edit (or we cannot prove
-        // it is behind: no base ⇒ `base?.fileHash` is undefined ⇒ never equal) ⇒ SKIP. Ingest
-        // will reconcile it; pendingDocs keeps the loop alive.
-        if (diskHash !== base?.fileHash) continue;
-      }
+      // ANTI-CLOBBER GUARD: only write when the disk is provably NOT a newer un-ingested external
+      // edit — either BEHIND the converged doc, or a relocated concurrent-create sibling. The
+      // decision lives in the SHARED safeToOverwriteStaleLive helper (the scoped branch above calls
+      // the SAME one), so the scoped + full guards CANNOT diverge — the old duplicated-guard hazard
+      // is structurally eliminated.
+      if (bytes !== null && !(await this.safeToOverwriteStaleLive(path, entry.docId, bytes, dirty)))
+        continue;
 
       if (bytes === null && this.shouldDeferMissingLive(path)) continue; // BARRIER (Part B)
       await this.outbound.onRemoteUpdate(doc);
     }
+  }
+
+  /**
+   * ANTI-CLOBBER decision for {@link materializeLiveDiskContent} — called IDENTICALLY from the
+   * scoped and full branches (a divergence here is a silent clobber-class data-loss bug). May we
+   * overwrite an EXISTING live file whose disk bytes differ from the converged doc, with the
+   * converged content?
+   *
+   * True ONLY when the disk is provably NOT a newer un-ingested EXTERNAL edit:
+   *   - NEVER over a DIRTY doc — its disk may hold an unpushed (post-crash recovered) edit.
+   *   - disk == the doc's last-reconciled working base (`base.fileHash`) ⇒ genuinely BEHIND ⇒ write.
+   *   - else the disk bytes are a RELOCATED concurrent-create SIBLING (the recovered LWW loser of
+   *     THIS path, now materialized at its conflict artifact) ⇒ not unique disk state ⇒ write. This
+   *     is the concurrent-create split-brain fix: on the reconnecting device the live disk can hold
+   *     the loser's bytes (its own losing create, or a transiently-materialized remote loser) whose
+   *     hash never equals the WINNER's `base.fileHash`, so the old base-only guard skipped forever.
+   *   - otherwise (a genuine external edit, or unprovable) ⇒ SKIP. Ingest reconciles it; the
+   *     `pendingDocs` disk-hash clause keeps `waitConverged` looping so a skip never masks a loss.
+   */
+  private async safeToOverwriteStaleLive(
+    path: VaultPath,
+    docId: DocId,
+    bytes: Uint8Array,
+    dirty: ReadonlySet<DocId>,
+  ): Promise<boolean> {
+    if (dirty.has(docId)) return false;
+    const diskHash = await sha256OfBytes(bytes);
+    const base = await this.base.load(docId);
+    if (diskHash === base?.fileHash) return true;
+    return this.diskIsRelocatedSibling(path, docId, diskHash);
+  }
+
+  /**
+   * A+ relocated concurrent-create SIBLING proof. True when `diskHash` (the stale bytes at live
+   * `currentPath`, bound to `currentDocId`) equals — byte-for-byte ON THIS DISK — the content of a
+   * DIFFERENT live doc that is the recovered LWW loser of THIS path: a live entry whose create-meta
+   * `originalPath === currentPath` and whose path is exactly its deterministic
+   * {@link orphanRecoveryPath}. Those bytes therefore still survive in a user-visible file, so
+   * re-materializing the winner over them loses NOTHING.
+   *
+   * The sibling DISK read is LOAD-BEARING: index state alone does not prove the duplicate bytes are
+   * present locally (a note-doc's content and the index entry that binds it can arrive
+   * independently). If the conflict file is not yet materialized, we SKIP and repair on a later pass
+   * once it is — never removing the only on-disk copy.
+   *
+   * LIVENESS (honest guarantee): the repair lands on the NEXT full pass that runs AFTER the conflict
+   * sibling is materialized on this disk — prompt via `/sync/flush`→`waitConverged` (the harness gate
+   * proves this), startup, or a true idle window's S6c audit; NOT hard-bounded under sustained
+   * unrelated churn (the progress-aware watchdog re-arms while activity advances). This is byte-safe
+   * throughout (both bodies always survive — the loser at its conflict artifact) and is the same
+   * full-pass-only liveness-exposure class as the adjacent {@link runOrphanSweep}.
+   *
+   * PERF: the per-entry `loadCreateMeta` (docStore load + parse) + disk read run ONLY for conflict
+   * artifacts — `orphanRecoveryPath` (= `conflictArtifactPath`) ALWAYS emits the literal `"(conflict,"`
+   * suffix, so the cheap in-memory path pre-filter below is a behavior-preserving SUPERSET that bounds
+   * the I/O to the (typically 0–2) artifacts in the vault, not all N live entries.
+   */
+  private async diskIsRelocatedSibling(
+    currentPath: VaultPath,
+    currentDocId: DocId,
+    diskHash: Sha256,
+  ): Promise<boolean> {
+    for (const [otherPath, otherEntry] of this.index.liveEntries()) {
+      if (otherEntry.docId === currentDocId) continue;
+      if (otherPath === currentPath) continue;
+      if (!otherPath.includes("(conflict,")) continue; // cheap superset pre-filter (no I/O)
+      const meta = await this.loadCreateMeta(otherEntry.docId);
+      if (meta === undefined) continue;
+      if (meta.originalPath !== currentPath) continue;
+      if (orphanRecoveryPath(meta) !== otherPath) continue;
+      const otherBytes = await this.ports.vault.read(otherPath);
+      if (otherBytes === null) continue;
+      if ((await sha256OfBytes(otherBytes)) !== diskHash) continue;
+      return true;
+    }
+    return false;
   }
 
   /** Barrier (Part B): should `materializeLiveDiskContent` DEFER re-creating this live+disk-absent path? */

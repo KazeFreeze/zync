@@ -59,6 +59,15 @@ export class FakeVault implements VaultPort {
     this.files.set(to, e);
   }
 
+  /** TEST HOOK: overwrite `path`'s bytes WITHOUT emitting any event — models bytes that the engine
+   *  itself put on disk (echo-suppressed) so the watcher never re-ingests them. Used to stage the
+   *  post-merge "stranded live disk" state (a live path holding stale-but-engine-known bytes) that the
+   *  real relay produces but the synchronous in-process bus cannot. Unlike {@link writeAtomic}, fires
+   *  nothing. */
+  writeSilently(path: VaultPath, data: Uint8Array, opts?: { mtime?: number }): void {
+    this.files.set(path, { data, mtime: opts?.mtime ?? ++this.clock });
+  }
+
   list(prefix?: VaultPath): Promise<{ path: VaultPath; size: number; mtime: number }[]> {
     const out: { path: VaultPath; size: number; mtime: number }[] = [];
     for (const [path, e] of this.files) {
