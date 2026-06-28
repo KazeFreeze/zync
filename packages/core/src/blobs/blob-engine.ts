@@ -1,5 +1,6 @@
 import type {
   BlobStorePort,
+  ClockPort,
   CrdtMap,
   DeviceId,
   IdentityPort,
@@ -11,6 +12,8 @@ import type {
 import type { EchoLedger } from "../bridge/echo.js";
 import { sha256OfBytes } from "../hash.js";
 import { CorruptBlobError } from "../errors.js";
+import { BlobFetchQueue } from "./blob-fetch-queue.js";
+import type { MaterializeOutcome } from "./blob-fetch-queue.js";
 
 /**
  * One row of the index `blobs` map (0b-2 §B): the content-address of a binary /
@@ -41,6 +44,13 @@ export interface BlobEngineDeps {
   echo: EchoLedger;
   identity: IdentityPort;
   policy: BlobFetchPolicy;
+  clock: ClockPort;
+  concurrency: number;
+  maxInFlightBytes: number;
+  maxRetries: number;
+  retryTickMs: number;
+  /** Aggregate failure surface: called with the CURRENT full failed-path set whenever it changes. */
+  onBlobFailure: (failedPaths: VaultPath[]) => void;
 }
 
 /**
@@ -56,9 +66,20 @@ export interface BlobEngineDeps {
  */
 export class BlobEngine {
   readonly #deps: BlobEngineDeps;
+  readonly #queue: BlobFetchQueue;
 
   constructor(deps: BlobEngineDeps) {
     this.#deps = deps;
+    this.#queue = new BlobFetchQueue({
+      materialize: (p, s) => this.materialize(p, s),
+      manifestEntries: () => this.manifestEntries(),
+      clock: deps.clock,
+      onFailure: deps.onBlobFailure,
+      concurrency: deps.concurrency,
+      maxInFlightBytes: deps.maxInFlightBytes,
+      maxRetries: deps.maxRetries,
+      retryTickMs: deps.retryTickMs,
+    });
   }
 
   /**
@@ -80,56 +101,43 @@ export class BlobEngine {
   }
 
   /**
-   * A manifest entry changed (typically remote). `eager` ⇒ materialize the blob
-   * to the vault now; `lazy` ⇒ no-op (bytes are fetched on read via {@link
-   * materialize}).
-   */
-  async onManifestChange(path: VaultPath): Promise<void> {
-    if (this.#deps.policy === "eager") {
-      await this.materialize(path);
-    }
-  }
-
-  /**
-   * Fetch the blob bytes for `path`, HASH-VERIFY them against the manifest sha,
-   * and write them to the vault (echo-recorded so the resulting fs event is not
-   * re-ingested). Returns the verified bytes.
+   * GENERATION-AWARE fetch: materialize the blob whose CURRENT manifest sha is
+   * `expectedSha`. Fetches the bytes, HASH-VERIFIES them, and writes the vault
+   * (echo-recorded first so the resulting fs event is not re-ingested). Returns a
+   * {@link MaterializeOutcome}:
+   *  - `"superseded"` — the manifest entry is absent, or its sha no longer equals
+   *    `expectedSha` (checked both BEFORE fetch and AGAIN immediately before the
+   *    write to close the fetch-window generation race). Nothing is written; the
+   *    queue re-enqueues the path under its fresh sha via the manifest observe.
+   *  - `"already"`  — the file on disk already hashes to `expectedSha` (idempotent
+   *    short-circuit; also breaks the eager re-materialize feedback loop).
+   *  - `"written"`  — the verified bytes were written to the vault.
    *
-   * If there is no manifest entry for `path`, throws (a clear programming error —
-   * nothing to materialize). If the fetched bytes do NOT hash to the manifest sha,
-   * throws {@link CorruptBlobError} and DOES NOT write the vault.
+   * If the fetched bytes do NOT hash to `expectedSha`, throws {@link
+   * CorruptBlobError} and DOES NOT write the vault.
    */
-  async materialize(path: VaultPath): Promise<Uint8Array> {
+  async materialize(path: VaultPath, expectedSha: Sha256): Promise<MaterializeOutcome> {
     const d = this.#deps;
     const entry = d.manifest.get(path);
-    if (entry === undefined) {
-      throw new Error(`BlobEngine.materialize: no manifest entry for ${path}`);
-    }
+    if (entry?.sha256 !== expectedSha) return "superseded"; // manifest moved/absent
 
-    // IDEMPOTENCY SHORT-CIRCUIT (0b-3 loop fix): if the file already on disk hashes to the
-    // manifest sha, the blob is ALREADY materialized — fetching + re-writing would be wasted
-    // work AND (critically) would emit another fs "modify" event, feeding the eager-materialize
-    // feedback loop (materialize → write → fs event → onWrite → onLocalBlobWrite → manifest
-    // re-stamp → observe → materialize → …). Skipping here makes both the steady state and the
-    // initial eager sweep idempotent, breaking the loop even if an echo is ever missed. Returns
-    // the on-disk bytes (which provably hash to the manifest sha) without touching the vault.
+    // IDEMPOTENCY: disk already matches -> nothing to fetch (also breaks the eager re-materialize loop).
     const onDisk = await d.vault.read(path);
-    if (onDisk !== null && (await sha256OfBytes(onDisk)) === entry.sha256) {
-      return onDisk;
-    }
+    if (onDisk !== null && (await sha256OfBytes(onDisk)) === expectedSha) return "already";
 
-    const bytes = await d.blobStore.get(entry.sha256);
+    const bytes = await d.blobStore.get(expectedSha);
     const actual = await sha256OfBytes(bytes);
-    if (actual !== entry.sha256) {
-      // Hash-verify FAILED: reject the corrupt blob; the vault is left untouched.
-      throw new CorruptBlobError({ path, expected: entry.sha256, actual });
+    if (actual !== expectedSha) {
+      throw new CorruptBlobError({ path, expected: expectedSha, actual });
     }
+    // RE-VALIDATE immediately before the write (generation-race close): if the manifest moved
+    // during the fetch, abort -> the queue re-enqueues the current sha.
+    const now = d.manifest.get(path);
+    if (now?.sha256 !== expectedSha) return "superseded";
 
-    // echo-record IMMEDIATELY precedes the write (matches the bridge invariant),
-    // so the resulting vault event is recognized as our own and not re-ingested.
-    d.echo.recordWrite(path, entry.sha256);
+    d.echo.recordWrite(path, expectedSha);
     await d.vault.writeAtomic(path, bytes);
-    return bytes;
+    return "written";
   }
 
   /**
@@ -145,30 +153,47 @@ export class BlobEngine {
   }
 
   /**
-   * Observe the manifest and drive eager fetches: every changed path is routed
-   * through {@link onManifestChange} (eager ⇒ auto-materialize; lazy ⇒ no-op).
-   * Returns the unsubscribe.
+   * Observe the manifest and DRIVE the bounded {@link BlobFetchQueue} for eager
+   * fetches. Returns the unsubscribe (which also stops the queue).
    *
-   * INITIAL EAGER SWEEP (0b-3 Fix 3): `observe` only fires on FUTURE manifest changes,
-   * but a follower that attaches the index doc AFTER a blob was already advertised pulls
-   * that entry via the INITIAL state-vector exchange — i.e. it is ALREADY present when
-   * `start()` subscribes, so no observe callback ever fires for it. Without an initial
-   * pass an eager follower would never materialize a pre-existing blob (the bug surfaced
-   * by the new blob-pending accounting). So eager `start()` also routes every entry
-   * already in the manifest through {@link onManifestChange}. Fire-and-forget + echo-
-   * guarded + idempotent (a re-materialize re-writes byte-identical content), so it is
-   * loop-safe; lazy stays a pure no-op.
+   * EAGER: start the queue (arms its heal-retry tick), then enqueue every entry
+   * ALREADY in the manifest (the initial sweep — `observe` only fires on FUTURE
+   * changes, so a follower that attached the index doc after a blob was advertised
+   * would otherwise never materialize that pre-existing entry — 0b-3 Fix 3). Each
+   * later manifest change re-enqueues its changed paths under their CURRENT sha. The
+   * queue is bounded-concurrency, byte-budgeted, typed-retry, and generation-aware
+   * (a same-sha in-flight enqueue is a no-op; a newer sha re-targets), and {@link
+   * materialize} is idempotent + echo-guarded, so this is loop-safe.
+   *
+   * LAZY: no queue, no enqueue — bytes are fetched only on read via {@link
+   * materialize}.
    */
   start(): Unsubscribe {
     if (this.#deps.policy === "eager") {
-      for (const [p] of this.#deps.manifest.entries()) {
-        void this.onManifestChange(p as VaultPath);
+      this.#queue.start();
+      for (const [p, e] of this.#deps.manifest.entries()) {
+        this.#queue.enqueue(p as VaultPath, e.sha256, e.size);
       }
     }
-    return this.#deps.manifest.observe((changedPaths) => {
-      for (const p of changedPaths) {
-        void this.onManifestChange(p as VaultPath);
+    const unsub = this.#deps.manifest.observe((changed) => {
+      if (this.#deps.policy !== "eager") return;
+      for (const p of changed) {
+        const e = this.#deps.manifest.get(p);
+        if (e) this.#queue.enqueue(p as VaultPath, e.sha256, e.size);
       }
     });
+    return () => {
+      this.#queue.stop();
+      unsub();
+    };
+  }
+
+  /** True once every advertised blob is materialized-or-failed (no queued/in-flight/retry). */
+  blobsSettled(): boolean {
+    return this.#queue.settled();
+  }
+
+  blobProgress(): { materialized: number; total: number; failed: number } {
+    return this.#queue.progress();
   }
 }

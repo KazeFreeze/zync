@@ -1,5 +1,11 @@
 export * from "./ports.js";
-export { ClosedError, CorruptBlobError } from "./errors.js";
+export {
+  ClosedError,
+  CorruptBlobError,
+  BlobTransientError,
+  BlobNotFoundError,
+  BlobPermanentError,
+} from "./errors.js";
 export { classify } from "./classify/classify.js";
 export type { Route, Caps, Classification } from "./classify/classify.js";
 export { sha256OfBytes, sha256OfText } from "./hash.js";
@@ -48,3 +54,4 @@ export { SyncEngine, AUDIT_QUIESCENCE_MS, AUDIT_MAX_STALENESS_MS } from "./engin
 export type { EnginePorts, EngineConfig } from "./engine.js";
 export { BlobEngine } from "./blobs/blob-engine.js";
 export type { BlobManifestEntry, BlobFetchPolicy, BlobEngineDeps } from "./blobs/blob-engine.js";
+export * from "./blobs/blob-fetch-queue.js";

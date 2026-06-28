@@ -1,11 +1,12 @@
 import { describe, it, expect } from "vitest";
-import type { DeviceId, IdentityPort, VaultPath } from "../ports.js";
+import type { DeviceId, IdentityPort, Sha256, VaultPath } from "../ports.js";
 import { sha256OfBytes } from "../hash.js";
 import { EchoLedger } from "../bridge/echo.js";
 import { CorruptBlobError } from "../errors.js";
 import { FakeVault } from "../testing/fake-vault.js";
 import { FakeBlobStore } from "../testing/fake-blob-store.js";
 import { FakeCrdtMap } from "../testing/fake-crdt-map.js";
+import { FakeClock } from "../testing/fake-clock.js";
 import { BlobEngine, type BlobFetchPolicy, type BlobManifestEntry } from "./blob-engine.js";
 
 const path = (s: string): VaultPath => s as VaultPath;
@@ -36,6 +37,12 @@ function makeEngine(policy: BlobFetchPolicy, device: DeviceId = DEV_A): Harness 
     echo,
     identity: identity(device),
     policy,
+    clock: new FakeClock(),
+    concurrency: 4,
+    maxInFlightBytes: 1_000_000_000,
+    maxRetries: 4,
+    retryTickMs: 1_000_000_000, // heal tick effectively off for deterministic tests
+    onBlobFailure: () => undefined,
   });
   return { engine, manifest, blobStore, vault, echo };
 }
@@ -85,39 +92,16 @@ describe("BlobEngine.onLocalBlobWrite (content-address → manifest + store)", (
   });
 });
 
-describe("BlobEngine.onManifestChange (eager vs lazy)", () => {
-  it("eager: fetches bytes, hash-verifies, writes the vault (echo-recorded first)", async () => {
-    const h = makeEngine("eager");
-    const sha = await sha256OfBytes(PNG);
-    await h.blobStore.put(sha, PNG);
-    // The manifest entry arrives as if from a remote replica.
-    h.manifest.set("img.png", { sha256: sha, size: PNG.length, deviceId: DEV_A });
-
-    await h.engine.onManifestChange(path("img.png"));
-
-    expect(await h.vault.read(path("img.png"))).toEqual(PNG);
-    // The write was echo-recorded so the resulting fs event is recognized as ours.
-    expect(h.echo.isEcho("img.png", sha)).toBe(true);
-  });
-
-  it("lazy: manifest-only — the vault is NOT written until materialize() is called", async () => {
+describe("BlobEngine.materialize (hash-verify-on-read)", () => {
+  it("lazy-on-read: materialize fetches + writes the bytes, returns 'written'", async () => {
     const h = makeEngine("lazy");
     const sha = await sha256OfBytes(PNG);
     await h.blobStore.put(sha, PNG);
     h.manifest.set("img.png", { sha256: sha, size: PNG.length, deviceId: DEV_A });
-
-    await h.engine.onManifestChange(path("img.png"));
-    // Still manifest-only: nothing materialized.
-    expect(await h.vault.read(path("img.png"))).toBeNull();
-
-    // On read/open, materialize fetches and writes the bytes.
-    const bytes = await h.engine.materialize(path("img.png"));
-    expect(bytes).toEqual(PNG);
+    expect(await h.engine.materialize(path("img.png"), sha)).toBe("written");
     expect(await h.vault.read(path("img.png"))).toEqual(PNG);
   });
-});
 
-describe("BlobEngine.materialize (hash-verify-on-read)", () => {
   it("rejects a CORRUPT blob and does NOT write the vault", async () => {
     const h = makeEngine("lazy");
     const sha = await sha256OfBytes(PNG);
@@ -126,7 +110,9 @@ describe("BlobEngine.materialize (hash-verify-on-read)", () => {
     h.blobStore.putRaw(sha, wrongBytes);
     h.manifest.set("img.png", { sha256: sha, size: PNG.length, deviceId: DEV_A });
 
-    await expect(h.engine.materialize(path("img.png"))).rejects.toBeInstanceOf(CorruptBlobError);
+    await expect(h.engine.materialize(path("img.png"), sha)).rejects.toBeInstanceOf(
+      CorruptBlobError,
+    );
 
     // The vault was left untouched — corrupt bytes never reached disk.
     expect(await h.vault.read(path("img.png"))).toBeNull();
@@ -142,16 +128,16 @@ describe("BlobEngine.materialize (hash-verify-on-read)", () => {
     h.manifest.set("img.png", { sha256: sha, size: PNG.length, deviceId: DEV_A });
 
     const actual = await sha256OfBytes(wrongBytes);
-    await expect(h.engine.materialize(path("img.png"))).rejects.toMatchObject({
+    await expect(h.engine.materialize(path("img.png"), sha)).rejects.toMatchObject({
       path: "img.png",
       expected: sha,
       actual,
     });
   });
 
-  it("throws when there is no manifest entry for the path", async () => {
+  it("returns 'superseded' when there is no manifest entry for the path", async () => {
     const h = makeEngine("eager");
-    await expect(h.engine.materialize(path("missing.png"))).rejects.toThrow(/no manifest entry/);
+    expect(await h.engine.materialize(path("missing.png"), "anysha" as Sha256)).toBe("superseded");
   });
 
   it("echo-record IMMEDIATELY precedes writeAtomic in the materialize path", async () => {
@@ -171,9 +157,28 @@ describe("BlobEngine.materialize (hash-verify-on-read)", () => {
       order.push(`write:${e.path}`);
     });
 
-    await h.engine.materialize(path("img.png"));
+    await h.engine.materialize(path("img.png"), sha);
 
     expect(order).toEqual([`echo:img.png:${sha}`, "write:img.png"]);
+  });
+
+  it("generation race: manifest moves to sha2 mid-fetch -> 'superseded', sha1 NOT written", async () => {
+    const h = makeEngine("lazy");
+    const v1 = new Uint8Array([1, 1, 1]);
+    const v2 = new Uint8Array([2, 2, 2, 2]);
+    const sha1 = await sha256OfBytes(v1);
+    const sha2 = await sha256OfBytes(v2);
+    await h.blobStore.put(sha1, v1);
+    await h.blobStore.put(sha2, v2);
+    h.manifest.set("img.png", { sha256: sha1, size: v1.length, deviceId: DEV_A });
+    // Move the manifest to sha2 DURING the fetch (the get() suspension point).
+    const realGet = h.blobStore.get.bind(h.blobStore);
+    h.blobStore.get = (s: Sha256): Promise<Uint8Array> => {
+      h.manifest.set("img.png", { sha256: sha2, size: v2.length, deviceId: DEV_A });
+      return realGet(s);
+    };
+    expect(await h.engine.materialize(path("img.png"), sha1)).toBe("superseded");
+    expect(await h.vault.read(path("img.png"))).toBeNull(); // sha1 bytes NOT written
   });
 });
 
@@ -199,6 +204,12 @@ describe("BlobEngine two-device materialization (shared manifest + shared store)
       echo: new EchoLedger(),
       identity: identity(DEV_A),
       policy: "lazy",
+      clock: new FakeClock(),
+      concurrency: 4,
+      maxInFlightBytes: 1_000_000_000,
+      maxRetries: 4,
+      retryTickMs: 1_000_000_000, // heal tick effectively off for deterministic tests
+      onBlobFailure: () => undefined,
     });
 
     // Device B: EAGER + observing — it must auto-fetch the moment the entry lands.
@@ -211,6 +222,12 @@ describe("BlobEngine two-device materialization (shared manifest + shared store)
       echo: new EchoLedger(),
       identity: identity(DEV_B),
       policy: "eager",
+      clock: new FakeClock(),
+      concurrency: 4,
+      maxInFlightBytes: 1_000_000_000,
+      maxRetries: 4,
+      retryTickMs: 1_000_000_000, // heal tick effectively off for deterministic tests
+      onBlobFailure: () => undefined,
     });
 
     let writtenB = false;

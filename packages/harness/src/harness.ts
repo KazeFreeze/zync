@@ -85,6 +85,7 @@ export interface Status {
   writeCount: number;
   ingestCount: number;
   lastSyncAt: number | null;
+  blobs: { materialized: number; total: number; failed: number; settled: boolean };
 }
 
 /** `GET /doc?path=`. */
@@ -519,6 +520,38 @@ export async function waitConverged(
   }
 }
 
+/**
+ * Poll until every named device reports `blobs.settled` with zero failures, for TWO consecutive
+ * samples (so a momentary mid-enqueue gap can't read as settled). Background blob materialization
+ * is decoupled from prose convergence, so this is the blob-side analogue of {@link waitConverged}.
+ */
+export async function waitBlobsSettled(
+  names: DeviceName[],
+  options: { timeoutMs?: number; pollMs?: number } = {},
+): Promise<void> {
+  const timeoutMs = options.timeoutMs ?? 120_000;
+  const pollMs = options.pollMs ?? 500;
+  const devices = names.map((n) => device(n));
+  const deadline = Date.now() + timeoutMs;
+  let settledOnce = false;
+  for (;;) {
+    const states = await Promise.all(devices.map((d) => d.status()));
+    const allSettled = states.every((s) => s.blobs.settled && s.blobs.failed === 0);
+    if (allSettled) {
+      if (settledOnce) return;
+      settledOnce = true;
+    } else {
+      settledOnce = false;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `waitBlobsSettled timed out: ${states.map((s) => JSON.stringify(s.blobs)).join(" ")}`,
+      );
+    }
+    await sleep(pollMs);
+  }
+}
+
 function convergenceDiagnostic(
   names: DeviceName[],
   trees: Map<DeviceName, Tree>,
@@ -554,6 +587,13 @@ export function treesEqual(a: Tree, b: Tree): boolean {
     if (a[k]?.sha256 !== b[k]?.sha256) return false;
   }
   return true;
+}
+
+/** Tree equality over PROSE files only (.md/.txt) — proves prose convergence independent of blobs. */
+export function proseTreesEqual(a: Tree, b: Tree): boolean {
+  const prose = (t: Tree): Tree =>
+    Object.fromEntries(Object.entries(t).filter(([k]) => /\.(md|txt)$/.test(k)));
+  return treesEqual(prose(a), prose(b));
 }
 
 /** Paths in a tree that look like engine-written conflict artifacts. */

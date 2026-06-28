@@ -37,6 +37,7 @@ import {
   resetStack,
   SERVER_BLOB_BASE,
   sleep,
+  waitBlobsSettled,
   waitConverged,
 } from "../src/harness.js";
 
@@ -171,6 +172,9 @@ describe("blob CONTENT converges to the follower's disk (eager-blob materializat
     await a.write(BIN, BIN_BYTES);
     await waitServerHasBlob(binSha, 60_000);
     await waitConverged(["device-a", "device-b"], { timeoutMs: 60_000 });
+    // waitConverged settles PROSE; the blob lands via B's background queue (decoupled
+    // from prose convergence), so wait on it explicitly before asserting B's disk bytes.
+    await waitBlobsSettled(["device-b"], { timeoutMs: 60_000 });
 
     expect(await b.exists(BIN)).toBe(true);
     const bBytes = await b.readBytes(BIN);

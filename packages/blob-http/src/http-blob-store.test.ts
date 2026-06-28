@@ -1,7 +1,12 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import * as http from "node:http";
 import type { Sha256 } from "@zync/core";
-import { sha256OfBytes } from "@zync/core";
+import {
+  sha256OfBytes,
+  BlobTransientError,
+  BlobNotFoundError,
+  BlobPermanentError,
+} from "@zync/core";
 import { HttpBlobStore } from "./http-blob-store.js";
 
 // ---------------------------------------------------------------------------
@@ -20,13 +25,23 @@ interface BlobServerHandle {
   lastAuth(): string | undefined;
 }
 
-function startBlobServer(opts: { requireToken?: string } = {}): Promise<BlobServerHandle> {
+function startBlobServer(
+  opts: { requireToken?: string; forceStatus?: number } = {},
+): Promise<BlobServerHandle> {
   const blobs = new Map<string, Buffer>();
   const tampered = new Map<string, Buffer>(); // sha → wrong bytes
   let lastAuth: string | undefined;
 
   const server = http.createServer((req, res) => {
     lastAuth = req.headers.authorization;
+
+    // `forceStatus`: short-circuit EVERY verb with a fixed status (used by the
+    // error-taxonomy mapping tests to exercise 5xx/413/etc on has/get/put).
+    if (opts.forceStatus !== undefined) {
+      req.resume(); // drain any request body so the socket stays clean
+      res.writeHead(opts.forceStatus).end();
+      return;
+    }
 
     if (
       opts.requireToken !== undefined &&
@@ -220,5 +235,98 @@ describe("HttpBlobStore — Bearer-token auth", () => {
   it("a wrong-token client is rejected (401)", async () => {
     const wrong = new HttpBlobStore(authHandle.baseUrl, "not-the-token");
     await expect(wrong.has("0".repeat(64) as Sha256)).rejects.toThrow(/401/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Error-taxonomy mapping (drives the fetch queue's retry-vs-park decision)
+//
+// The client maps HTTP STATUS → typed errors:
+//   404               → BlobNotFoundError (get/put); has() keeps 404 → false
+//   401/403/413/4xx   → BlobPermanentError (never retried)
+//   408/429/5xx       → BlobTransientError (retried)
+//   network reject    → BlobTransientError (retried)
+// ---------------------------------------------------------------------------
+
+const SHA = "a".repeat(64) as Sha256;
+
+describe("HttpBlobStore — error taxonomy mapping", () => {
+  it("get() of a missing sha → BlobNotFoundError (server 404)", async () => {
+    const handle = await startBlobServer();
+    const store = new HttpBlobStore(handle.baseUrl);
+    try {
+      await expect(store.get(SHA)).rejects.toBeInstanceOf(BlobNotFoundError);
+    } finally {
+      handle.server.close();
+    }
+  });
+
+  it("has() of a missing sha still returns false (NOT an error)", async () => {
+    const handle = await startBlobServer();
+    const store = new HttpBlobStore(handle.baseUrl);
+    try {
+      expect(await store.has(SHA)).toBe(false);
+    } finally {
+      handle.server.close();
+    }
+  });
+
+  it("get/put/has against a 503 → BlobTransientError", async () => {
+    const handle = await startBlobServer({ forceStatus: 503 });
+    const store = new HttpBlobStore(handle.baseUrl);
+    try {
+      await expect(store.get(SHA)).rejects.toBeInstanceOf(BlobTransientError);
+      await expect(store.put(SHA, new Uint8Array([1, 2, 3]))).rejects.toBeInstanceOf(
+        BlobTransientError,
+      );
+      await expect(store.has(SHA)).rejects.toBeInstanceOf(BlobTransientError);
+    } finally {
+      handle.server.close();
+    }
+  });
+
+  it("get/put against a 413 → BlobPermanentError", async () => {
+    const handle = await startBlobServer({ forceStatus: 413 });
+    const store = new HttpBlobStore(handle.baseUrl);
+    try {
+      await expect(store.get(SHA)).rejects.toBeInstanceOf(BlobPermanentError);
+      await expect(store.put(SHA, new Uint8Array([1, 2, 3]))).rejects.toBeInstanceOf(
+        BlobPermanentError,
+      );
+    } finally {
+      handle.server.close();
+    }
+  });
+
+  it("get/put against a 401 (no token) → BlobPermanentError", async () => {
+    const handle = await startBlobServer({ requireToken: "the-token" });
+    const anon = new HttpBlobStore(handle.baseUrl); // no token → 401
+    try {
+      await expect(anon.get(SHA)).rejects.toBeInstanceOf(BlobPermanentError);
+      await expect(anon.put(SHA, new Uint8Array([1, 2, 3]))).rejects.toBeInstanceOf(
+        BlobPermanentError,
+      );
+    } finally {
+      handle.server.close();
+    }
+  });
+
+  it("a network failure (closed server) → BlobTransientError", async () => {
+    // Start then immediately close a server to obtain a guaranteed-dead URL,
+    // so fetch() rejects with a connection error (DNS/refused/timeout class).
+    const dead = await startBlobServer();
+    const deadUrl = dead.baseUrl;
+    await new Promise<void>((resolve) => {
+      dead.server.close(() => {
+        resolve();
+      });
+    });
+    const store = new HttpBlobStore(deadUrl);
+
+    await expect(store.get(SHA)).rejects.toBeInstanceOf(BlobTransientError);
+    await expect(store.put(SHA, new Uint8Array([1, 2, 3]))).rejects.toBeInstanceOf(
+      BlobTransientError,
+    );
+    await expect(store.has(SHA)).rejects.toBeInstanceOf(BlobTransientError);
   });
 });

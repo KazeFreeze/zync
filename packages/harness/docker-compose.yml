@@ -113,6 +113,11 @@ services:
       ZYNC_BLOB_PORT: "8080"
       ZYNC_TOKEN: dev-static-token
       ZYNC_SNAPSHOT_DIR: /data/snapshots
+      # HARNESS-ONLY blob GET latch (blob-scale gate): delay every blob GET by 200ms so blob
+      # draining clearly outlasts (fast) prose convergence — a wide, deterministic decoupling
+      # window — and expose the /_blob-stats concurrent-GET peak route. ONLY delays GETs; other
+      # scenarios have few blobs so the global impact is small. Production runs with delay=0.
+      ZYNC_BLOB_GET_DELAY_MS: "200"
       ZYNC_S3_ENDPOINT: http://minio:9000
       ZYNC_S3_BUCKET: zync-blobs
       ZYNC_S3_REGION: us-east-1

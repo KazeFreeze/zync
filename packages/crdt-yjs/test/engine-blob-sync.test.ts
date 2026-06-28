@@ -19,6 +19,14 @@ function identity(id: string, name: string): IdentityPort {
   return { deviceId: () => id as DeviceId, deviceName: () => name };
 }
 
+async function waitFor(cond: () => boolean | Promise<boolean>, maxTicks = 200): Promise<void> {
+  for (let i = 0; i < maxTicks; i++) {
+    if (await Promise.resolve(cond())) return;
+    await new Promise((r) => setTimeout(r, 0));
+  }
+  throw new Error("waitFor: condition not met within the tick budget");
+}
+
 interface Device {
   engine: SyncEngine;
   vault: FakeVault;
@@ -65,48 +73,56 @@ describe("SyncEngine blob sync — eager follower materializes + blob-pending ac
     await b.engine.stop();
   });
 
-  it("eager follower B materializes A's blob to disk; pendingDocs reports it until then", async () => {
-    const blobStore = new FakeBlobStore();
-    const bus = new InProcessBus();
-    a = makeDevice(bus, "dev-a", blobStore, "lazy");
-    b = makeDevice(bus, "dev-b", blobStore, "eager"); // the headless follower default
-
-    await a.engine.start();
-    await b.engine.start();
-
-    // A writes a binary blob after start (the live-harness path): store + manifest advertise.
-    await a.vault.writeAtomic(IMG, PNG);
-    await a.engine.waitConverged();
-
-    // B (eager) must materialize the bytes onto its OWN disk. waitConverged loops until the
-    // blob-pending accounting clears — pre-fix B reported pendingDocs===0 with NO file (the bug).
-    await b.engine.waitConverged();
-
-    const onDiskB = await b.vault.read(IMG);
-    expect(onDiskB).toEqual(PNG);
-    const sha = await sha256OfBytes(PNG);
-    expect(await sha256OfBytes(onDiskB ?? new Uint8Array())).toBe(sha);
-
-    // Both engines are quiescent (no false-quiescence: the blob is genuinely on B's disk).
-    expect(await a.engine.pendingDocs()).toEqual([]);
-    expect(await b.engine.pendingDocs()).toEqual([]);
-  });
-
-  it("bootstrap publishes a blob already on disk → eager follower materializes it", async () => {
+  it("eager follower B materializes A's blob to disk in the background (decoupled from prose)", async () => {
     const blobStore = new FakeBlobStore();
     const bus = new InProcessBus();
     a = makeDevice(bus, "dev-a", blobStore, "lazy");
     b = makeDevice(bus, "dev-b", blobStore, "eager");
 
-    // A has the blob on disk BEFORE start (the fixture-load path) — bootstrap must publish it.
+    await a.engine.start();
+    await b.engine.start();
+
+    await a.vault.writeAtomic(IMG, PNG);
+    await a.engine.waitConverged();
+    await b.engine.waitConverged(); // prose converges WITHOUT waiting for the blob
+
+    const sha = await sha256OfBytes(PNG);
+    await waitFor(async () => {
+      const d = await b.vault.read(IMG);
+      return d !== null && (await sha256OfBytes(d)) === sha;
+    });
+    expect(await b.vault.read(IMG)).toEqual(PNG);
+
+    // The background queue settles with the blob materialized, zero failures.
+    await waitFor(() => b.engine.blobsSettled());
+    expect(b.engine.blobProgress().failed).toBe(0);
+
+    // Drain B's watcher fallout: materializing the blob fired an fs "create" that the M3 rename
+    // coalescer buffered as a transient rename-target (a blob path is not in the prose index). The
+    // live daemon's convergence loop / debounce timer drains it; here whenIdle force-drains it, and
+    // the materialize echo-guard then suppresses the re-publish. (Pre-decouple this drained inside
+    // waitConverged because the blob materialized within its loop; now it lands in the background.)
+    await b.engine.whenIdle();
+
+    // Blobs are no longer part of pendingDocs (the decouple): prose is converged.
+    expect(await a.engine.pendingDocs()).toEqual([]);
+    expect(await b.engine.pendingDocs()).toEqual([]);
+  });
+
+  it("bootstrap publishes a blob already on disk -> eager follower materializes it in the background", async () => {
+    const blobStore = new FakeBlobStore();
+    const bus = new InProcessBus();
+    a = makeDevice(bus, "dev-a", blobStore, "lazy");
+    b = makeDevice(bus, "dev-b", blobStore, "eager");
+
     await a.vault.writeAtomic(IMG, PNG);
     await a.engine.start();
     await b.engine.start();
     await a.engine.waitConverged();
     await b.engine.waitConverged();
 
-    // A advertised the pre-existing blob; eager B fetched + materialized it.
     expect(b.engine.blobManifestEntries().length).toBe(1);
+    await waitFor(async () => (await b.vault.read(IMG)) !== null);
     expect(await b.vault.read(IMG)).toEqual(PNG);
     expect(await b.engine.pendingDocs()).toEqual([]);
   });
@@ -137,7 +153,7 @@ describe("SyncEngine blob sync — eager follower materializes + blob-pending ac
     // And a full waitConverged settles rather than hanging/throwing.
     await b.engine.waitConverged();
 
-    // The read-only manifest accessor still exposes the advertised entry (used by pendingDocs).
+    // The read-only manifest accessor still exposes the advertised entry (the blob-state surface).
     const sha = await sha256OfBytes(PNG);
     const entries = b.engine.blobManifestEntries();
     expect(entries).toHaveLength(1);
@@ -155,8 +171,8 @@ describe("SyncEngine blob sync — eager follower materializes + blob-pending ac
     // Count EVERY writeAtomic the eager follower B performs for the blob path. The unbounded
     // feedback loop is: materialize → echo.recordWrite + vault.writeAtomic → fs "modify" →
     // onVaultEvent → onWrite (blob branch) → onLocalBlobWrite → manifest.set (re-stamp) →
-    // observe → onManifestChange → materialize → … spinning forever. Each spin is one MORE
-    // writeAtomic for IMG, so the count is the loop detector. Pre-fix: hundreds/thousands.
+    // observe → the background fetch queue enqueues → materialize → … spinning forever. Each spin
+    // is one MORE writeAtomic for IMG, so the count is the loop detector. Pre-fix: hundreds/thousands.
     let bWritesForImg = 0;
     const realWrite = b.vault.writeAtomic.bind(b.vault);
     b.vault.writeAtomic = (p, data, opts): Promise<void> => {
@@ -166,23 +182,18 @@ describe("SyncEngine blob sync — eager follower materializes + blob-pending ac
 
     await a.engine.start();
     await b.engine.start();
-
-    // A writes the blob after start: store + manifest advertise. B (eager) materializes it.
     await a.vault.writeAtomic(IMG, PNG);
     await a.engine.waitConverged();
     await b.engine.waitConverged();
 
-    // Let any background spin run: drain inflight, then give the fire-and-forget materialize/
-    // onWrite echo cycle ample macrotask ticks to spin if it is going to. A live daemon never
-    // stops, so the untracked `void onManifestChange(...)` background work must self-terminate.
+    // The blob lands via the background queue (the SOLE eager writer now — drainEagerBlobs is gone).
+    await waitFor(async () => (await b.vault.read(IMG)) !== null);
+    // Let any spin run: the bounded queue dedups same-path, so a synced blob is written once.
     for (let i = 0; i < 50; i++) {
       await b.engine.whenIdle();
       await new Promise((r) => setTimeout(r, 0));
     }
-
-    // The blob landed on B's disk exactly once (idempotent) — NOT re-written on every echo.
     expect(await b.vault.read(IMG)).toEqual(PNG);
-    // BOUNDED: a single synced blob ⇒ at most one materialize write on B. The loop is gone.
     expect(bWritesForImg).toBeLessThanOrEqual(2);
     expect(await b.engine.pendingDocs()).toEqual([]);
   });

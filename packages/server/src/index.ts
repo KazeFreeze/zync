@@ -33,6 +33,13 @@ export interface ServerConfig {
   snapshotDir: string;
   /** Injectable blob backend — defaults to S3BlobStore in main(). */
   blobBackend: BlobBackend;
+  /**
+   * HARNESS-ONLY blob GET latch (ms, ZYNC_BLOB_GET_DELAY_MS). When > 0, every blob GET sleeps
+   * this long + a `/_blob-stats` peak-concurrency route is exposed (see createBlobHandler). 0 in
+   * production — no delay, no extra route. Used by the blob-scale gate to widen + measure the
+   * prose-converges-before-blobs-settle decoupling window.
+   */
+  blobGetDelayMs?: number;
 }
 
 export interface ServerHandle {
@@ -55,7 +62,10 @@ export async function createServer(config: ServerConfig): Promise<ServerHandle> 
   console.log(`[zync] relay on ws://0.0.0.0:${config.relayPort}`);
 
   // 2. Start the blob HTTP server (shares the relay's static token).
-  const blobHandler = createBlobHandler(config.blobBackend, { token: config.token });
+  const blobHandler = createBlobHandler(config.blobBackend, {
+    token: config.token,
+    getDelayMs: config.blobGetDelayMs ?? 0,
+  });
   const blobServer = http.createServer(blobHandler);
 
   await new Promise<void>((resolve, reject) => {
@@ -91,6 +101,8 @@ async function main(): Promise<void> {
   const blobPort = Number(process.env.ZYNC_BLOB_PORT ?? 8080);
   const token = process.env.ZYNC_TOKEN ?? "dev-static-token";
   const snapshotDir = process.env.ZYNC_SNAPSHOT_DIR ?? "/data/snapshots";
+  // HARNESS-ONLY: 0 in production (no latch, no /_blob-stats). The blob-scale gate sets it.
+  const blobGetDelayMs = Number(process.env.ZYNC_BLOB_GET_DELAY_MS ?? 0);
 
   const s3Endpoint = process.env.ZYNC_S3_ENDPOINT ?? "http://localhost:9000";
   const s3Bucket = process.env.ZYNC_S3_BUCKET ?? "zync-blobs";
@@ -113,6 +125,7 @@ async function main(): Promise<void> {
     token,
     snapshotDir,
     blobBackend,
+    blobGetDelayMs,
   });
 }
 

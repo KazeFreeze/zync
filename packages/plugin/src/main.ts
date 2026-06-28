@@ -277,8 +277,17 @@ export default class ZyncPlugin extends Plugin {
   }
 
   private renderStatus(pending: number): void {
+    const b = this.engine?.blobProgress();
+    // Show "Files M/N" only while blobs are still materializing. Clamp M to N defensively:
+    // `materialized` is a cumulative counter and can momentarily exceed the live `total` on a
+    // re-targeted blob, which would otherwise render "152/150".
+    const files =
+      b && b.total > 0 && b.materialized < b.total
+        ? ` · Files ${String(Math.min(b.materialized, b.total))}/${String(b.total)}` +
+          (b.failed > 0 ? ` (${String(b.failed)} failed)` : "")
+        : "";
     this.statusBar?.setText(
-      `Zync: ${this.connText}${pending > 0 ? ` · ${String(pending)} pending` : ""}`,
+      `Zync: ${this.connText}${pending > 0 ? ` · ${String(pending)} pending` : ""}${files}`,
     );
   }
 

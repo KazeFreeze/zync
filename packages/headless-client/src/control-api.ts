@@ -233,6 +233,10 @@ async function syncStop(deps: ControlApiDeps): Promise<JsonResponse> {
  * return `{ ok: true, converged: false }` (a 200) rather than a 500, so the harness
  * poll treats "didn't settle this round" as a signal to keep polling, not an error.
  * The remaining `pendingDocs` is reported for diagnostics.
+ *
+ * PROSE-ONLY: flush converges DOC (prose) state only. The blob-fetch decouple removed
+ * blobs from `waitConverged`, so background blob materialization is NOT awaited here —
+ * observe it separately via `GET /status` `blobs.settled`.
  */
 async function syncFlush(deps: ControlApiDeps): Promise<JsonResponse> {
   let converged = true;
@@ -390,6 +394,9 @@ async function status(deps: ControlApiDeps): Promise<JsonResponse> {
       writeCount: state.writeCount,
       ingestCount: state.ingestCount,
       lastSyncAt: state.lastSyncAt,
+      blobs: deps.isStarted()
+        ? { ...engine.blobProgress(), settled: engine.blobsSettled() }
+        : { materialized: 0, total: 0, failed: 0, settled: true },
     },
   };
 }

@@ -19,7 +19,12 @@
  * headless client can depend on it without dragging `node:*` modules in.
  */
 
-import { sha256OfBytes } from "@zync/core";
+import {
+  sha256OfBytes,
+  BlobTransientError,
+  BlobNotFoundError,
+  BlobPermanentError,
+} from "@zync/core";
 import type { BlobStorePort, Sha256 } from "@zync/core";
 
 export class HttpBlobStore implements BlobStorePort {
@@ -37,8 +42,35 @@ export class HttpBlobStore implements BlobStorePort {
       token !== undefined && token !== "" ? { Authorization: `Bearer ${token}` } : {};
   }
 
+  /** Map a non-ok HTTP status to the blob error taxonomy (drives the fetch queue's retry-vs-park). */
+  private errorForStatus(sha: Sha256, verb: string, status: number): Error {
+    if (status === 404) return new BlobNotFoundError({ sha });
+    if (status === 401 || status === 403 || status === 413)
+      return new BlobPermanentError({ sha, reason: `${verb} ${String(status)}` });
+    if (status === 408 || status === 429 || status >= 500)
+      return new BlobTransientError({ sha, cause: `${verb} ${String(status)}` });
+    return new BlobPermanentError({ sha, reason: `${verb} ${String(status)}` }); // other 4xx: won't fix on retry
+  }
+
+  /**
+   * Run `fetch`, mapping a thrown (rejected) fetch — DNS/connection-refused/timeout
+   * network failures surface as a `TypeError` — to a retryable `BlobTransientError`.
+   */
+  private async fetchOrTransient(
+    sha: Sha256,
+    verb: string,
+    url: string,
+    init?: RequestInit,
+  ): Promise<Response> {
+    try {
+      return await fetch(url, init);
+    } catch (cause) {
+      throw new BlobTransientError({ sha, cause: `${verb} network: ${String(cause)}` });
+    }
+  }
+
   async has(sha: Sha256): Promise<boolean> {
-    const res = await fetch(`${this.baseUrl}/blob/${sha}`, {
+    const res = await this.fetchOrTransient(sha, "HEAD", `${this.baseUrl}/blob/${sha}`, {
       method: "HEAD",
       headers: { ...this.authHeaders },
     });
@@ -49,13 +81,13 @@ export class HttpBlobStore implements BlobStorePort {
     }
     if (!res.ok) {
       void res.body?.cancel();
-      throw new Error(`HttpBlobStore.has: unexpected status ${String(res.status)} for ${sha}`);
+      throw this.errorForStatus(sha, "HEAD", res.status);
     }
     return true;
   }
 
   async put(sha: Sha256, data: Uint8Array): Promise<void> {
-    const res = await fetch(`${this.baseUrl}/blob/${sha}`, {
+    const res = await this.fetchOrTransient(sha, "PUT", `${this.baseUrl}/blob/${sha}`, {
       method: "PUT",
       // `.slice()` yields a fresh Uint8Array<ArrayBuffer> — a `BodyInit` under BOTH the DOM lib (browser
       // plugin) and @types/node (headless), sidestepping the Uint8Array<ArrayBufferLike> generic mismatch.
@@ -64,17 +96,19 @@ export class HttpBlobStore implements BlobStorePort {
     });
     if (!res.ok) {
       void res.body?.cancel();
-      throw new Error(`HttpBlobStore.put: server returned ${String(res.status)} for ${sha}`);
+      throw this.errorForStatus(sha, "PUT", res.status);
     }
     // Drain the (typically empty) success body so the connection can be reused.
     void res.body?.cancel();
   }
 
   async get(sha: Sha256): Promise<Uint8Array> {
-    const res = await fetch(`${this.baseUrl}/blob/${sha}`, { headers: { ...this.authHeaders } });
+    const res = await this.fetchOrTransient(sha, "GET", `${this.baseUrl}/blob/${sha}`, {
+      headers: { ...this.authHeaders },
+    });
     if (!res.ok) {
       void res.body?.cancel();
-      throw new Error(`HttpBlobStore.get: server returned ${String(res.status)} for ${sha}`);
+      throw this.errorForStatus(sha, "GET", res.status);
     }
     const buf = await res.arrayBuffer();
     const bytes = new Uint8Array(buf);

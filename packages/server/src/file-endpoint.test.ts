@@ -49,11 +49,12 @@ interface FetchOpts {
 
 async function startTestServer(
   backend: BlobBackend,
-  opts: { maxBodyBytes?: number; token?: string } = {},
+  opts: { maxBodyBytes?: number; token?: string; getDelayMs?: number } = {},
 ): Promise<{ baseUrl: string; close: () => Promise<void> }> {
-  const handlerOpts: { maxBodyBytes?: number; token?: string } = {};
+  const handlerOpts: { maxBodyBytes?: number; token?: string; getDelayMs?: number } = {};
   if (opts.maxBodyBytes !== undefined) handlerOpts.maxBodyBytes = opts.maxBodyBytes;
   if (opts.token !== undefined) handlerOpts.token = opts.token;
+  if (opts.getDelayMs !== undefined) handlerOpts.getDelayMs = opts.getDelayMs;
   const handler = createBlobHandler(backend, handlerOpts);
   const server = http.createServer(handler);
 
@@ -458,5 +459,59 @@ describe("file-endpoint blob handler — CORS", () => {
     const res = await req(`${baseUrl}/blob/${"c".repeat(64)}`, { method: "HEAD" }); // no auth → 401
     expect(res.status).toBe(401);
     expect(res.headers["access-control-allow-origin"]).toBe("*");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET-latch instrumentation (getDelayMs) — the harness blob-scale gate's hook.
+// When getDelayMs > 0: each GET sleeps the delay, a concurrent-GET peak is tracked,
+// and an unauthenticated GET /_blob-stats reports it. When 0 (production default):
+// no delay, and /_blob-stats is NOT a route (falls through to the 404 path).
+// ---------------------------------------------------------------------------
+
+describe("file-endpoint blob handler — GET latch + /_blob-stats instrumentation", () => {
+  it("with getDelayMs>0: GETs are delayed and the concurrent-GET peak is observable (>=2)", async () => {
+    const backend = makeMemBackend();
+    const data = Buffer.from("latched blob content");
+    const sha = sha256(data);
+    await backend.put(sha, new Uint8Array(data));
+
+    const DELAY = 20;
+    const server = await startTestServer(backend, { getDelayMs: DELAY });
+    try {
+      // (b) the delay is applied: a single GET takes at least ~the configured delay.
+      const t0 = Date.now();
+      const single = await req(`${server.baseUrl}/blob/${sha}`);
+      expect(single.status).toBe(200);
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(DELAY - 4);
+
+      // (a) concurrency is observed: fire several GETs at once; they overlap inside the delay
+      // window so the server's peak must reach >= 2.
+      const results = await Promise.all(
+        Array.from({ length: 6 }, () => req(`${server.baseUrl}/blob/${sha}`)),
+      );
+      for (const r of results) expect(r.status).toBe(200);
+
+      const statsRes = await req(`${server.baseUrl}/_blob-stats`);
+      expect(statsRes.status).toBe(200);
+      const stats = JSON.parse(statsRes.body.toString("utf8")) as {
+        maxConcurrentGets: number;
+        getCount: number;
+      };
+      expect(stats.maxConcurrentGets).toBeGreaterThanOrEqual(2);
+      expect(stats.getCount).toBeGreaterThanOrEqual(7); // the single + the 6 concurrent
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("with getDelayMs=0 (default): /_blob-stats is NOT a special route (404, falls through)", async () => {
+    const server = await startTestServer(makeMemBackend()); // no getDelayMs → production behavior
+    try {
+      const res = await req(`${server.baseUrl}/_blob-stats`);
+      expect(res.status).toBe(404);
+    } finally {
+      await server.close();
+    }
   });
 });

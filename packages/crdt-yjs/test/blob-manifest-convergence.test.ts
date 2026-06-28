@@ -8,7 +8,7 @@ import type {
   IdentityPort,
   VaultPath,
 } from "@zync/core";
-import { FakeVault, FakeBlobStore } from "@zync/core/testing";
+import { FakeVault, FakeBlobStore, FakeClock } from "@zync/core/testing";
 import { YjsCrdtMap } from "../src/index.js";
 
 const path = (s: string): VaultPath => s as VaultPath;
@@ -41,6 +41,12 @@ function makeReplica(device: string, policy: BlobFetchPolicy, blobStore: FakeBlo
     echo: new EchoLedger(),
     identity: identity(device),
     policy,
+    clock: new FakeClock(),
+    concurrency: 4,
+    maxInFlightBytes: 1_000_000_000,
+    maxRetries: 4,
+    retryTickMs: 1_000_000_000, // heal tick effectively off for deterministic tests
+    onBlobFailure: () => undefined,
   });
   return { doc, engine, vault };
 }
@@ -116,8 +122,8 @@ describe("Blob manifest convergence over real YjsCrdtMap (shared blob store)", (
     expect(await b.vault.read(path("img.png"))).toBeNull();
 
     // On read/open, B materializes the byte-identical blob from the shared store.
-    const bytes = await b.engine.materialize(path("img.png"));
-    expect(bytes).toEqual(PNG);
+    const sha = await sha256OfBytes(PNG);
+    expect(await b.engine.materialize(path("img.png"), sha)).toBe("written");
     expect(await b.vault.read(path("img.png"))).toEqual(PNG);
 
     unsubB();

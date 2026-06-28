@@ -34,3 +34,35 @@ export class CorruptBlobError extends Error {
     this.actual = args.actual;
   }
 }
+
+/** A TRANSIENT blob-store failure (network / timeout / 5xx) — the fetch queue RETRIES these. */
+export class BlobTransientError extends Error {
+  readonly sha: Sha256;
+  constructor(args: { sha: Sha256; cause?: string }) {
+    super(`transient blob error for sha ${args.sha}${args.cause ? `: ${args.cause}` : ""}`);
+    this.name = "BlobTransientError";
+    this.sha = args.sha;
+  }
+}
+
+/** The blob bytes are NOT in the store (404). Retried a few times (propagation lag) then parked. */
+export class BlobNotFoundError extends Error {
+  readonly sha: Sha256;
+  constructor(args: { sha: Sha256 }) {
+    super(`blob not found for sha ${args.sha}`);
+    this.name = "BlobNotFoundError";
+    this.sha = args.sha;
+  }
+}
+
+/** A PERMANENT blob failure (auth 401/403, 413/too-large) — parked immediately, NEVER retried. */
+export class BlobPermanentError extends Error {
+  readonly sha: Sha256;
+  readonly reason: string;
+  constructor(args: { sha: Sha256; reason: string }) {
+    super(`permanent blob error for sha ${args.sha}: ${args.reason}`);
+    this.name = "BlobPermanentError";
+    this.sha = args.sha;
+    this.reason = args.reason;
+  }
+}

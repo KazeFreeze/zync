@@ -31,6 +31,23 @@ import { createHash } from "node:crypto";
 /** Default PUT body-size ceiling: 100 MB. Overridable in tests. */
 export const DEFAULT_MAX_BODY_BYTES = 100 * 1024 * 1024;
 
+/** Test-only sleep (Node) — used by the GET-latch instrumentation. NOT @zync/core's clock. */
+const sleep = (ms: number): Promise<void> => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * Mutable GET-latch counters, closed over by ONE handler instance. Only touched when
+ * `getDelayMs > 0` (the harness blob-scale gate sets `ZYNC_BLOB_GET_DELAY_MS`); production
+ * (delay=0) never allocates a delay and never reads/writes these beyond the unused init.
+ */
+interface BlobStats {
+  /** GETs currently in their delay/serve window (incremented on entry, decremented in finally). */
+  activeGets: number;
+  /** High-water mark of `activeGets` — the observed concurrent-GET peak (the cap proof). */
+  peakGets: number;
+  /** Total GETs served since the last reset. */
+  getCount: number;
+}
+
 // ---------------------------------------------------------------------------
 // Injectable backend interface
 // ---------------------------------------------------------------------------
@@ -118,6 +135,14 @@ export interface BlobHandlerOptions {
    * is open (pre-auth behavior — used by the in-memory unit tests).
    */
   token?: string;
+  /**
+   * HARNESS-ONLY GET latch (ms). When > 0, every `GET /blob/:sha` sleeps this long before
+   * serving, a concurrent-GET peak is tracked, and an unauthenticated `GET /_blob-stats`
+   * diagnostics route is exposed. When 0 (the default — production), the endpoint behaves
+   * EXACTLY as before: no delay, no peak tracking, no `/_blob-stats` route, zero overhead.
+   * The harness sets it via `ZYNC_BLOB_GET_DELAY_MS` to widen + measure the decoupling window.
+   */
+  getDelayMs?: number;
 }
 
 /**
@@ -131,8 +156,12 @@ export function createBlobHandler(
 ): (req: IncomingMessage, res: ServerResponse) => void {
   const maxBodyBytes = opts.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
   const token = opts.token;
+  const getDelayMs = opts.getDelayMs ?? 0;
+  // One counter set per handler instance, closed over by every request it serves. Untouched
+  // when getDelayMs === 0 (production), so the latch + stats are strictly opt-in.
+  const stats: BlobStats = { activeGets: 0, peakGets: 0, getCount: 0 };
   return function blobHandler(req: IncomingMessage, res: ServerResponse): void {
-    void handleBlobRequest(req, res, backend, maxBodyBytes, token);
+    void handleBlobRequest(req, res, backend, maxBodyBytes, token, getDelayMs, stats);
   };
 }
 
@@ -142,6 +171,8 @@ async function handleBlobRequest(
   backend: BlobBackend,
   maxBodyBytes: number,
   token: string | undefined,
+  getDelayMs: number,
+  stats: BlobStats,
 ): Promise<void> {
   try {
     const url = req.url ?? "";
@@ -157,6 +188,21 @@ async function handleBlobRequest(
     if (method === "OPTIONS") {
       res.writeHead(204);
       res.end();
+      return;
+    }
+
+    // HARNESS-ONLY diagnostics route (gated behind the GET latch; absent in production where
+    // getDelayMs === 0). Matched BEFORE /blob/:sha and WITHOUT auth — it leaks no blob bytes,
+    // only the concurrent-GET peak the blob-scale gate reads. `?reset=1` zeroes the window AFTER
+    // reading (peak is rebased to the live in-flight count so an active GET is not under-counted).
+    if (getDelayMs > 0 && (url === "/_blob-stats" || url.startsWith("/_blob-stats?"))) {
+      const body = JSON.stringify({ maxConcurrentGets: stats.peakGets, getCount: stats.getCount });
+      if (url.includes("reset=1")) {
+        stats.peakGets = stats.activeGets;
+        stats.getCount = 0;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(body);
       return;
     }
 
@@ -200,6 +246,31 @@ async function handleBlobRequest(
     if (method === "GET") {
       // Avoid has()-then-get() TOCTOU: call get() directly and catch on miss.
       // BlobBackend.get() MUST throw (any error) when the key is absent.
+      if (getDelayMs > 0) {
+        // LATCHED path (harness gate only): count this GET, track the concurrent peak, then sleep
+        // BEFORE serving so blob draining visibly outlasts prose convergence. `finally` keeps
+        // activeGets exact even when the backend throws (a 404 still decrements the in-flight count).
+        stats.getCount++;
+        stats.activeGets++;
+        if (stats.activeGets > stats.peakGets) stats.peakGets = stats.activeGets;
+        try {
+          await sleep(getDelayMs);
+          const bytes = await backend.get(sha);
+          res.writeHead(200, {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": String(bytes.length),
+          });
+          res.end(bytes);
+        } catch {
+          if (!res.headersSent) {
+            res.writeHead(404);
+            res.end();
+          }
+        } finally {
+          stats.activeGets--;
+        }
+        return;
+      }
       try {
         const bytes = await backend.get(sha);
         res.writeHead(200, {

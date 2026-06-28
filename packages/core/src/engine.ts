@@ -58,6 +58,14 @@ export interface EngineConfig {
   maxProseBytes: number;
   substrate?: string;
   blobPolicy?: BlobFetchPolicy;
+  /** Background blob fetch queue: max concurrent fetches. Default 4. */
+  blobFetchConcurrency?: number;
+  /** Background blob fetch queue: max in-flight bytes (admission budget). Default 96 MiB. */
+  maxInFlightBlobBytes?: number;
+  /** Background blob fetch queue: max typed-retry attempts before parking. Default 4. */
+  blobFetchMaxRetries?: number;
+  /** Background blob fetch queue: heal-retry tick (ms) for re-trying parked failures. Default 45000. */
+  blobRetryTickMs?: number;
   /** Index-stamp bump debounce (ms). Default 1500; tests pass 0 (immediate, microtask). */
   stampDebounceMs?: number;
   /**
@@ -107,6 +115,11 @@ const DEFAULT_RENAME_SETTLE_MS = 60;
 /** Default M3 live-rename coalescer debounce + cap (ms) — see {@link EngineConfig.renameWindowMs}. */
 const DEFAULT_RENAME_WINDOW_MS = 300;
 const DEFAULT_RENAME_WINDOW_CAP_MS = 1000;
+/** Defaults for the BlobEngine's bounded fetch queue (blob-fetch orchestration, P1). */
+const DEFAULT_BLOB_CONCURRENCY = 4;
+const DEFAULT_MAX_INFLIGHT_BLOB_BYTES = 96 * 1024 * 1024;
+const DEFAULT_BLOB_MAX_RETRIES = 4;
+const DEFAULT_BLOB_RETRY_TICK_MS = 45_000;
 
 /**
  * An unmatched-lost entry (live prose, file absent, base present, NOT a rename) DEFERRED past the
@@ -536,6 +549,14 @@ export class SyncEngine {
       echo: this.echo,
       identity,
       policy: this.config.blobPolicy ?? "lazy",
+      clock: this.ports.clock,
+      concurrency: this.config.blobFetchConcurrency ?? DEFAULT_BLOB_CONCURRENCY,
+      maxInFlightBytes: this.config.maxInFlightBlobBytes ?? DEFAULT_MAX_INFLIGHT_BLOB_BYTES,
+      maxRetries: this.config.blobFetchMaxRetries ?? DEFAULT_BLOB_MAX_RETRIES,
+      retryTickMs: this.config.blobRetryTickMs ?? DEFAULT_BLOB_RETRY_TICK_MS,
+      onBlobFailure: (paths) => {
+        this.surfaceBlobFailures(paths);
+      },
     });
     this.blobUnsub = this.blobEngine.start();
 
@@ -999,28 +1020,6 @@ export class SyncEngine {
       if (entry.deleted !== true) continue;
       if ((await this.ports.vault.read(path)) !== null) pending.add(entry.docId);
     }
-    // UN-MATERIALIZED BLOB (0b-3 Fix 3): under EAGER policy, a manifest entry whose bytes are
-    // NOT on this device's disk (file absent, OR on-disk sha ≠ the manifest sha) has not finished
-    // syncing — the fire-and-forget `materialize` may still be in flight. Without this, an eager
-    // follower's `waitConverged` declares quiescence while a manifest-advertised blob is still
-    // missing from disk (the Fix-3 bug: blob reaches the server store but never lands on the
-    // follower, yet pendingDocs reports 0). The blob manifest carries no DocId, so we add a stable DIAGNOSTIC token
-    // (`blob:<path>`) — pendingDocs is consumed only by `.length`/`.join` (count + the
-    // waitConverged stuck-dump), never resolved back to a doc, so the synthetic id names
-    // the stuck blob in a failure dump. READ-ONLY: reads the manifest + vault, writes
-    // NOTHING (loop discipline preserved — see pendingDocs' contract above).
-    // POLICY-AWARE (0b-3 Fix): only an EAGER device's un-materialized blob is pending — its
-    // fire-and-forget `materialize` is still in flight, so quiescence must wait for the bytes to
-    // land. A LAZY device defers fetch until access BY DESIGN: it HAS the manifest and will fetch
-    // on read, so an un-materialized advertised blob IS converged for it (counting it would hang
-    // a lazy follower's waitConverged forever). READ-ONLY: reads manifest + vault, writes nothing.
-    if ((this.config.blobPolicy ?? "lazy") === "eager") {
-      for (const [path, entry] of this.blobManifestEntries()) {
-        const bytes = await this.ports.vault.read(path);
-        const diskSha = bytes === null ? null : await sha256OfBytes(bytes);
-        if (diskSha !== entry.sha256) pending.add(`blob:${path}` as DocId);
-      }
-    }
     // OPEN RENAME TRANSACTION (0b-3): a rename whose bounded settle window has not yet
     // fired is in-flight — quiescence must wait so `waitConverged` does not declare
     // convergence while the watcher's async fallout is still quarantined (and before the
@@ -1041,12 +1040,42 @@ export class SyncEngine {
 
   /**
    * READ-ONLY snapshot of the blob manifest (the index `blobs` map), via the
-   * {@link BlobEngine}. Used by {@link pendingDocs} to detect a manifest-advertised
-   * blob whose bytes have not yet materialized onto this device's disk. PURE READ —
+   * {@link BlobEngine}. A pure manifest snapshot for tests / the blob-state surface —
+   * NO LONGER consumed by {@link pendingDocs} (blobs were decoupled from prose
+   * convergence; the background queue is the sole eager materialize driver). PURE READ —
    * never mutates the manifest, so it is safe on the convergence loop.
    */
   blobManifestEntries(): [VaultPath, BlobManifestEntry][] {
     return this.blobEngine.manifestEntries();
+  }
+
+  /**
+   * ONE aggregate inbox item for ALL parked blob failures (never per-path spam). Called by the
+   * BlobFetchQueue whenever its parked-failure set changes. Empty set => resolve (tombstone) it.
+   */
+  private surfaceBlobFailures(paths: VaultPath[]): void {
+    const [first] = paths;
+    if (first === undefined) {
+      this.inbox.resolve("blob:sync-failed");
+      return;
+    }
+    const sample = paths.slice(0, 3).join(", ");
+    this.inbox.add({
+      id: "blob:sync-failed",
+      kind: "conflict",
+      path: first,
+      detail: `${String(paths.length)} file(s) could not sync (e.g. ${sample}). Will retry.`,
+    });
+  }
+
+  /** Background blob fetch progress (materialized / total advertised / parked-failed). */
+  blobProgress(): { materialized: number; total: number; failed: number } {
+    return this.blobEngine.blobProgress();
+  }
+
+  /** True once every advertised blob is materialized-or-parked (no queued/in-flight/retry). */
+  blobsSettled(): boolean {
+    return this.blobEngine.blobsSettled();
   }
 
   /**
@@ -1057,7 +1086,6 @@ export class SyncEngine {
   async waitConverged(): Promise<void> {
     const MAX_ROUNDS = 50;
     for (let round = 0; round < MAX_ROUNDS; round++) {
-      await this.drainEagerBlobs();
       await this.whenIdle();
       // S7: recover ORPHANS (concurrent-create losers) before the convergence check. They are NOT
       // live entries and are in NO backstop set, so pendingDocs + the backstop sets cannot represent
@@ -1093,7 +1121,6 @@ export class SyncEngine {
       // Stage 4a: uses runFullConvergencePass() — the named full-chain entry point.
       // waitConverged MUST always run the FULL chain (never the scoped hot path).
       await this.runFullConvergencePass();
-      await this.drainEagerBlobs();
       await this.whenIdle();
       // S6a: same backstop check on the second idle in each round.
       if (
@@ -1108,36 +1135,6 @@ export class SyncEngine {
     throw new Error(
       `waitConverged: did not settle after ${String(MAX_ROUNDS)} rounds: ${stuck.join(", ")}`,
     );
-  }
-
-  /**
-   * EAGER-BLOB CONVERGENCE DRIVER (0b-3 loop fix). The BlobEngine drives eager fetches via an
-   * UNTRACKED fire-and-forget `void onManifestChange(...)` (manifest observe + the initial sweep),
-   * so {@link whenIdle} — which only drains TRACKED inflight work — does not await it. Previously
-   * the now-removed materialize feedback SPIN happened to keep re-driving it across waitConverged
-   * rounds; with the spin gone, a single eager materialize could still be mid-flight (its
-   * `crypto.subtle.digest` resolves on a macrotask) when waitConverged samples pendingDocs.
-   *
-   * So waitConverged AWAITS this deterministic, idempotent pass: for an EAGER engine, materialize
-   * every manifest entry whose disk sha lags the manifest sha. LOOP-SAFE: {@link
-   * BlobEngine.materialize} short-circuits when disk already matches (no fetch, no write) and is
-   * echo-guarded; it writes ONLY `vault.writeAtomic` (never the manifest/index/inbox), so it
-   * cannot re-publish or relay. Lazy is a no-op here (lazy defers fetch by design). A materialize
-   * that rejects (corrupt blob / missing bytes) is swallowed — the still-mismatched disk keeps the
-   * entry pending so waitConverged surfaces it as a non-settle rather than crashing the loop.
-   */
-  private async drainEagerBlobs(): Promise<void> {
-    if ((this.config.blobPolicy ?? "lazy") !== "eager") return;
-    for (const [path, entry] of this.blobManifestEntries()) {
-      const bytes = await this.ports.vault.read(path);
-      const diskSha = bytes === null ? null : await sha256OfBytes(bytes);
-      if (diskSha === entry.sha256) continue; // already materialized — idempotent skip.
-      try {
-        await this.blobEngine.materialize(path);
-      } catch {
-        // Corrupt/missing bytes: leave disk as-is; pendingDocs keeps the entry pending.
-      }
-    }
   }
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -3564,8 +3561,8 @@ export class SyncEngine {
         // `BlobEngine.materialize` echo-records the sha IMMEDIATELY before its `vault.writeAtomic`,
         // so the resulting fs "modify" event lands here as the echo of our OWN materialize. Without
         // this guard, re-publishing via `onLocalBlobWrite` re-stamps the manifest under THIS device
-        // (origin "local-bridge", which the transport RELAYS) → observe → onManifestChange →
-        // materialize → write → fs event → … an unbounded feedback loop that floods disk + the
+        // (origin "local-bridge", which the transport RELAYS) → observe → the background fetch
+        // queue enqueues → materialize → write → fs event → … an unbounded feedback loop that floods disk + the
         // relay. If this write is that echo, SKIP: do NOT re-publish. The shared EchoLedger is
         // multi-entry/consume-once, used here exactly as ingest uses it. (`writeHash` is the
         // blob's sha — already computed above for the rename-transaction check.)

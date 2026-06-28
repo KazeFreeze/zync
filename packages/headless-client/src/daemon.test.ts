@@ -295,6 +295,19 @@ describe("headless-client daemon control API", () => {
     expect(m.docStoreBytes).toBeGreaterThanOrEqual(0);
   });
 
+  it("/status exposes a blobs progress object (materialized/total/failed + settled)", async () => {
+    await boot();
+    await post("/sync/start");
+
+    const blobs = (await get("/status")).json as {
+      blobs: { materialized: number; total: number; failed: number; settled: boolean };
+    };
+    expect(typeof blobs.blobs.materialized).toBe("number");
+    expect(typeof blobs.blobs.total).toBe("number");
+    expect(typeof blobs.blobs.failed).toBe("number");
+    expect(typeof blobs.blobs.settled).toBe("boolean");
+  });
+
   it("/doc 404s for an unknown path with no file", async () => {
     await boot();
     await post("/sync/start");
