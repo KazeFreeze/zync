@@ -174,6 +174,11 @@ export class Device {
     return this.postOk("/fs/delete", { path });
   }
 
+  /** Resolve a content conflict via the engine's resolveContentConflict (keep-current | keep-backup). */
+  resolveContentConflict(id: string, action: "keep-current" | "keep-backup"): Promise<void> {
+    return this.postOk("/inbox/resolve-content", { id, action });
+  }
+
   // -- reads -----------------------------------------------------------------
 
   async read(path: string): Promise<string> {

@@ -50,6 +50,10 @@ export { conflictArtifactPath, writeConflictArtifact } from "./conflicts/artifac
 export { Inbox } from "./conflicts/inbox.js";
 export type { InboxEntry, InboxKind } from "./conflicts/inbox.js";
 export { supervisedImport } from "./conflicts/supervised-import.js";
+export { ArtifactNotLocalError } from "./conflicts/resolve.js";
+export type { ResolveAction } from "./conflicts/resolve.js";
+export { describeInboxEntry, isActionableConflict } from "./conflicts/entry-view.js";
+export type { EntryView, EntryAction, EntryActionSpec } from "./conflicts/entry-view.js";
 export { SyncEngine, AUDIT_QUIESCENCE_MS, AUDIT_MAX_STALENESS_MS } from "./engine.js";
 export type { EnginePorts, EngineConfig } from "./engine.js";
 export { BlobEngine } from "./blobs/blob-engine.js";

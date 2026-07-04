@@ -130,6 +130,8 @@ async function handle(deps: ControlApiDeps, req: http.IncomingMessage): Promise<
       return fsRename(deps, await readJson(req));
     case "POST /fs/delete":
       return fsDelete(deps, await readJson(req));
+    case "POST /inbox/resolve-content":
+      return inboxResolveContent(deps, await readJson(req));
     case "GET /fs/read":
       return fsRead(deps, url);
     case "GET /fs/tree":
@@ -349,6 +351,17 @@ async function fsDelete(deps: ControlApiDeps, raw: unknown): Promise<JsonRespons
   const body = raw as FsDeleteBody;
   if (typeof body.path !== "string") throw new HttpError(400, "path is required");
   await deps.vault.remove(vp(body.path));
+  return { status: 200, body: { ok: true } };
+}
+
+interface InboxResolveContentBody {
+  id: string;
+  action: "keep-current" | "keep-backup";
+}
+
+async function inboxResolveContent(deps: ControlApiDeps, raw: unknown): Promise<JsonResponse> {
+  const { id, action } = raw as InboxResolveContentBody;
+  await deps.engine.resolveContentConflict(id, action);
   return { status: 200, body: { ok: true } };
 }
 

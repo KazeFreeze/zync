@@ -1,0 +1,160 @@
+/* Zync conflict-inbox modal (ConflictInboxModal). Theme-aware via Obsidian CSS variables. */
+
+.zync-inbox-modal {
+  width: min(540px, 92vw);
+}
+
+/* Top bar: count + bulk actions */
+.zync-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 10px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.zync-count {
+  font-size: var(--font-smaller);
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.zync-topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* List of compact rows (one per entry, divided — no boxes) */
+.zync-list {
+  display: flex;
+  flex-direction: column;
+}
+.zync-row {
+  padding: 11px 0;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.zync-row:last-child {
+  border-bottom: none;
+}
+
+.zync-row-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.zync-row-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0; /* allow the name to ellipsize */
+}
+.zync-row-name {
+  font-weight: var(--font-semibold);
+  color: var(--text-normal);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.zync-row-act {
+  flex: none;
+  display: flex;
+  gap: 6px;
+}
+
+.zync-row-sub {
+  color: var(--text-muted);
+  font-size: var(--font-smaller);
+  line-height: 1.5;
+  margin-top: 4px;
+}
+.zync-dot {
+  margin: 0 5px;
+  opacity: 0.5;
+}
+.zync-inline-link {
+  color: var(--text-accent);
+  cursor: pointer;
+  text-decoration: none;
+}
+.zync-inline-link:hover {
+  text-decoration: underline;
+}
+
+/* Kind chip */
+.zync-chip {
+  flex: none;
+  font-size: var(--font-smaller);
+  font-weight: var(--font-medium);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-radius: var(--radius-s);
+  padding: 1px 7px;
+  background: var(--background-modifier-hover);
+  color: var(--text-muted);
+}
+.zync-chip[data-kind="conflict"] {
+  background: rgba(var(--color-red-rgb), 0.15);
+  color: var(--color-red);
+}
+.zync-chip[data-kind="supervised-import"] {
+  background: rgba(var(--color-blue-rgb), 0.15);
+  color: var(--color-blue);
+}
+.zync-chip[data-kind="pending-delete"] {
+  background: rgba(var(--color-orange-rgb), 0.15);
+  color: var(--color-orange);
+}
+.zync-chip[data-kind="resurrected"] {
+  background: rgba(var(--color-green-rgb), 0.15);
+  color: var(--color-green);
+}
+
+/* Compact buttons */
+.zync-btn {
+  cursor: pointer;
+}
+.zync-btn-sm {
+  padding: 4px 11px;
+  font-size: var(--font-ui-smaller);
+  box-shadow: none;
+}
+.zync-btn-link {
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-muted);
+}
+.zync-btn-link:hover {
+  background: transparent;
+  color: var(--text-normal);
+  text-decoration: underline;
+}
+
+/* Empty state */
+.zync-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  padding: 28px 16px 20px;
+  color: var(--text-muted);
+}
+.zync-empty-icon {
+  color: var(--color-green);
+  margin-bottom: 8px;
+}
+.zync-empty-icon svg {
+  width: 32px;
+  height: 32px;
+}
+.zync-empty-title {
+  font-weight: var(--font-semibold);
+  color: var(--text-normal);
+  margin: 0 0 2px;
+}
+.zync-empty-sub {
+  margin: 0;
+  font-size: var(--font-ui-small);
+}

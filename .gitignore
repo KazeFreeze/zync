@@ -11,6 +11,9 @@ build/
 # docs/superpowers/notes/2026-06-17-zync-m1-dev-loop-runbook.md
 .zync-dev/
 
+# brainstorming visual-companion mockups (transient HTML/state; local-only scratch)
+.superpowers/
+
 # logs / os
 *.log
 .DS_Store

@@ -1,5 +1,12 @@
 import { Plugin, PluginSettingTab, Setting, Notice, type App } from "obsidian";
-import { SyncEngine, type ClockPort, type DeviceId, type IdentityPort } from "@zync/core";
+import {
+  SyncEngine,
+  isActionableConflict,
+  type ClockPort,
+  type DeviceId,
+  type IdentityPort,
+} from "@zync/core";
+import { ConflictInboxModal } from "./conflict-inbox-modal.js";
 import { YjsCrdtProvider, HocuspocusTransport } from "@zync/crdt-yjs";
 import { HttpBlobStore } from "@zync/blob-http";
 import {
@@ -78,6 +85,9 @@ export default class ZyncPlugin extends Plugin {
   private readonly unsubs: (() => void)[] = [];
   private connText = "offline";
   private lastConflictCount = 0;
+  /** True only AFTER engine.start() completes. Gates status-bar reads of blobProgress()/inbox —
+   *  both are undefined until start() finishes, and onStatus can drive renderStatus mid-start. */
+  private engineReady = false;
   /** Per-session port timing (recreated each startEngine); dumped by "Zync: dump bootstrap profile". */
   private profiler: PortProfiler | null = null;
 
@@ -85,13 +95,18 @@ export default class ZyncPlugin extends Plugin {
     await this.loadSettings();
     this.statusBar = this.addStatusBarItem();
     this.renderStatus(0);
+    if (this.statusBar !== null) {
+      this.statusBar.style.cursor = "pointer";
+      this.statusBar.addEventListener("click", () => this.openInbox());
+    }
 
     this.addSettingTab(new ZyncSettingTab(this.app, this));
     this.addCommand({
+      // id kept stable (avoids breaking any saved hotkey); the name reflects the browse+resolve inbox.
       id: "zync-show-conflicts",
-      name: "Zync: show sync conflicts",
+      name: "Zync: open sync inbox",
       callback: () => {
-        this.showConflicts();
+        this.openInbox();
       },
     });
     this.addCommand({
@@ -176,6 +191,7 @@ export default class ZyncPlugin extends Plugin {
       );
 
       await engine.start();
+      this.engineReady = true; // blobProgress()/inbox are now valid to read from renderStatus
 
       // Surface sync conflicts as they land.
       this.unsubs.push(
@@ -200,12 +216,13 @@ export default class ZyncPlugin extends Plugin {
       console.error("[zync] failed to start engine:", err);
       this.connText = "error";
       this.renderStatus(0);
-      new Notice(`Zync: failed to start — ${err instanceof Error ? err.message : String(err)}`);
+      new Notice(`Zync: failed to start. ${err instanceof Error ? err.message : String(err)}`);
       await this.stopEngine();
     }
   }
 
   private async stopEngine(): Promise<void> {
+    this.engineReady = false; // stop reading blobProgress()/inbox during + after teardown
     if (this.statusTimer !== null) {
       window.clearInterval(this.statusTimer);
       this.statusTimer = null;
@@ -277,38 +294,38 @@ export default class ZyncPlugin extends Plugin {
   }
 
   private renderStatus(pending: number): void {
-    const b = this.engine?.blobProgress();
-    // Show "Files M/N" only while blobs are still materializing. Clamp M to N defensively:
-    // `materialized` is a cumulative counter and can momentarily exceed the live `total` on a
-    // re-targeted blob, which would otherwise render "152/150".
+    // blobProgress() and inbox are only valid once start() completes; onStatus can drive
+    // renderStatus mid-start, so gate both reads on engineReady (else they throw on undefined).
+    const engine = this.engineReady ? this.engine : null;
+    const b = engine?.blobProgress();
     const files =
       b && b.total > 0 && b.materialized < b.total
         ? ` · Files ${String(Math.min(b.materialized, b.total))}/${String(b.total)}` +
           (b.failed > 0 ? ` (${String(b.failed)} failed)` : "")
         : "";
+    const nConf = engine ? engine.inbox.list().filter(isActionableConflict).length : 0;
+    const conf = nConf > 0 ? ` · ⚠ ${String(nConf)}` : "";
     this.statusBar?.setText(
-      `Zync: ${this.connText}${pending > 0 ? ` · ${String(pending)} pending` : ""}${files}`,
+      `Zync: ${this.connText}${pending > 0 ? ` · ${String(pending)} pending` : ""}${files}${conf}`,
     );
   }
 
   private refreshConflictNotice(): void {
-    // The inbox observe fires on every index/inbox mutation — Notice ONLY when the count GROWS, so a
-    // burst of conflicts (or unrelated index churn) doesn't spam escalating popups.
-    const n = this.engine?.inbox.list().length ?? 0;
+    // Notice ONLY when the actionable count GROWS, so churn/FYIs don't spam escalating popups.
+    const n = this.engine?.inbox.list().filter(isActionableConflict).length ?? 0;
     if (n > this.lastConflictCount) {
-      new Notice(`Zync: ${String(n)} sync conflict(s) — run "Zync: show sync conflicts".`);
+      new Notice(`Zync: ${String(n)} item(s) need attention. Click the status bar.`);
     }
     this.lastConflictCount = n;
+    this.renderStatus(this.lastPending); // push the badge without waiting for the coarse poll
   }
 
-  private showConflicts(): void {
-    const entries = this.engine?.inbox.list() ?? [];
-    if (entries.length === 0) {
-      new Notice("Zync: no sync conflicts.");
+  private openInbox(): void {
+    if (this.engine === null) {
+      new Notice("Zync: sync not started.");
       return;
     }
-    const lines = entries.map((e) => `• [${e.kind}] ${e.path}`).join("\n");
-    new Notice(`Zync conflicts (${String(entries.length)}):\n${lines}`, 10_000);
+    new ConflictInboxModal(this.app, this.engine).open();
   }
 
   // ── settings ───────────────────────────────────────────────────────────────
@@ -341,7 +358,7 @@ class ZyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Relay URL (WebSocket)")
-      .setDesc("e.g. ws://localhost:1234 — the @zync/server relay.")
+      .setDesc("e.g. ws://localhost:1234 (the @zync/server relay).")
       .addText((t) =>
         t
           .setPlaceholder("ws://localhost:1234")
@@ -354,7 +371,7 @@ class ZyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Blob URL (HTTP)")
-      .setDesc("e.g. http://localhost:8080 — the content-addressed blob endpoint.")
+      .setDesc("e.g. http://localhost:8080 (the content-addressed blob endpoint).")
       .addText((t) =>
         t
           .setPlaceholder("http://localhost:8080")

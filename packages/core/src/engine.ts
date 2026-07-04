@@ -39,6 +39,7 @@ import { makeStamp, stampHash, stampsEqual } from "./protocol/stamp.js";
 import { BlobEngine, type BlobFetchPolicy, type BlobManifestEntry } from "./blobs/blob-engine.js";
 import { Inbox } from "./conflicts/inbox.js";
 import { conflictArtifactPath, writeConflictArtifact } from "./conflicts/artifact.js";
+import { ArtifactNotLocalError, type ResolveAction } from "./conflicts/resolve.js";
 import { canonicalizeProse, sha256OfBytes, sha256OfText } from "./hash.js";
 import { diffToEdits, merge3 } from "./bridge/merge.js";
 
@@ -935,6 +936,110 @@ export class SyncEngine {
     for (const e of this.inbox.list()) {
       if (e.kind === "pending-delete" && e.path === path) this.inbox.resolve(e.id);
     }
+  }
+
+  /**
+   * Resolve a CONTENT conflict (kind `conflict`/`supervised-import` carrying an `artifactPath`):
+   * `keep-current` discards the backup; `keep-backup` adopts the backup as the live note. Both
+   * then tombstone the inbox entry. Idempotent/re-entrant (safe on double-click). Throws
+   * {@link ArtifactNotLocalError} on a device where the backup file is absent (a non-authoring
+   * peer) — the caller offers acknowledge-only there. NOT for pending-delete/resurrected/notice
+   * entries (use confirmPendingDelete/dismissPendingDelete/inbox.resolve).
+   */
+  async resolveContentConflict(id: string, action: ResolveAction): Promise<void> {
+    const entry = this.inbox.list().find((e) => e.id === id);
+    if (entry === undefined) return; // unknown / already resolved — idempotent no-op
+    if (
+      entry.artifactPath === undefined ||
+      (entry.kind !== "conflict" && entry.kind !== "supervised-import")
+    ) {
+      throw new Error(`resolveContentConflict: ${id} is not a content conflict`);
+    }
+    const artifactPath = entry.artifactPath;
+    if (artifactPath === entry.path) {
+      throw new Error(
+        `resolveContentConflict: ${id} artifactPath equals the live path (malformed entry)`,
+      );
+    }
+    const bytes = await this.ports.vault.read(artifactPath);
+    if (bytes === null) throw new ArtifactNotLocalError(artifactPath);
+
+    if (action === "keep-backup") {
+      const doc = await this.ensureNoteAttached(entry.path);
+      if (doc === undefined) {
+        throw new Error(`resolveContentConflict: live doc for ${entry.path} unavailable`);
+      }
+      const backupText = canonicalizeProse(decode(bytes));
+      const crdtText = doc.getText();
+      if (backupText !== crdtText) {
+        doc.applyEdits(diffToEdits(crdtText, backupText), "local-bridge");
+      }
+      await this.adoptBackupIntoLive(doc, entry.path, backupText);
+    }
+    await this.deleteConflictArtifact(artifactPath);
+    this.inbox.resolve(id);
+  }
+
+  /**
+   * Delete a resolved conflict's backup artifact SAFELY. The common emitConflict/supervised-import
+   * artifact is UNBOUND (a bare disk file, no index entry) → a plain local remove. A bound artifact
+   * (e.g. after a bootstrap seed re-bound it) is tombstoned with the SAME materializedHash-guarded
+   * discipline as {@link confirmPendingDelete} — never a fallback hash, or a peer that edited it
+   * would RESURRECT it. If a bound artifact has no confirmed materializedHash yet, leave the file
+   * (byte-safe) rather than lay an unsafe tombstone.
+   */
+  private async deleteConflictArtifact(artifactPath: VaultPath): Promise<void> {
+    const entry = this.index.get(artifactPath);
+    if (entry === undefined || entry.deleted === true) {
+      this.echo.clear(artifactPath);
+      await this.ports.vault.remove(artifactPath);
+      return;
+    }
+    const rec = await this.base.load(entry.docId);
+    const cur = this.index.get(artifactPath); // re-read after the await (concurrent resolve)
+    if (cur === undefined || cur.deleted === true) return;
+    if (rec?.materializedHash === undefined) return; // cannot tombstone safely → leave the file
+    await this.tombstoneAndCleanup(artifactPath, cur.docId, cur.type, rec.materializedHash);
+    await this.ports.vault.remove(artifactPath);
+  }
+
+  /**
+   * Adopt `backupText` (already applied to `doc`'s CRDT by the caller) as the live note at `path`,
+   * converging disk + base + index (+ relay, automatic via the transport). A PURE overwrite: unlike
+   * reconcileDirtyDoc it does NOT merge the current disk — "keep backup" DISCARDS the live winner, so
+   * the doc's text is authoritative. Mirrors the base-before-file + lagging-acked + dirty-before-base
+   * discipline of ingest/outbound.
+   */
+  private async adoptBackupIntoLive(
+    doc: CrdtDoc,
+    path: VaultPath,
+    backupText: string,
+  ): Promise<void> {
+    const newHash = await sha256OfText(backupText);
+    const prior = await this.base.load(doc.id);
+    // dirty BEFORE base (crash-ordering): never leave the base advanced-but-not-dirty (a wedge).
+    await this.ports.engineState.markDirty(doc.id);
+    // base BEFORE file (torn-pair). Keep the acked/recovery base LAGGING — this push is not yet acked.
+    await this.base.save(doc.id, {
+      baseText: backupText,
+      fileHash: newHash,
+      crdtToken: doc.encodeStateVector(),
+      substrate: this.substrate,
+      ackedText: prior?.ackedText ?? "",
+      ackedHash: prior?.ackedHash ?? (await sha256OfText("")),
+      materializedHash: newHash,
+    });
+    // keep-backup is a DELIBERATE overwrite: always materialize the backup to disk (echo-guarded),
+    // EVEN when the note is active-bound. applyEdits already set the editor's Y.Text to the backup, so
+    // disk == the editor buffer (no divergence/loss). Writing now — rather than deferring to the
+    // editor's autosave — closes a window where a reconcileDirtyDoc firing pre-autosave would compute
+    // merge3(acked, disk=winner, crdt=backup) and re-introduce the discarded winner (when the winner
+    // was an unpushed local edit). The editor stays bound to the Y.Text, so this cannot lose edits.
+    this.echo.recordWrite(path, newHash);
+    await this.ports.vault.writeAtomic(path, utf8(backupText));
+    await this.ports.docStore.save(doc.id, doc.encodeSnapshot());
+    // Bump the index tree stamp so peers converge on the adopted content (the seam ingest uses).
+    this.scheduleBump(path, doc.id, "crdt-prose", newHash);
   }
 
   /**
