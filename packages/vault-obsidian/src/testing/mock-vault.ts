@@ -21,7 +21,7 @@ interface FileRec {
   ctime: number;
 }
 
-type VaultEventName = "create" | "modify" | "delete" | "rename";
+type VaultEventName = "create" | "modify" | "delete" | "rename" | "raw";
 
 const enc = (s: string): Uint8Array => new TextEncoder().encode(s);
 const dec = (u: Uint8Array): string => new TextDecoder().decode(u);
@@ -55,6 +55,11 @@ export interface MockVaultExternal {
   hiddenPut(path: string, data: string | Uint8Array): void;
   /** Inspect raw stored bytes (null if absent). */
   peek(path: string): Uint8Array | null;
+  /**
+   * Fire a `"raw"` vault event for `path` (simulates Obsidian's config-zone DataAdapter watcher).
+   * Used to test ObsidianConfigPort.onChange filtering without writing to disk.
+   */
+  raw(path: string): void;
 }
 
 export interface MockVault {
@@ -73,6 +78,7 @@ export function createMockVault(): MockVault {
     modify: new Set(),
     delete: new Set(),
     rename: new Set(),
+    raw: new Set(),
   };
 
   // Deterministic monotonic clock for default mtimes (explicit DataWriteOptions.mtime overrides it).
@@ -159,6 +165,31 @@ export function createMockVault(): MockVault {
       if (folders.has(path))
         return Promise.resolve({ type: "folder", mtime: 0, ctime: 0, size: 0 });
       return Promise.resolve(null);
+    },
+    /**
+     * List immediate children of `path`. Returns `{ files, folders }` where each entry is a
+     * full vault-relative path. Matches the Obsidian DataAdapter.list contract.
+     */
+    list: (path: string): Promise<{ files: string[]; folders: string[] }> => {
+      const prefix = `${path}/`;
+      const fileList: string[] = [];
+      const folderSet = new Set<string>();
+      for (const filePath of files.keys()) {
+        if (!filePath.startsWith(prefix)) continue;
+        const rest = filePath.slice(prefix.length);
+        const slash = rest.indexOf("/");
+        if (slash === -1) {
+          fileList.push(filePath);
+        } else {
+          folderSet.add(`${prefix}${rest.slice(0, slash)}`);
+        }
+      }
+      for (const folderPath of folders) {
+        if (!folderPath.startsWith(prefix)) continue;
+        const rest = folderPath.slice(prefix.length);
+        if (!rest.includes("/")) folderSet.add(folderPath);
+      }
+      return Promise.resolve({ files: fileList, folders: [...folderSet] });
     },
   };
 
@@ -272,6 +303,9 @@ export function createMockVault(): MockVault {
       hidden.add(path);
     },
     peek: (path) => files.get(path)?.data ?? null,
+    raw: (path) => {
+      fire("raw", path);
+    },
   };
 
   return { vault: vault as unknown as Vault, external };

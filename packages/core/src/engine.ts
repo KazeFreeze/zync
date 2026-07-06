@@ -15,8 +15,13 @@ import type {
   Unsubscribe,
   VaultEvent,
   VaultPath,
+  ConfigPort,
 } from "./ports.js";
 import { INDEX_DOC_ID } from "./ports.js";
+import { ConfigChannel } from "./config/config-channel.js";
+import { RoutedManifest } from "./config/routed-manifest.js";
+import { RoutedVault } from "./config/routed-vault.js";
+import { configCategoryOf, isConfigZone, type ConfigEntry } from "./config/config-entry.js";
 import type { Route } from "./classify/classify.js";
 import { classify, type Caps } from "./classify/classify.js";
 import { EchoLedger } from "./bridge/echo.js";
@@ -39,7 +44,11 @@ import { makeStamp, stampHash, stampsEqual } from "./protocol/stamp.js";
 import { BlobEngine, type BlobFetchPolicy, type BlobManifestEntry } from "./blobs/blob-engine.js";
 import { Inbox } from "./conflicts/inbox.js";
 import { conflictArtifactPath, writeConflictArtifact } from "./conflicts/artifact.js";
-import { ArtifactNotLocalError, type ResolveAction } from "./conflicts/resolve.js";
+import {
+  ArtifactNotLocalError,
+  type ResolveAction,
+  type ResolveConfigAction,
+} from "./conflicts/resolve.js";
 import { canonicalizeProse, sha256OfBytes, sha256OfText } from "./hash.js";
 import { diffToEdits, merge3 } from "./bridge/merge.js";
 
@@ -52,6 +61,7 @@ export interface EnginePorts {
   clock: ClockPort;
   identity: IdentityPort;
   engineState: EngineStateStore;
+  config?: ConfigPort;
 }
 
 export interface EngineConfig {
@@ -101,6 +111,13 @@ export interface EngineConfig {
    * make it a SECOND write authority for every note (a sync loop + duplicate origin).
    */
   ingestDisabled?: boolean;
+  /**
+   * Per-category config-zone sync toggle. When absent, BOTH categories are enabled
+   * (back-compat: existing engine constructions without this field behave as before).
+   * Publish and materialize both respect this policy: a disabled category is never
+   * uploaded from this device and never downloaded/materialized onto it.
+   */
+  configCategories?: { themes: boolean; snippets: boolean };
 }
 
 const utf8 = (s: string): Uint8Array => new TextEncoder().encode(s);
@@ -252,6 +269,8 @@ export class SyncEngine {
   private outbound!: OutboundPipeline;
   private lazyAttach!: LazyAttachManager;
   private blobEngine!: BlobEngine;
+  private configChannel: ConfigChannel | undefined;
+  private configUnsub: Unsubscribe = () => undefined;
 
   // ── subscriptions to unwind on stop() ───────────────────────────────────
   private vaultUnsub: Unsubscribe | null = null;
@@ -542,11 +561,29 @@ export class SyncEngine {
       this.swallowOfflineSynced(this.indexAttached);
     }
 
-    // 2. Blob engine over the index `blobs` map.
+    // 2. Blob engine over the index `blobs` map (+ optional config map via RoutedManifest).
+    const blobsMap = indexDoc.getMap<BlobManifestEntry>("blobs");
+    const configMap = indexDoc.getMap<ConfigEntry>("config");
+    // Resolve per-category policy once: absent => both enabled (back-compat).
+    const cats = this.config.configCategories ?? { themes: true, snippets: true };
+    const configPort = this.ports.config;
+    if (configPort !== undefined) {
+      this.configChannel = new ConfigChannel({
+        config: configMap,
+        blobStore: this.ports.blobs,
+        configPort,
+        identity,
+        echo: this.echo,
+        enabledCategories: cats,
+      });
+      this.configUnsub = this.configChannel.start();
+      await this.configChannel.bootstrap();
+    }
     this.blobEngine = new BlobEngine({
-      manifest: indexDoc.getMap<BlobManifestEntry>("blobs"),
+      manifest: configPort !== undefined ? new RoutedManifest(blobsMap, configMap, cats) : blobsMap,
       blobStore: this.ports.blobs,
-      vault: this.ports.vault,
+      vault:
+        configPort !== undefined ? new RoutedVault(this.ports.vault, configPort) : this.ports.vault,
       echo: this.echo,
       identity,
       policy: this.config.blobPolicy ?? "lazy",
@@ -558,6 +595,14 @@ export class SyncEngine {
       onBlobFailure: (paths) => {
         this.surfaceBlobFailures(paths);
       },
+      ...(configPort !== undefined
+        ? {
+            onDivergence: (path, info) => this.onConfigDivergence(path, info),
+            onMaterialized: (path, sha256) => {
+              if (isConfigZone(path)) void this.ports.engineState.setConfigBase(path, sha256);
+            },
+          }
+        : {}),
     });
     this.blobUnsub = this.blobEngine.start();
 
@@ -744,6 +789,9 @@ export class SyncEngine {
     this.indexUnsub = null;
     this.blobUnsub = null;
     this.transportUnsub = null;
+    this.configUnsub();
+    this.configUnsub = () => undefined;
+    this.configChannel = undefined;
 
     for (const pending of this.pendingBumps.values()) {
       if (pending.timer !== null) clearTimeout(pending.timer);
@@ -978,6 +1026,58 @@ export class SyncEngine {
     }
     await this.deleteConflictArtifact(artifactPath);
     this.inbox.resolve(id);
+  }
+
+  /**
+   * Resolve a CONFIG-FILE conflict (kind `config-file`): `keep-mine` writes local bytes back to
+   * disk + publishes the local sha to the config map; `keep-theirs` fetches the remote bytes from
+   * the blob store, writes them to disk, and publishes the remote sha. Both paths update the config
+   * map so all devices converge on the winner. The write is echo-guarded (via a direct
+   * `config.writeAtomic` call, NOT blobEngine.materialize) to avoid re-triggering
+   * onConfigDivergence. Idempotent: a no-op if the entry is already resolved.
+   */
+  async resolveConfigConflict(id: string, action: ResolveConfigAction): Promise<void> {
+    const entry = this.inbox.list().find((e) => e.id === id);
+    if (entry === undefined) return; // idempotent
+    if (
+      entry.kind !== "config-file" ||
+      entry.localSha === undefined ||
+      entry.remoteSha === undefined
+    ) {
+      throw new Error(`resolveConfigConflict: ${id} is not a config-file conflict`);
+    }
+    const category = configCategoryOf(entry.path);
+    if (category === undefined)
+      throw new Error(`resolveConfigConflict: not a config path: ${entry.path}`);
+    if (this.ports.config === undefined) throw new Error("resolveConfigConflict: no config port");
+    const winner = action === "keep-mine" ? entry.localSha : entry.remoteSha;
+    const size = action === "keep-mine" ? (entry.localSize ?? 0) : (entry.remoteSize ?? 0);
+    // Write the winner's bytes to disk DIRECTLY (echo-guarded) — NOT via blobEngine.materialize, which
+    // would see the loser still on disk and re-trigger onConfigDivergence (a resolve loop).
+    const bytes = await this.ports.blobs.get(winner);
+    this.echo.recordWrite(entry.path, winner);
+    await this.ports.config.writeAtomic(entry.path, bytes);
+    // Publish the winner to the config map so both devices converge.
+    const indexDoc = this.indexDoc;
+    if (indexDoc === null) throw new Error("resolveConfigConflict: engine not started");
+    indexDoc.getMap<ConfigEntry>("config").set(entry.path, {
+      sha256: winner,
+      size,
+      category,
+      deviceId: this.ports.identity.deviceId(),
+    });
+    // Update the durable config base to the winner so the NEXT remote push for this path is
+    // treated as a normal update (local == new base) rather than triggering a spurious conflict.
+    await this.ports.engineState.setConfigBase(entry.path, winner);
+    this.inbox.resolve(id);
+  }
+
+  /**
+   * Force an immediate config-zone rescan (the "Zync: rescan config" command). A no-op when
+   * no config port is wired (i.e. both syncConfig toggles are off).
+   */
+  async rescanConfig(): Promise<void> {
+    await this.ports.config?.rescan();
   }
 
   /**
@@ -3744,6 +3844,36 @@ export class SyncEngine {
       case "excluded":
         return;
     }
+  }
+
+  /** BlobEngine divergence hook for config paths: preserve "mine" (publish its bytes so keep-mine is
+   *  resolvable on any device) and raise a config-file inbox entry; return true so materialize does NOT
+   *  overwrite the local file. */
+  private async onConfigDivergence(
+    path: VaultPath,
+    info: { localSha: Sha256; expectedSha: Sha256 },
+  ): Promise<boolean> {
+    if (configCategoryOf(path) === undefined || this.ports.config === undefined) return false;
+    const base = await this.ports.engineState.getConfigBase(path);
+    if (base !== null && info.localSha === base) return false; // local unchanged since last sync -> accept remote
+    const localBytes = await this.ports.config.read(path);
+    if (localBytes !== null && !(await this.ports.blobs.has(info.localSha))) {
+      await this.ports.blobs.put(info.localSha, localBytes);
+    }
+    const indexDoc = this.indexDoc;
+    if (indexDoc === null) return false;
+    const remote = indexDoc.getMap<ConfigEntry>("config").get(path);
+    this.inbox.add({
+      id: `config-file:${path}:${info.localSha.slice(0, 8)}`,
+      kind: "config-file",
+      path,
+      localSha: info.localSha,
+      remoteSha: info.expectedSha,
+      localSize: localBytes?.length ?? 0,
+      remoteSize: remote?.size ?? 0,
+      detail: "Config file changed on another device.",
+    });
+    return true;
   }
 
   /**

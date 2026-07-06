@@ -15,7 +15,7 @@
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
-import type { DocId, EngineStateStore, Stamp, VaultPath } from "@zync/core";
+import type { DocId, EngineStateStore, Sha256, Stamp, VaultPath } from "@zync/core";
 import { isEnoent, atomicWriteBytes } from "./fs-utils.js";
 
 interface StateFile {
@@ -25,6 +25,8 @@ interface StateFile {
   // keys, so reads must default them — `persist()` always writes them going forward.
   lastLivePaths?: Record<string, string>;
   deleted?: string[];
+  // Config base: last sha materialized from remote per config path. Optional for back-compat.
+  configBases?: Record<string, string>;
 }
 
 export class FsEngineStateStore implements EngineStateStore {
@@ -33,6 +35,7 @@ export class FsEngineStateStore implements EngineStateStore {
   private dirty: Set<DocId>;
   private lastLive: Map<DocId, VaultPath>;
   private deletedDocs: Set<DocId>;
+  private configBasesMap: Map<VaultPath, Sha256>;
 
   private constructor(
     filePath: string,
@@ -40,12 +43,14 @@ export class FsEngineStateStore implements EngineStateStore {
     dirty: Set<DocId>,
     lastLive: Map<DocId, VaultPath>,
     deletedDocs: Set<DocId>,
+    configBasesMap: Map<VaultPath, Sha256>,
   ) {
     this.filePath = filePath;
     this.syncedStamps = syncedStamps;
     this.dirty = dirty;
     this.lastLive = lastLive;
     this.deletedDocs = deletedDocs;
+    this.configBasesMap = configBasesMap;
   }
 
   /** Async factory: loads existing state or starts fresh. */
@@ -55,6 +60,7 @@ export class FsEngineStateStore implements EngineStateStore {
     const dirty = new Set<DocId>();
     const lastLive = new Map<DocId, VaultPath>();
     const deletedDocs = new Set<DocId>();
+    const configBasesMap = new Map<VaultPath, Sha256>();
     try {
       const raw = await fsp.readFile(abs, "utf8");
       const data = JSON.parse(raw) as StateFile;
@@ -71,11 +77,15 @@ export class FsEngineStateStore implements EngineStateStore {
       for (const id of data.deleted ?? []) {
         deletedDocs.add(id as DocId);
       }
+      // Back-compat: pre-slice-1 state files have no configBases field.
+      for (const [k, v] of Object.entries(data.configBases ?? {})) {
+        configBasesMap.set(k as VaultPath, v as Sha256);
+      }
     } catch (err) {
       if (!isEnoent(err)) throw err;
       // No file yet → start empty
     }
-    return new FsEngineStateStore(abs, syncedStamps, dirty, lastLive, deletedDocs);
+    return new FsEngineStateStore(abs, syncedStamps, dirty, lastLive, deletedDocs, configBasesMap);
   }
 
   // ---------------------------------------------------------------------------
@@ -141,6 +151,15 @@ export class FsEngineStateStore implements EngineStateStore {
     await this.persist();
   }
 
+  getConfigBase(path: VaultPath): Promise<Sha256 | null> {
+    return Promise.resolve(this.configBasesMap.get(path) ?? null);
+  }
+
+  async setConfigBase(path: VaultPath, sha256: Sha256): Promise<void> {
+    this.configBasesMap.set(path, sha256);
+    await this.persist();
+  }
+
   // ---------------------------------------------------------------------------
   // Internal persistence (atomic write)
   // ---------------------------------------------------------------------------
@@ -154,6 +173,7 @@ export class FsEngineStateStore implements EngineStateStore {
       dirty: [...this.dirty],
       lastLivePaths: Object.fromEntries(this.lastLive),
       deleted: [...this.deletedDocs],
+      configBases: Object.fromEntries(this.configBasesMap),
     };
     const json = JSON.stringify(data);
     await atomicWriteBytes(this.filePath, new TextEncoder().encode(json));

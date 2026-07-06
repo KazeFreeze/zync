@@ -20,7 +20,12 @@ import { TMP_PREFIX, isEnoent, atomicWriteBytes } from "./fs-utils.js";
 const ZYNC_INTERNAL_PREFIX = ".obsidian/zync/";
 
 function isExcluded(rel: string): boolean {
-  return rel.startsWith(ZYNC_INTERNAL_PREFIX) || path.basename(rel).startsWith(TMP_PREFIX);
+  return (
+    rel.startsWith(ZYNC_INTERNAL_PREFIX) ||
+    rel.startsWith(".obsidian/themes/") ||
+    rel.startsWith(".obsidian/snippets/") ||
+    path.basename(rel).startsWith(TMP_PREFIX)
+  );
 }
 
 function toVaultPath(rel: string): VaultPath {

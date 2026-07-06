@@ -8,6 +8,8 @@ export {
 } from "./errors.js";
 export { classify } from "./classify/classify.js";
 export type { Route, Caps, Classification } from "./classify/classify.js";
+export { CONFIG_ZONE_PREFIXES, isConfigZone, configCategoryOf } from "./config/config-entry.js";
+export type { ConfigEntry, ConfigCategory } from "./config/config-entry.js";
 export { sha256OfBytes, sha256OfText } from "./hash.js";
 export { diffToEdits, merge3, applyEdits } from "./bridge/merge.js";
 export { EchoLedger } from "./bridge/echo.js";
@@ -51,7 +53,7 @@ export { Inbox } from "./conflicts/inbox.js";
 export type { InboxEntry, InboxKind } from "./conflicts/inbox.js";
 export { supervisedImport } from "./conflicts/supervised-import.js";
 export { ArtifactNotLocalError } from "./conflicts/resolve.js";
-export type { ResolveAction } from "./conflicts/resolve.js";
+export type { ResolveAction, ResolveConfigAction } from "./conflicts/resolve.js";
 export { describeInboxEntry, isActionableConflict } from "./conflicts/entry-view.js";
 export type { EntryView, EntryAction, EntryActionSpec } from "./conflicts/entry-view.js";
 export { SyncEngine, AUDIT_QUIESCENCE_MS, AUDIT_MAX_STALENESS_MS } from "./engine.js";

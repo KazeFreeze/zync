@@ -1,6 +1,11 @@
-import type { CrdtMap, DocId, Unsubscribe, VaultPath } from "../ports.js";
+import type { CrdtMap, DocId, Sha256, Unsubscribe, VaultPath } from "../ports.js";
 
-export type InboxKind = "conflict" | "resurrected" | "supervised-import" | "pending-delete";
+export type InboxKind =
+  | "conflict"
+  | "resurrected"
+  | "supervised-import"
+  | "pending-delete"
+  | "config-file";
 
 /**
  * One inbox entry. The `id` is DETERMINISTIC (e.g. `${kind}:${path}:${discriminator}`)
@@ -19,6 +24,10 @@ export interface InboxEntry {
   artifactPath?: VaultPath;
   detail?: string;
   deleted?: boolean;
+  localSha?: Sha256;
+  remoteSha?: Sha256;
+  localSize?: number;
+  remoteSize?: number;
 }
 
 /**

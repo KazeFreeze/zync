@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import type { DeviceId, IdentityPort, Sha256, VaultPath } from "../ports.js";
 import { sha256OfBytes } from "../hash.js";
 import { EchoLedger } from "../bridge/echo.js";
@@ -255,6 +255,163 @@ describe("BlobEngine two-device materialization (shared manifest + shared store)
     expect(h.engine.manifestEntries()).toEqual([
       ["img.png", { sha256: sha, size: PNG.length, deviceId: DEV_A }],
     ]);
+  });
+});
+
+describe("BlobEngine.materialize — onMaterialized hook", () => {
+  it("calls onMaterialized with (path, sha) on successful 'written' materialize", async () => {
+    const manifest = new FakeCrdtMap<BlobManifestEntry>();
+    const blobStore = new FakeBlobStore();
+    const vault = new FakeVault();
+    const echo = new EchoLedger();
+
+    const sha = await sha256OfBytes(PNG);
+    await blobStore.put(sha, PNG);
+    manifest.set("img.png", { sha256: sha, size: PNG.length, deviceId: DEV_A });
+
+    const calls: [string, string][] = [];
+    const engine = new BlobEngine({
+      manifest,
+      blobStore,
+      vault,
+      echo,
+      identity: identity(DEV_A),
+      policy: "lazy",
+      clock: new FakeClock(),
+      concurrency: 4,
+      maxInFlightBytes: 1_000_000_000,
+      maxRetries: 4,
+      retryTickMs: 1_000_000_000,
+      onBlobFailure: () => undefined,
+      onMaterialized: (p, s) => {
+        calls.push([p, s]);
+      },
+    });
+
+    const outcome = await engine.materialize(path("img.png"), sha);
+    expect(outcome).toBe("written");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toEqual(["img.png", sha]);
+  });
+
+  it("does NOT call onMaterialized on 'already' outcome", async () => {
+    const manifest = new FakeCrdtMap<BlobManifestEntry>();
+    const blobStore = new FakeBlobStore();
+    const vault = new FakeVault();
+    const echo = new EchoLedger();
+
+    const sha = await sha256OfBytes(PNG);
+    await blobStore.put(sha, PNG);
+    manifest.set("img.png", { sha256: sha, size: PNG.length, deviceId: DEV_A });
+    // Pre-write the file so disk already matches -> 'already'
+    vault.writeSilently(path("img.png"), PNG);
+
+    const calls: [string, string][] = [];
+    const engine = new BlobEngine({
+      manifest,
+      blobStore,
+      vault,
+      echo,
+      identity: identity(DEV_A),
+      policy: "lazy",
+      clock: new FakeClock(),
+      concurrency: 4,
+      maxInFlightBytes: 1_000_000_000,
+      maxRetries: 4,
+      retryTickMs: 1_000_000_000,
+      onBlobFailure: () => undefined,
+      onMaterialized: (p, s) => {
+        calls.push([p, s]);
+      },
+    });
+
+    const outcome = await engine.materialize(path("img.png"), sha);
+    expect(outcome).toBe("already");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("does NOT call onMaterialized on 'superseded' outcome", async () => {
+    const manifest = new FakeCrdtMap<BlobManifestEntry>();
+    const blobStore = new FakeBlobStore();
+    const vault = new FakeVault();
+    const echo = new EchoLedger();
+
+    const calls: [string, string][] = [];
+    const engine = new BlobEngine({
+      manifest,
+      blobStore,
+      vault,
+      echo,
+      identity: identity(DEV_A),
+      policy: "lazy",
+      clock: new FakeClock(),
+      concurrency: 4,
+      maxInFlightBytes: 1_000_000_000,
+      maxRetries: 4,
+      retryTickMs: 1_000_000_000,
+      onBlobFailure: () => undefined,
+      onMaterialized: (p, s) => {
+        calls.push([p, s]);
+      },
+    });
+
+    const outcome = await engine.materialize(path("img.png"), "no-such-sha" as Sha256);
+    expect(outcome).toBe("superseded");
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe("BlobEngine.materialize — onDivergence hook", () => {
+  it("returns 'conflict' and does NOT write vault when onDivergence returns true", async () => {
+    const manifest = new FakeCrdtMap<BlobManifestEntry>();
+    const blobStore = new FakeBlobStore();
+    const vault = new FakeVault();
+    const echo = new EchoLedger();
+
+    const diskBytes = new Uint8Array([1, 1, 1]);
+    const remoteBytes = new Uint8Array([2, 2, 2]);
+    const localSha = await sha256OfBytes(diskBytes);
+    const expectedSha = await sha256OfBytes(remoteBytes);
+
+    // Seed on-disk content that DIFFERS from the manifest's expectedSha.
+    vault.writeSilently(path(".obsidian/snippets/x.css"), diskBytes);
+
+    // Manifest entry points at remoteBytes (expectedSha).
+    manifest.set(".obsidian/snippets/x.css", {
+      sha256: expectedSha,
+      size: remoteBytes.length,
+      deviceId: DEV_A,
+    });
+
+    const onDivergence = vi.fn(() => Promise.resolve(true));
+
+    const engine = new BlobEngine({
+      manifest,
+      blobStore,
+      vault,
+      echo,
+      identity: identity(DEV_A),
+      policy: "lazy",
+      clock: new FakeClock(),
+      concurrency: 4,
+      maxInFlightBytes: 1_000_000_000,
+      maxRetries: 4,
+      retryTickMs: 1_000_000_000,
+      onBlobFailure: () => undefined,
+      onDivergence,
+    });
+
+    const outcome = await engine.materialize(path(".obsidian/snippets/x.css"), expectedSha);
+
+    // Hook handled it: return 'conflict', do NOT overwrite.
+    expect(outcome).toBe("conflict");
+    expect(onDivergence).toHaveBeenCalledOnce();
+    expect(onDivergence).toHaveBeenCalledWith(path(".obsidian/snippets/x.css"), {
+      localSha,
+      expectedSha,
+    });
+    // On-disk bytes are unchanged — writeAtomic was never called.
+    expect(await vault.read(path(".obsidian/snippets/x.css"))).toEqual(diskBytes);
   });
 });
 

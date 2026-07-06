@@ -3,6 +3,9 @@ import type { VaultPath } from "../ports.js";
 /** The two content-conflict resolutions the engine can perform. */
 export type ResolveAction = "keep-current" | "keep-backup";
 
+/** The two config-file-conflict resolutions the engine can perform. */
+export type ResolveConfigAction = "keep-mine" | "keep-theirs";
+
 /**
  * Thrown by `resolveContentConflict` when the conflict's backup artifact is not present on THIS
  * device. Content-conflict artifacts are device-local (written unbound/echo-suppressed on the

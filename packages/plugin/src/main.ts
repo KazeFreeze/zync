@@ -17,7 +17,7 @@ import {
   DEFAULT_ZYNC_DB_NAME,
   type ZyncDb,
 } from "@zync/store-idb";
-import { ObsidianVaultPort, ObsidianEditorBinding } from "@zync/vault-obsidian";
+import { ObsidianVaultPort, ObsidianEditorBinding, ObsidianConfigPort } from "@zync/vault-obsidian";
 import { PortProfiler } from "./profiling.js";
 
 /**
@@ -43,6 +43,8 @@ interface ZyncSettings {
   deviceName: string;
   /** Stable per-install device id — auto-generated on first run, never user-edited. */
   deviceId: string;
+  /** Config-zone sync toggles. Defaults OFF — opt-in per category. Restart required to apply. */
+  syncConfig: { themes: boolean; snippets: boolean };
 }
 
 const DEFAULT_SETTINGS: ZyncSettings = {
@@ -51,6 +53,7 @@ const DEFAULT_SETTINGS: ZyncSettings = {
   token: "",
   deviceName: "obsidian-desktop",
   deviceId: "",
+  syncConfig: { themes: false, snippets: false },
 };
 
 const CONFIG_DIR = ".obsidian/zync"; // vault-relative; the BaseStore zone ObsidianVaultPort excludes
@@ -72,6 +75,7 @@ export default class ZyncPlugin extends Plugin {
   private engine: SyncEngine | null = null;
   private editorBinding: ObsidianEditorBinding | null = null;
   private vault: ObsidianVaultPort | null = null;
+  private configPort: ObsidianConfigPort | null = null;
   private transport: HocuspocusTransport | null = null;
   private db: ZyncDb | null = null;
   private dbName: string | null = null;
@@ -114,6 +118,13 @@ export default class ZyncPlugin extends Plugin {
       name: "Zync: restart sync",
       callback: () => {
         void this.restart();
+      },
+    });
+    this.addCommand({
+      id: "zync-rescan-config",
+      name: "Zync: rescan config",
+      callback: () => {
+        void this.engine?.rescanConfig();
       },
     });
     this.addCommand({
@@ -175,11 +186,37 @@ export default class ZyncPlugin extends Plugin {
         deviceName: () => this.settings.deviceName,
       };
 
+      // Construct the config port only when at least one category toggle is on.
+      // Gated here (not in the constructor) so the port — which registers a "raw" watcher —
+      // is never created when neither theme nor snippet sync is requested.
+      let configPort: ObsidianConfigPort | undefined;
+      if (this.settings.syncConfig.themes || this.settings.syncConfig.snippets) {
+        configPort = new ObsidianConfigPort(this.app.vault);
+        this.configPort = configPort;
+      }
+
       const engine = new SyncEngine(
-        { vault: this.vault, crdt, transport, blobs, docStore, clock, identity, engineState },
+        {
+          vault: this.vault,
+          crdt,
+          transport,
+          blobs,
+          docStore,
+          clock,
+          identity,
+          engineState,
+          ...(configPort !== undefined ? { config: configPort } : {}),
+        },
         // blobPolicy "eager": a desktop device materializes synced blobs to disk (parity with the
         // headless peer's default). Blobs-at-scale + lazy mobile fetch are M2.
-        { configDir: CONFIG_DIR, maxProseBytes: MAX_PROSE_BYTES, blobPolicy: "eager" },
+        {
+          configDir: CONFIG_DIR,
+          maxProseBytes: MAX_PROSE_BYTES,
+          blobPolicy: "eager",
+          // Thread the per-category toggle through to ConfigChannel + RoutedManifest so
+          // a device with "snippets on, themes off" never uploads or downloads theme files.
+          configCategories: this.settings.syncConfig,
+        },
       );
       this.engine = engine;
 
@@ -252,6 +289,8 @@ export default class ZyncPlugin extends Plugin {
       }
       this.transport = null;
     }
+    this.configPort?.close();
+    this.configPort = null;
     this.vault?.close();
     this.vault = null;
     this.profiler = null;
@@ -399,6 +438,26 @@ class ZyncSettingTab extends PluginSettingTab {
       .addText((t) =>
         t.setValue(this.plugin.settings.deviceName).onChange(async (v) => {
           this.plugin.settings.deviceName = v.trim() === "" ? "obsidian-desktop" : v.trim();
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName("Sync themes")
+      .setDesc("Sync .obsidian/themes/ across devices. Restart required to apply.")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.syncConfig.themes).onChange(async (v) => {
+          this.plugin.settings.syncConfig.themes = v;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName("Sync snippets")
+      .setDesc("Sync .obsidian/snippets/ across devices. Restart required to apply.")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.syncConfig.snippets).onChange(async (v) => {
+          this.plugin.settings.syncConfig.snippets = v;
           await this.plugin.saveSettings();
         }),
       );

@@ -68,6 +68,22 @@ describe("describeInboxEntry", () => {
     const e = base({ id: "blob:sync-failed", detail: "3 files could not sync" });
     expect(actions(e, false)).toEqual([]);
   });
+
+  it("config-file entry -> keep-mine / keep-theirs chooser", () => {
+    const view = describeInboxEntry(
+      {
+        id: "config-file:.obsidian/snippets/x.css:aa",
+        kind: "config-file",
+        path: ".obsidian/snippets/x.css" as never,
+        localSha: "aa" as never,
+        remoteSha: "bb" as never,
+      },
+      { artifactLocal: false },
+    );
+    const acts = view.actions.map((a) => a.action);
+    expect(acts).toContain("keep-mine");
+    expect(acts).toContain("keep-theirs");
+  });
 });
 
 describe("isActionableConflict", () => {
@@ -88,5 +104,11 @@ describe("isActionableConflict", () => {
     expect(isActionableConflict(resurrected)).toBe(false);
     expect(isActionableConflict(renameRefused)).toBe(false);
     expect(isActionableConflict(blob)).toBe(false);
+  });
+
+  it("config-file is actionable (counts in the badge)", () => {
+    expect(
+      isActionableConflict({ id: "config-file:x:aa", kind: "config-file", path: "x" as never }),
+    ).toBe(true);
   });
 });

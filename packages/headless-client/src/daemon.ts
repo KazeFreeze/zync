@@ -26,6 +26,7 @@ import type {
 import { YjsCrdtProvider, HocuspocusTransport } from "@zync/crdt-yjs";
 import { HttpBlobStore } from "@zync/blob-http";
 import { NodeFsVault } from "./adapters/node-fs-vault.js";
+import { NodeFsConfig } from "./adapters/node-fs-config.js";
 import { FsDocStore } from "./adapters/fs-docstore.js";
 import { FsEngineStateStore } from "./adapters/fs-engine-state.js";
 import { createControlApi, type DaemonState } from "./control-api.js";
@@ -118,6 +119,7 @@ export async function createDaemon(config: DaemonConfig): Promise<Daemon> {
       ? { durabilityTrusted: config.durabilityTrusted }
       : undefined,
   );
+  const configPort = new NodeFsConfig(config.vaultDir);
   const docStore = new FsDocStore(config.docStoreDir);
   const engineState = await FsEngineStateStore.open(config.stateFile);
   const blobs = new HttpBlobStore(config.serverHttp, config.token);
@@ -136,7 +138,7 @@ export async function createDaemon(config: DaemonConfig): Promise<Daemon> {
   };
 
   const engine = new SyncEngine(
-    { vault, crdt, transport, blobs, docStore, clock, identity, engineState },
+    { vault, crdt, transport, blobs, docStore, clock, identity, engineState, config: configPort },
     {
       configDir: config.engineConfigDir,
       maxProseBytes: config.maxProseBytes,
@@ -144,6 +146,9 @@ export async function createDaemon(config: DaemonConfig): Promise<Daemon> {
       // Wire the blob fetch policy end-to-end (0b-3 Fix 3) so a synced blob materializes
       // onto this follower's disk. Only pass it when set so the engine's own default applies.
       ...(config.blobPolicy !== undefined ? { blobPolicy: config.blobPolicy } : {}),
+      // Harness daemon: both categories always on so all config-themes/config-conflict
+      // scenarios run unaffected. A per-device env-based toggle can be added later.
+      configCategories: { themes: true, snippets: true },
     },
   );
 
@@ -177,6 +182,7 @@ export async function createDaemon(config: DaemonConfig): Promise<Daemon> {
     engine,
     transport,
     vault,
+    config: configPort,
     vaultDir: path.resolve(config.vaultDir),
     docStoreDir: path.resolve(config.docStoreDir),
     fixturesDir: path.resolve(config.fixturesDir),
@@ -215,6 +221,7 @@ export async function createDaemon(config: DaemonConfig): Promise<Daemon> {
       }
       await transport.close();
       vault.close();
+      configPort.close();
       const s = server;
       if (s !== null) {
         await new Promise<void>((resolve, reject) => {

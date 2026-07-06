@@ -3,7 +3,7 @@ import { BlobTransientError, BlobNotFoundError, CorruptBlobError } from "../erro
 import type { BlobManifestEntry } from "./blob-engine.js";
 
 /** Outcome of one materialize attempt (the queue drives this callback). */
-export type MaterializeOutcome = "written" | "already" | "superseded";
+export type MaterializeOutcome = "written" | "already" | "superseded" | "conflict";
 
 export interface BlobFetchQueueDeps {
   /** Fetch+verify+write the path's CURRENT manifest sha; re-validates the manifest before writing
@@ -147,8 +147,10 @@ export class BlobFetchQueue {
       const outcome = await this.#d.materialize(job.path, job.targetSha);
       // `superseded` = the manifest moved during the fetch; the fresh sha arrives via a manifest-observe
       // enqueue (Task 6 wires the BlobEngine observe), so nothing to re-enqueue here. Only a real write
-      // counts toward materialized progress.
-      if (outcome !== "superseded") this.#materialized++;
+      // or idempotent already-present hit counts toward materialized progress. `conflict` = a divergence
+      // hook handled the path out-of-band (e.g. config raised a conflict inbox item) — no vault write
+      // happened, treated identically to `superseded` (done, not failed, not retried).
+      if (outcome !== "superseded" && outcome !== "conflict") this.#materialized++;
       // A successful re-materialize heals a previously-parked failure; re-emit the aggregate report so
       // the inbox item resolves once the LAST parked path clears (fires onFailure([]) on full recovery).
       // Suppress the notify after stop() (in-flight heal during shutdown -> torn-down consumer); the

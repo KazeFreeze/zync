@@ -32,6 +32,15 @@ function framing(kind: InboxEntry["kind"]): {
       openBackup: "Open mine",
     };
   }
+  if (kind === "config-file") {
+    return {
+      sub: "Config file changed on another device.",
+      keepCurrent: "Keep synced",
+      keepBackup: "Keep mine",
+      openCurrent: "Open synced",
+      openBackup: "Open mine",
+    };
+  }
   return {
     sub: "The synced version is live; your edit is backed up.",
     keepCurrent: "Keep synced",
@@ -243,6 +252,12 @@ export class ConflictInboxModal extends Modal {
           break;
         case "acknowledge":
           this.engine.inbox.resolve(id);
+          break;
+        case "keep-mine":
+          await this.engine.resolveConfigConflict(id, "keep-mine");
+          break;
+        case "keep-theirs":
+          await this.engine.resolveConfigConflict(id, "keep-theirs");
           break;
         default: {
           // Exhaustiveness guard: a new core EntryAction fails the build in the exact file that

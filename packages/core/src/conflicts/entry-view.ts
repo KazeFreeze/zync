@@ -7,7 +7,12 @@ export type EntryAction =
   | "keep-backup"
   | "confirm-delete"
   | "keep"
-  | "acknowledge";
+  | "acknowledge"
+  | "keep-mine"
+  | "keep-theirs";
+
+/** Extract the filename component from a vault path (e.g. ".obsidian/snippets/x.css" → "x.css"). */
+const basename = (p: string): string => p.slice(p.lastIndexOf("/") + 1);
 
 export interface EntryActionSpec {
   action: EntryAction;
@@ -36,7 +41,7 @@ function isContentConflict(e: InboxEntry): boolean {
  * pile of "restored"/"rename refused" notices does not inflate a scary conflict number.
  */
 export function isActionableConflict(e: InboxEntry): boolean {
-  return isContentConflict(e) || e.kind === "pending-delete";
+  return isContentConflict(e) || e.kind === "pending-delete" || e.kind === "config-file";
 }
 
 /**
@@ -120,6 +125,17 @@ export function describeInboxEntry(e: InboxEntry, ctx: { artifactLocal: boolean 
       actions: [{ action: "acknowledge", label: "Dismiss" }],
     };
   }
+  if (e.kind === "config-file") {
+    return {
+      kindLabel: "Config file",
+      title: basename(e.path),
+      actions: [
+        { action: "keep-mine", label: "Keep mine", primary: true },
+        { action: "keep-theirs", label: "Keep synced" },
+      ],
+    };
+  }
+
   // recovered-file notices (recoverInPlaceCollision / orphan-sweep): path IS a real file.
   return {
     kindLabel: "recovered",

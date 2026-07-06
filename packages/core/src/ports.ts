@@ -65,6 +65,25 @@ export interface VaultPort {
   durabilityTrusted?(): boolean;
 }
 
+/**
+ * Filesystem access for the CONFIG ZONE (`.obsidian/themes|snippets`) — a separate seam from
+ * VaultPort, which is deliberately blind to `.obsidian/**`. Reads/writes go through Obsidian's
+ * DataAdapter (Vault API cannot enumerate dot-folders); change detection is watcher + rescan
+ * because `.obsidian/**` fires no Vault events.
+ */
+export interface ConfigPort {
+  read(path: VaultPath): Promise<Uint8Array | null>;
+  writeAtomic(path: VaultPath, data: Uint8Array): Promise<void>;
+  remove(path: VaultPath): Promise<void>;
+  /** List config-zone files (recursively) under the two allow-listed prefixes. */
+  list(): Promise<{ path: VaultPath; size: number }[]>;
+  /** Fires on any config-zone change (best-effort watcher + periodic rescan). */
+  onChange(cb: (path: VaultPath) => void): Unsubscribe;
+  /** Force an immediate rescan (the manual `Zync: rescan config` command). */
+  rescan(): Promise<void>;
+  close(): void;
+}
+
 export type ConnStatus = "connected" | "connecting" | "offline" | "unauthorized";
 
 /**
@@ -157,6 +176,13 @@ export interface EngineStateStore {
   markDeleted(id: DocId): Promise<void>;
   wasDeleted(id: DocId): Promise<boolean>;
   clearDeleted(id: DocId): Promise<void>;
+  /**
+   * Config base: the last sha this device materialized (from a remote peer) at a config path.
+   * Durable — survives restart — so conflict detection can tell a normal update (local == base) from
+   * an independent local edit (local != base). Not updated on local publish.
+   */
+  getConfigBase(path: VaultPath): Promise<Sha256 | null>;
+  setConfigBase(path: VaultPath, sha256: Sha256): Promise<void>;
 }
 export interface ClockPort {
   now(): number;

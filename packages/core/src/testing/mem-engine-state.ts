@@ -1,4 +1,4 @@
-import type { DocId, EngineStateStore, Stamp, VaultPath } from "../ports.js";
+import type { DocId, EngineStateStore, Sha256, Stamp, VaultPath } from "../ports.js";
 
 /**
  * In-memory {@link EngineStateStore} for tests: a `Map` of per-doc synced stamps
@@ -11,6 +11,7 @@ export class MemEngineState implements EngineStateStore {
   private readonly dirty = new Set<DocId>();
   private readonly lastLive = new Map<DocId, VaultPath>();
   private readonly deleted = new Set<DocId>();
+  private readonly configBases = new Map<VaultPath, Sha256>();
 
   getSyncedStamp(id: DocId): Promise<Stamp | null> {
     return Promise.resolve(this.synced.get(id) ?? null);
@@ -68,6 +69,15 @@ export class MemEngineState implements EngineStateStore {
   clearDeleted(id: DocId): Promise<void> {
     if (!this.deleted.has(id)) return Promise.resolve(); // skip-if-unchanged
     this.deleted.delete(id);
+    return Promise.resolve();
+  }
+
+  getConfigBase(path: VaultPath): Promise<Sha256 | null> {
+    return Promise.resolve(this.configBases.get(path) ?? null);
+  }
+
+  setConfigBase(path: VaultPath, sha256: Sha256): Promise<void> {
+    this.configBases.set(path, sha256);
     return Promise.resolve();
   }
 }

@@ -51,6 +51,18 @@ export interface BlobEngineDeps {
   retryTickMs: number;
   /** Aggregate failure surface: called with the CURRENT full failed-path set whenever it changes. */
   onBlobFailure: (failedPaths: VaultPath[]) => void;
+  /**
+   * Optional divergence hook (config channel injects it). Called when the on-disk file EXISTS and
+   * its content differs from the manifest's expected sha. Returning true means "handled out of band
+   * (e.g. raised a conflict) — do NOT overwrite". Absent => overwrite (blob LWW, unchanged).
+   */
+  onDivergence?: (
+    path: VaultPath,
+    info: { localSha: Sha256; expectedSha: Sha256 },
+  ) => Promise<boolean>;
+  /** Called after a blob is successfully materialized (written to disk). The engine uses it to record
+   *  the config base sha for config-zone paths. Fires for ALL materialized blobs; the handler filters. */
+  onMaterialized?: (path: VaultPath, sha256: Sha256) => void;
 }
 
 /**
@@ -122,8 +134,16 @@ export class BlobEngine {
     if (entry?.sha256 !== expectedSha) return "superseded"; // manifest moved/absent
 
     // IDEMPOTENCY: disk already matches -> nothing to fetch (also breaks the eager re-materialize loop).
+    // Compute the on-disk sha ONCE so it can be reused for the divergence hook below.
     const onDisk = await d.vault.read(path);
-    if (onDisk !== null && (await sha256OfBytes(onDisk)) === expectedSha) return "already";
+    if (onDisk !== null) {
+      const onDiskSha = await sha256OfBytes(onDisk);
+      if (onDiskSha === expectedSha) return "already";
+      if (d.onDivergence !== undefined) {
+        const handled = await d.onDivergence(path, { localSha: onDiskSha, expectedSha });
+        if (handled) return "conflict"; // config raised a conflict — do NOT overwrite
+      }
+    }
 
     const bytes = await d.blobStore.get(expectedSha);
     const actual = await sha256OfBytes(bytes);
@@ -137,6 +157,7 @@ export class BlobEngine {
 
     d.echo.recordWrite(path, expectedSha);
     await d.vault.writeAtomic(path, bytes);
+    d.onMaterialized?.(path, expectedSha);
     return "written";
   }
 

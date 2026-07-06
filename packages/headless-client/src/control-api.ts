@@ -20,7 +20,7 @@ import * as http from "node:http";
 import * as fsp from "node:fs/promises";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { CrdtDoc, TransportPort, VaultPath } from "@zync/core";
+import type { ConfigPort, CrdtDoc, TransportPort, VaultPath } from "@zync/core";
 import { SyncEngine, sha256OfText, sha256OfBytes } from "@zync/core";
 import { SimulatedEditor } from "@zync/core/testing";
 import type { NodeFsVault } from "./adapters/node-fs-vault.js";
@@ -55,6 +55,8 @@ export interface ControlApiDeps {
   /** The transport — read directly for `/status` `conn` (not exposed via the engine). */
   transport: TransportPort;
   vault: NodeFsVault;
+  /** ConfigPort for the config zone (.obsidian/themes, .obsidian/snippets). */
+  config: ConfigPort;
   /** Absolute path to the vault root (for direct external fs writes). */
   vaultDir: string;
   /** Absolute path to the FsDocStore directory (for /metrics docStoreBytes). */
@@ -132,6 +134,16 @@ async function handle(deps: ControlApiDeps, req: http.IncomingMessage): Promise<
       return fsDelete(deps, await readJson(req));
     case "POST /inbox/resolve-content":
       return inboxResolveContent(deps, await readJson(req));
+    case "POST /config/write":
+      return configWrite(deps, await readJson(req));
+    case "POST /config/remove":
+      return configRemove(deps, await readJson(req));
+    case "POST /config/resolve":
+      return configResolve(deps, await readJson(req));
+    case "POST /config/rescan":
+      return configRescan(deps);
+    case "GET /config/list":
+      return configList(deps);
     case "GET /fs/read":
       return fsRead(deps, url);
     case "GET /fs/tree":
@@ -362,6 +374,64 @@ interface InboxResolveContentBody {
 async function inboxResolveContent(deps: ControlApiDeps, raw: unknown): Promise<JsonResponse> {
   const { id, action } = raw as InboxResolveContentBody;
   await deps.engine.resolveContentConflict(id, action);
+  return { status: 200, body: { ok: true } };
+}
+
+// ── /config/* ─────────────────────────────────────────────────────────────────
+
+interface ConfigWriteBody {
+  path: string;
+  contentBase64: string;
+}
+
+/**
+ * Write bytes to the config zone via the ConfigPort (NOT a raw fs write) so the engine's
+ * watcher observes and ingests the change through the config channel.
+ */
+async function configWrite(deps: ControlApiDeps, raw: unknown): Promise<JsonResponse> {
+  const body = raw as ConfigWriteBody;
+  if (typeof body.path !== "string" || typeof body.contentBase64 !== "string") {
+    throw new HttpError(400, "path and contentBase64 are required");
+  }
+  const bytes = new Uint8Array(Buffer.from(body.contentBase64, "base64"));
+  await deps.config.writeAtomic(vp(body.path), bytes);
+  return { status: 200, body: { ok: true } };
+}
+
+interface ConfigRemoveBody {
+  path: string;
+}
+
+async function configRemove(deps: ControlApiDeps, raw: unknown): Promise<JsonResponse> {
+  const body = raw as ConfigRemoveBody;
+  if (typeof body.path !== "string") {
+    throw new HttpError(400, "path is required");
+  }
+  await deps.config.remove(vp(body.path));
+  return { status: 200, body: { ok: true } };
+}
+
+async function configList(deps: ControlApiDeps): Promise<JsonResponse> {
+  const files = await deps.config.list();
+  return { status: 200, body: { files } };
+}
+
+interface ConfigResolveBody {
+  id: string;
+  action: "keep-mine" | "keep-theirs";
+}
+
+async function configResolve(deps: ControlApiDeps, raw: unknown): Promise<JsonResponse> {
+  const body = raw as ConfigResolveBody;
+  if (typeof body.id !== "string" || typeof body.action !== "string") {
+    throw new HttpError(400, "id and action are required");
+  }
+  await deps.engine.resolveConfigConflict(body.id, body.action);
+  return { status: 200, body: { ok: true } };
+}
+
+async function configRescan(deps: ControlApiDeps): Promise<JsonResponse> {
+  await deps.config.rescan();
   return { status: 200, body: { ok: true } };
 }
 

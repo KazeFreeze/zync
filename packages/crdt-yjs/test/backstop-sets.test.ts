@@ -30,6 +30,7 @@ import {
   type DocId,
   type EngineStateStore,
   type IdentityPort,
+  type Sha256,
   type Stamp,
   type TransportPort,
   type Unsubscribe,
@@ -804,6 +805,14 @@ class BlockedSyncedStampState implements EngineStateStore {
 
   clearDeleted(id: DocId): Promise<void> {
     return this.inner.clearDeleted(id);
+  }
+
+  getConfigBase(path: VaultPath): Promise<Sha256 | null> {
+    return this.inner.getConfigBase(path);
+  }
+
+  setConfigBase(path: VaultPath, sha256: Sha256): Promise<void> {
+    return this.inner.setConfigBase(path, sha256);
   }
 }
 

@@ -12,8 +12,8 @@
  * (a set: a docId appears at most once). All of this is durable across reopen
  * because it lives in IndexedDB — the engine's crash-restart guarantee.
  */
-import type { DocId, EngineStateStore, Stamp, VaultPath } from "@zync/core";
-import { ENGINE_STATE_STORE, type EngineStateRecord, type ZyncDb } from "./idb-open.js";
+import type { DocId, EngineStateStore, Sha256, Stamp, VaultPath } from "@zync/core";
+import { ENGINE_STATE_STORE, META_STORE, type EngineStateRecord, type ZyncDb } from "./idb-open.js";
 
 function emptyRecord(): EngineStateRecord {
   return { syncedStamp: null, dirty: false };
@@ -94,6 +94,15 @@ export class IdbEngineState implements EngineStateStore {
     const rec = await this.db.get(ENGINE_STATE_STORE, id);
     if (!(rec?.deleted ?? false)) return; // skip-if-unchanged (hot in noteLiveBinding)
     await this.mutate(id, (r) => ({ ...r, deleted: false }));
+  }
+
+  async getConfigBase(path: VaultPath): Promise<Sha256 | null> {
+    const value = await this.db.get(META_STORE, `configBase:${path}`);
+    return (value as Sha256 | undefined) ?? null;
+  }
+
+  async setConfigBase(path: VaultPath, sha256: Sha256): Promise<void> {
+    await this.db.put(META_STORE, sha256, `configBase:${path}`);
   }
 
   /**

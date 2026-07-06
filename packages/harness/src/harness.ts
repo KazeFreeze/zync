@@ -109,6 +109,11 @@ export interface Metrics {
   attachedDocs: number;
 }
 
+/** `GET /config/list` → files in the config zone (themes + snippets). */
+export interface ConfigList {
+  files: { path: string; size: number }[];
+}
+
 // ── Device — control-API client ─────────────────────────────────────────────
 
 /**
@@ -177,6 +182,34 @@ export class Device {
   /** Resolve a content conflict via the engine's resolveContentConflict (keep-current | keep-backup). */
   resolveContentConflict(id: string, action: "keep-current" | "keep-backup"): Promise<void> {
     return this.postOk("/inbox/resolve-content", { id, action });
+  }
+
+  // -- config zone (themes / snippets) ---------------------------------------
+
+  /** Write bytes to the config zone via the ConfigPort. */
+  configWrite(path: string, content: string | Uint8Array): Promise<void> {
+    const bytes = typeof content === "string" ? Buffer.from(content, "utf8") : Buffer.from(content);
+    return this.postOk("/config/write", { path, contentBase64: bytes.toString("base64") });
+  }
+
+  /** Remove a config-zone file. */
+  configRemove(path: string): Promise<void> {
+    return this.postOk("/config/remove", { path });
+  }
+
+  /** Resolve a config-file conflict (keep-mine | keep-theirs). */
+  configResolve(id: string, action: "keep-mine" | "keep-theirs"): Promise<void> {
+    return this.postOk("/config/resolve", { id, action });
+  }
+
+  /** Force an immediate config-zone rescan on this device. */
+  configRescan(): Promise<void> {
+    return this.postOk("/config/rescan", {});
+  }
+
+  /** List config-zone files (themes + snippets) on this device. */
+  configList(): Promise<ConfigList> {
+    return this.getJson<ConfigList>("/config/list");
   }
 
   // -- reads -----------------------------------------------------------------
