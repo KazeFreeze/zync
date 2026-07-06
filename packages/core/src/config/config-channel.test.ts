@@ -222,7 +222,7 @@ describe("ConfigChannel", () => {
     expect(entry).toEqual(tombstonedEntry);
   });
 
-  it("remote tombstone -> remove: fire deleted entry triggers configPort.remove and echo.recordWrite", async () => {
+  it("remote tombstone -> remove: fire deleted entry triggers configPort.remove (m6: echo.recordWrite NOT called)", async () => {
     const { ch, config, configRemove, echoRecordWrite } = makeChannel();
     ch.start();
 
@@ -236,11 +236,13 @@ describe("ConfigChannel", () => {
     config.set(".obsidian/snippets/x.css", entry);
     config.fire([".obsidian/snippets/x.css"]);
 
-    // Remote tombstone path only awaits configPort.remove (Promise.resolve) — no crypto
+    // Remote tombstone path only awaits configPort.remove (Promise.resolve) — no crypto.
+    // m6: echo.recordWrite is removed — it was dead (onLocalChange suppresses the remove via
+    // the prev.deleted === true check, not via the echo ledger).
     await poll(() => {
-      expect(echoRecordWrite).toHaveBeenCalledWith(".obsidian/snippets/x.css", "abc123");
       expect(configRemove).toHaveBeenCalledWith(".obsidian/snippets/x.css");
     });
+    expect(echoRecordWrite).not.toHaveBeenCalled();
   });
 
   it("bootstrap: list returns two paths, both are published to config", async () => {

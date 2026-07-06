@@ -162,6 +162,63 @@ describe("resolveConfigConflict", () => {
     expect(await setup.engineState.getConfigBase(CONFIG_PATH)).toBe(remoteSha);
   });
 
+  it("keep-mine (m5b): re-reads current disk file and publishes current sha, not stale entry.localSha", async () => {
+    /**
+     * Scenario: inbox entry was raised with localSha = staleSha, but the user continued
+     * editing — disk now holds currentBytes (sha = currentSha). keep-mine should keep the
+     * CURRENT disk state, not revert to the bytes recorded at conflict-raise time.
+     */
+    const setup = makeSetup();
+    engine = setup.engine;
+    await engine.start();
+
+    const staleBytes = new TextEncoder().encode(
+      "/* stale local — was on disk when conflict raised */",
+    );
+    const currentBytes = new TextEncoder().encode(
+      "/* current local — edited after conflict raised */",
+    );
+    const staleSha = await sha256OfBytes(staleBytes);
+    const currentSha = await sha256OfBytes(currentBytes);
+    const remoteBytes = new TextEncoder().encode("/* their version */");
+    const remoteSha = await sha256OfBytes(remoteBytes);
+
+    // Pre-seed: remote bytes in store; disk now holds currentBytes (not staleBytes).
+    await setup.blobStore.put(remoteSha, remoteBytes);
+    setup.configPort.files.set(CONFIG_PATH, currentBytes);
+
+    // Inbox entry carries the old staleSha (as raised at conflict-detection time).
+    const id = `config-file:${CONFIG_PATH}`;
+    engine.inbox.add({
+      id,
+      kind: "config-file",
+      path: CONFIG_PATH,
+      localSha: staleSha,
+      remoteSha,
+      localSize: staleBytes.length,
+      remoteSize: remoteBytes.length,
+      detail: "Config file changed on another device.",
+    });
+
+    await engine.resolveConfigConflict(id, "keep-mine");
+
+    // (a) no writeAtomic — disk already holds current bytes, no write needed.
+    expect(setup.configPort.writes).toHaveLength(0);
+
+    // (b) config map has CURRENT sha, NOT the stale entry.localSha.
+    const map = (engine as unknown as EngineWithConfigMap).indexDoc?.getMap("config");
+    const mapEntry = map?.get(CONFIG_PATH);
+    expect(mapEntry?.sha256).toBe(currentSha);
+    expect(mapEntry?.sha256).not.toBe(staleSha);
+    expect(mapEntry?.size).toBe(currentBytes.length);
+
+    // (c) config base updated to the current sha so the next remote push is not a spurious conflict.
+    expect(await setup.engineState.getConfigBase(CONFIG_PATH)).toBe(currentSha);
+
+    // (d) inbox entry resolved.
+    expect(engine.inbox.list().find((e) => e.id === id)).toBeUndefined();
+  });
+
   it("idempotent: re-calling with an already-resolved id is a no-op", async () => {
     const setup = makeSetup();
     engine = setup.engine;
@@ -268,5 +325,87 @@ describe("onConfigDivergence — config base tracking", () => {
       .list()
       .find((e) => e.kind === "config-file" && e.path === CONFIG_PATH);
     expect(entry).toBeDefined();
+  });
+
+  it("m4 TOCTOU: blob stored under ACTUAL re-read disk sha, not stale info.localSha", async () => {
+    /**
+     * Scenario: BlobEngine computed info.localSha from disk, then the file changed before
+     * onConfigDivergence re-read it. Old code would put the new bytes under the stale sha →
+     * CorruptBlobError on peer fetch. Fix: re-hash the re-read bytes.
+     */
+    const setup = makeSetup();
+    engine = setup.engine;
+    await engine.start();
+
+    const staleBytes = new TextEncoder().encode("/* old disk state when caller hashed */");
+    const currentBytes = new TextEncoder().encode(
+      "/* disk changed before onConfigDivergence read */",
+    );
+    const staleSha = await sha256OfBytes(staleBytes);
+    const actualSha = await sha256OfBytes(currentBytes);
+    const remoteBytes = new TextEncoder().encode("/* remote version */");
+    const remoteSha = await sha256OfBytes(remoteBytes);
+
+    await setup.blobStore.put(remoteSha, remoteBytes);
+    // Disk holds currentBytes — NOT the stale bytes the caller hashed.
+    setup.configPort.files.set(CONFIG_PATH, currentBytes);
+    // No base set → base === null, so the early base-equality check does not fire.
+
+    const result = await (
+      engine as unknown as {
+        onConfigDivergence: (
+          p: typeof CONFIG_PATH,
+          i: { localSha: typeof staleSha; expectedSha: typeof remoteSha },
+        ) => Promise<boolean>;
+      }
+    ).onConfigDivergence(CONFIG_PATH, { localSha: staleSha, expectedSha: remoteSha });
+
+    expect(result).toBe(true);
+
+    // m4: blob stored under the ACTUAL current-disk sha, not the caller's stale sha.
+    expect(await setup.blobStore.has(actualSha as never)).toBe(true);
+    expect(await setup.blobStore.has(staleSha as never)).toBe(false);
+
+    // m4: inbox entry localSha reflects the actual disk sha.
+    const inboxEntry = engine.inbox
+      .list()
+      .find((e) => e.kind === "config-file" && e.path === CONFIG_PATH);
+    expect(inboxEntry?.localSha).toBe(actualSha);
+    expect(inboxEntry?.localSha).not.toBe(staleSha);
+  });
+
+  it("m5(a): entry id is 'config-file:{path}' with no sha suffix", async () => {
+    /**
+     * Per-path id ensures a re-divergence on the same path UPDATES the one inbox entry
+     * (LWW on the inbox map) instead of accumulating a stale second entry.
+     */
+    const setup = makeSetup();
+    engine = setup.engine;
+    await engine.start();
+
+    const localBytes = new TextEncoder().encode("/* local edit */");
+    const remoteBytes = new TextEncoder().encode("/* remote version */");
+    const localSha = await sha256OfBytes(localBytes);
+    const remoteSha = await sha256OfBytes(remoteBytes);
+
+    await setup.blobStore.put(remoteSha, remoteBytes);
+    setup.configPort.files.set(CONFIG_PATH, localBytes);
+
+    await (
+      engine as unknown as {
+        onConfigDivergence: (
+          p: typeof CONFIG_PATH,
+          i: { localSha: typeof localSha; expectedSha: typeof remoteSha },
+        ) => Promise<boolean>;
+      }
+    ).onConfigDivergence(CONFIG_PATH, { localSha, expectedSha: remoteSha });
+
+    const inboxEntry = engine.inbox
+      .list()
+      .find((e) => e.kind === "config-file" && e.path === CONFIG_PATH);
+    expect(inboxEntry).toBeDefined();
+    // m5(a): id must be "config-file:{path}" — no sha suffix.
+    expect(inboxEntry?.id).toBe(`config-file:${CONFIG_PATH}`);
+    expect(inboxEntry?.id).not.toMatch(/:[0-9a-f]{8}$/);
   });
 });

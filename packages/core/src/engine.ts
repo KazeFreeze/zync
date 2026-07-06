@@ -1050,26 +1050,52 @@ export class SyncEngine {
     if (category === undefined)
       throw new Error(`resolveConfigConflict: not a config path: ${entry.path}`);
     if (this.ports.config === undefined) throw new Error("resolveConfigConflict: no config port");
-    const winner = action === "keep-mine" ? entry.localSha : entry.remoteSha;
-    const size = action === "keep-mine" ? (entry.localSize ?? 0) : (entry.remoteSize ?? 0);
-    // Write the winner's bytes to disk DIRECTLY (echo-guarded) — NOT via blobEngine.materialize, which
-    // would see the loser still on disk and re-trigger onConfigDivergence (a resolve loop).
-    const bytes = await this.ports.blobs.get(winner);
-    this.echo.recordWrite(entry.path, winner);
-    await this.ports.config.writeAtomic(entry.path, bytes);
-    // Publish the winner to the config map so both devices converge.
     const indexDoc = this.indexDoc;
     if (indexDoc === null) throw new Error("resolveConfigConflict: engine not started");
-    indexDoc.getMap<ConfigEntry>("config").set(entry.path, {
-      sha256: winner,
-      size,
-      category,
-      deviceId: this.ports.identity.deviceId(),
-    });
-    // Update the durable config base to the winner so the NEXT remote push for this path is
-    // treated as a normal update (local == new base) rather than triggering a spurious conflict.
-    await this.ports.engineState.setConfigBase(entry.path, winner);
-    this.inbox.resolve(id);
+
+    if (action === "keep-mine") {
+      // m5(b): Re-read the CURRENT local file so we keep current bytes, not the (possibly stale)
+      // sha stored in the inbox entry. If the file was deleted in the meantime, just resolve.
+      // No writeAtomic (disk already holds the current bytes) and no echo.recordWrite (no write).
+      const cur = await this.ports.config.read(entry.path);
+      if (cur === null) {
+        // File was deleted — nothing local to keep; close the entry.
+        this.inbox.resolve(id);
+        return;
+      }
+      const curSha = await sha256OfBytes(cur);
+      if (!(await this.ports.blobs.has(curSha))) await this.ports.blobs.put(curSha, cur);
+      // Publish the current (re-read) sha to the config map so peers converge on the local winner.
+      indexDoc.getMap<ConfigEntry>("config").set(entry.path, {
+        sha256: curSha,
+        size: cur.length,
+        category,
+        deviceId: this.ports.identity.deviceId(),
+      });
+      // Update the durable config base so the next remote push is not a spurious conflict.
+      await this.ports.engineState.setConfigBase(entry.path, curSha);
+      this.inbox.resolve(id);
+    } else {
+      // keep-theirs: write the winner's bytes to disk DIRECTLY (echo-guarded) — NOT via
+      // blobEngine.materialize, which would see the loser still on disk and re-trigger
+      // onConfigDivergence (a resolve loop).
+      const winner = entry.remoteSha;
+      const size = entry.remoteSize ?? 0;
+      const bytes = await this.ports.blobs.get(winner);
+      this.echo.recordWrite(entry.path, winner);
+      await this.ports.config.writeAtomic(entry.path, bytes);
+      // Publish the winner to the config map so both devices converge.
+      indexDoc.getMap<ConfigEntry>("config").set(entry.path, {
+        sha256: winner,
+        size,
+        category,
+        deviceId: this.ports.identity.deviceId(),
+      });
+      // Update the durable config base to the winner so the NEXT remote push for this path is
+      // treated as a normal update (local == new base) rather than triggering a spurious conflict.
+      await this.ports.engineState.setConfigBase(entry.path, winner);
+      this.inbox.resolve(id);
+    }
   }
 
   /**
@@ -3848,7 +3874,17 @@ export class SyncEngine {
 
   /** BlobEngine divergence hook for config paths: preserve "mine" (publish its bytes so keep-mine is
    *  resolvable on any device) and raise a config-file inbox entry; return true so materialize does NOT
-   *  overwrite the local file. */
+   *  overwrite the local file.
+   *
+   *  m4 fix: re-hash the re-read localBytes so the blob is stored under the ACTUAL current-disk sha,
+   *  not the (potentially stale) sha that was computed by the caller before the read. If the file
+   *  changed between the caller's hash and our read, the old code would put bytes under a mismatched
+   *  key → CorruptBlobError on peer fetch. If localBytes is null (file gone) we return false and let
+   *  the remote materialize.
+   *
+   *  m5(a) fix: entry id is `config-file:${path}` (no sha suffix) so a re-divergence on the same
+   *  path UPDATES the single entry (LWW on the inbox map) instead of accumulating a stale second
+   *  entry with the old sha. */
   private async onConfigDivergence(
     path: VaultPath,
     info: { localSha: Sha256; expectedSha: Sha256 },
@@ -3857,19 +3893,22 @@ export class SyncEngine {
     const base = await this.ports.engineState.getConfigBase(path);
     if (base !== null && info.localSha === base) return false; // local unchanged since last sync -> accept remote
     const localBytes = await this.ports.config.read(path);
-    if (localBytes !== null && !(await this.ports.blobs.has(info.localSha))) {
-      await this.ports.blobs.put(info.localSha, localBytes);
+    if (localBytes === null) return false; // nothing local to preserve -> let it materialize
+    // m4: re-hash the re-read bytes; don't trust the caller's (possibly stale) sha.
+    const actualLocalSha = await sha256OfBytes(localBytes);
+    if (!(await this.ports.blobs.has(actualLocalSha))) {
+      await this.ports.blobs.put(actualLocalSha, localBytes);
     }
     const indexDoc = this.indexDoc;
     if (indexDoc === null) return false;
     const remote = indexDoc.getMap<ConfigEntry>("config").get(path);
     this.inbox.add({
-      id: `config-file:${path}:${info.localSha.slice(0, 8)}`,
+      id: `config-file:${path}`, // m5(a): per-path id — re-divergence updates the one entry (no accumulation)
       kind: "config-file",
       path,
-      localSha: info.localSha,
+      localSha: actualLocalSha, // m4: use actual re-read sha, not the potentially stale info.localSha
       remoteSha: info.expectedSha,
-      localSize: localBytes?.length ?? 0,
+      localSize: localBytes.length,
       remoteSize: remote?.size ?? 0,
       detail: "Config file changed on another device.",
     });

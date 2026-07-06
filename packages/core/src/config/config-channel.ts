@@ -94,7 +94,9 @@ export class ConfigChannel {
       if (!this.categoryEnabled(key as VaultPath)) continue; // disabled category: don't drive local removes
       const e = this.d.config.get(key);
       if (e?.deleted === true) {
-        this.d.echo.recordWrite(key, e.sha256); // suppress the resulting onChange
+        // m6: echo.recordWrite removed — it was dead. The remove triggers onChange with null bytes;
+        // onLocalChange sees prev.deleted === true and returns early, so no spurious re-tombstone.
+        // The dead echo entry could have falsely suppressed a later genuine write of the same sha.
         await this.d.configPort.remove(key as VaultPath).catch(() => undefined);
       }
     }
