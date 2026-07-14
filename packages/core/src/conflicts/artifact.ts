@@ -31,11 +31,7 @@ const utf8 = (s: string): Uint8Array => new TextEncoder().encode(s);
  *     excluded. Decoupling the two is deliberate — a shared `_conflicts/` prefix would
  *     make recovered orphans permanently-pending, non-syncing docs.
  */
-export function withConflictSuffix(
-  original: VaultPath,
-  deviceId: DeviceId,
-  ts: string,
-): VaultPath {
+export function withConflictSuffix(original: VaultPath, deviceId: DeviceId, ts: string): VaultPath {
   const suffix = ` (conflict, ${deviceId}, ${ts})`;
   const slash = original.lastIndexOf("/");
   const dot = original.lastIndexOf(".");

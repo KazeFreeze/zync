@@ -49,7 +49,7 @@ describe("PluginDataVersionGate", () => {
     config.set(dataPath, PD("2.0.0"));
     const gate = new PluginDataVersionGate({
       config,
-      localVersion: async () => "1.0.0",
+      localVersion: () => Promise.resolve("1.0.0"),
     });
     await gate.reeval(["dv"]);
     expect(gate.blocks(dataPath)).toBe(true);
@@ -61,7 +61,7 @@ describe("PluginDataVersionGate", () => {
     let local: string | undefined = "1.0.0";
     const gate = new PluginDataVersionGate({
       config,
-      localVersion: async () => local,
+      localVersion: () => Promise.resolve(local),
     });
     const seen: string[][] = [];
     gate.observe((keys) => seen.push([...keys]));
@@ -82,7 +82,7 @@ describe("PluginDataVersionGate", () => {
     config.set(dataPath, PD("1.0.0"));
     const gate = new PluginDataVersionGate({
       config,
-      localVersion: async () => undefined,
+      localVersion: () => Promise.resolve(undefined),
     });
     await gate.reeval(["dv"]);
     expect(gate.blocks(dataPath)).toBe(true);
@@ -93,7 +93,7 @@ describe("PluginDataVersionGate", () => {
     config.set(dataPath, PD("1.0.0"));
     const gate = new PluginDataVersionGate({
       config,
-      localVersion: async () => "2.0.0",
+      localVersion: () => Promise.resolve("2.0.0"),
     });
     await gate.reeval(["dv"]);
     expect(gate.blocks(dataPath)).toBe(false);
@@ -102,10 +102,10 @@ describe("PluginDataVersionGate", () => {
   it("reeval() with no ids evaluates ALL plugin-data entries", async () => {
     const config = new FakeCrdtMap<ConfigEntry>();
     config.set(dataPath, PD("2.0.0"));
-    config.set(".obsidian/plugins/other/data.json" as VaultPath, PD("2.0.0"));
+    config.set(".obsidian/plugins/other/data.json", PD("2.0.0"));
     const gate = new PluginDataVersionGate({
       config,
-      localVersion: async () => "1.0.0",
+      localVersion: () => Promise.resolve("1.0.0"),
     });
     await gate.reeval();
     expect(gate.blocks(dataPath)).toBe(true);
@@ -117,7 +117,7 @@ describe("PluginDataVersionGate", () => {
     config.set(dataPath, { ...PD("2.0.0"), deleted: true });
     const gate = new PluginDataVersionGate({
       config,
-      localVersion: async () => "1.0.0",
+      localVersion: () => Promise.resolve("1.0.0"),
     });
     await gate.reeval(["dv"]);
     expect(gate.blocks(dataPath)).toBe(false);
@@ -137,7 +137,7 @@ describe("PluginDataVersionGate", () => {
     const gate = new PluginDataVersionGate({
       config,
       localVersion: async () => {
-        const label = `call${call}`;
+        const label = `call${String(call)}`;
         // No two localVersion bodies may be in-flight at once if reeval is serialized.
         expect(active).toHaveLength(0);
         active.push(label);
@@ -167,7 +167,7 @@ describe("PluginDataVersionGate", () => {
     config.set(dataPath, PD("2.0.0"));
     const gate = new PluginDataVersionGate({
       config,
-      localVersion: async () => "1.0.0", // holds
+      localVersion: () => Promise.resolve("1.0.0"), // holds
     });
     await gate.reeval(["dv"]);
     expect(gate.blocks(dataPath)).toBe(true);
@@ -180,14 +180,20 @@ describe("PluginDataVersionGate", () => {
 
   it("holdPaths holds a plugin-data path synchronously (structural, pre-reeval)", () => {
     const config = new FakeCrdtMap<ConfigEntry>();
-    const gate = new PluginDataVersionGate({ config, localVersion: async () => "1.0.0" });
+    const gate = new PluginDataVersionGate({
+      config,
+      localVersion: () => Promise.resolve("1.0.0"),
+    });
     gate.holdPaths([dataPath]);
     expect(gate.blocks(dataPath)).toBe(true); // held immediately, before any reeval await
   });
 
   it("holdPaths ignores non-plugin-data paths (never hides themes/snippets)", () => {
     const config = new FakeCrdtMap<ConfigEntry>();
-    const gate = new PluginDataVersionGate({ config, localVersion: async () => "1.0.0" });
+    const gate = new PluginDataVersionGate({
+      config,
+      localVersion: () => Promise.resolve("1.0.0"),
+    });
     gate.holdPaths([".obsidian/snippets/x.css"]);
     expect(gate.blocks(".obsidian/snippets/x.css" as VaultPath)).toBe(false);
   });
@@ -195,7 +201,10 @@ describe("PluginDataVersionGate", () => {
   it("reeval RELEASES a pessimistically-held path whose version is adequate", async () => {
     const config = new FakeCrdtMap<ConfigEntry>();
     config.set(dataPath, PD("1.0.0")); // writer v1
-    const gate = new PluginDataVersionGate({ config, localVersion: async () => "1.0.0" }); // local v1 (adequate)
+    const gate = new PluginDataVersionGate({
+      config,
+      localVersion: () => Promise.resolve("1.0.0"),
+    }); // local v1 (adequate)
     gate.holdPaths([dataPath]);
     expect(gate.blocks(dataPath)).toBe(true);
     await gate.reeval(["dv"]);

@@ -103,7 +103,9 @@ export class PendingUpdatesModal extends Modal {
     this.button(act, "Apply", id);
 
     const sub = row.createDiv({ cls: "zync-row-sub" });
-    sub.createSpan({ text: "New code/settings materialized. Apply to reload, or restart Obsidian." });
+    sub.createSpan({
+      text: "New code/settings materialized. Apply to reload, or restart Obsidian.",
+    });
   }
 
   private button(parent: HTMLElement, text: string, id: string): void {

@@ -39,11 +39,7 @@ describe("classify", () => {
 
   it("excludes conflict backups under _conflicts/ (device-local, folder-based)", () => {
     expect(
-      classify(
-        p("_conflicts/notes/x (conflict, dev, ts).md"),
-        enc("losing text"),
-        caps,
-      ).route,
+      classify(p("_conflicts/notes/x (conflict, dev, ts).md"), enc("losing text"), caps).route,
     ).toBe("excluded");
   });
 
@@ -51,11 +47,7 @@ describe("classify", () => {
     // Only the _conflicts/ FOLDER is device-local. A beside-original recovery path is a
     // LIVE, SYNCING doc; excluding it would make recovered concurrent-create losers non-syncing.
     expect(
-      classify(
-        p("notes/x (conflict, dev, ts).md"),
-        enc("recovered orphan text"),
-        caps,
-      ).route,
+      classify(p("notes/x (conflict, dev, ts).md"), enc("recovered orphan text"), caps).route,
     ).toBe("crdt-prose");
   });
 

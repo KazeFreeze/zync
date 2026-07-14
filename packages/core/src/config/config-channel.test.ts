@@ -441,8 +441,6 @@ describe("ConfigChannel", () => {
     const enc = (s: string) => new TextEncoder().encode(s);
     const dataPath = (id: string) =>
       `.obsidian/plugins/${id}/data.json` as Parameters<typeof ConfigChannel.prototype.publish>[0];
-    const manifestPath = (id: string) =>
-      `.obsidian/plugins/${id}/manifest.json` as Parameters<typeof ConfigChannel.prototype.publish>[0];
 
     /** Build a channel wired with a real in-memory blob store and configPort that can return manifest bytes. */
     function makePluginDataChannel(manifestBytes: Uint8Array | null) {
@@ -456,11 +454,11 @@ describe("ConfigChannel", () => {
         return Promise.resolve(null as Uint8Array | null);
       });
       const configPort: ConfigPort = {
-        read: configReadFn as ConfigPort["read"],
+        read: configReadFn,
         writeAtomic: vi.fn(() => Promise.resolve()),
         remove: vi.fn(() => Promise.resolve()),
-        list: vi.fn(() => Promise.resolve([])) as unknown as ConfigPort["list"],
-        onChange: (_cb) => () => undefined,
+        list: vi.fn(() => Promise.resolve([])),
+        onChange: () => () => undefined,
         rescan: vi.fn(() => Promise.resolve()),
         close: vi.fn(),
       };
@@ -496,8 +494,8 @@ describe("ConfigChannel", () => {
 
       await ch.publish(dataPath("dv"), enc(`{"b":1,"a":2}`));
 
-      const entry = configMap.get(dataPath("dv"))!;
-      expect(entry).toBeDefined();
+      const entry = configMap.get(dataPath("dv"));
+      if (entry === undefined) throw new Error("expected plugin-data entry");
       expect(entry.category).toBe("plugin-data");
       expect(entry.version).toBe("1.2.0");
 
@@ -510,10 +508,14 @@ describe("ConfigChannel", () => {
       const { ch, configMap } = makePluginDataChannel(manifestBytes);
 
       await ch.publish(dataPath("dv"), enc(`{"a":1,"b":2}`));
-      const sha1 = configMap.get(dataPath("dv"))!.sha256;
+      const first = configMap.get(dataPath("dv"));
+      if (first === undefined) throw new Error("expected plugin-data entry");
+      const sha1 = first.sha256;
 
       await ch.publish(dataPath("dv"), enc(`{"b":2,"a":1}`));
-      expect(configMap.get(dataPath("dv"))!.sha256).toBe(sha1);
+      const second = configMap.get(dataPath("dv"));
+      if (second === undefined) throw new Error("expected plugin-data entry");
+      expect(second.sha256).toBe(sha1);
     });
 
     it("plugin-data: no manifest -> entry published without version field", async () => {
@@ -521,8 +523,8 @@ describe("ConfigChannel", () => {
 
       await ch.publish(dataPath("dv"), enc(`{"x":1}`));
 
-      const entry = configMap.get(dataPath("dv"))!;
-      expect(entry).toBeDefined();
+      const entry = configMap.get(dataPath("dv"));
+      if (entry === undefined) throw new Error("expected plugin-data entry");
       expect(entry.version).toBeUndefined();
       expect(entry.category).toBe("plugin-data");
     });
@@ -531,13 +533,16 @@ describe("ConfigChannel", () => {
       const { ch, configMap, blobStore } = makePluginDataChannel(null);
 
       const rawBytes = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
-      await ch.publish(".obsidian/themes/Foo/theme.css" as Parameters<typeof ConfigChannel.prototype.publish>[0], rawBytes);
+      await ch.publish(
+        ".obsidian/themes/Foo/theme.css" as Parameters<typeof ConfigChannel.prototype.publish>[0],
+        rawBytes,
+      );
 
       const entry = configMap.get(".obsidian/themes/Foo/theme.css");
-      expect(entry).toBeDefined();
-      expect(entry!.category).toBe("themes");
-      expect(entry!.version).toBeUndefined();
-      const stored = await blobStore.get(entry!.sha256);
+      if (entry === undefined) throw new Error("expected themes entry");
+      expect(entry.category).toBe("themes");
+      expect(entry.version).toBeUndefined();
+      const stored = await blobStore.get(entry.sha256);
       // Raw bytes, not canonicalized
       expect(stored).toEqual(rawBytes);
     });
@@ -549,18 +554,18 @@ describe("ConfigChannel", () => {
 
       let dataContent: Uint8Array | null = enc(`{"a":1}`);
       const configReadFn = vi.fn((path: string) => {
-        if (path.endsWith("/manifest.json") && manifestBytes !== null) {
+        if (path.endsWith("/manifest.json")) {
           return Promise.resolve(manifestBytes);
         }
         if (path === dataPath("dv")) return Promise.resolve(dataContent);
         return Promise.resolve(null as Uint8Array | null);
       });
       const configPort: ConfigPort = {
-        read: configReadFn as ConfigPort["read"],
+        read: configReadFn,
         writeAtomic: vi.fn(() => Promise.resolve()),
         remove: vi.fn(() => Promise.resolve()),
-        list: vi.fn(() => Promise.resolve([])) as unknown as ConfigPort["list"],
-        onChange: (_cb) => () => undefined,
+        list: vi.fn(() => Promise.resolve([])),
+        onChange: () => () => undefined,
         rescan: vi.fn(() => Promise.resolve()),
         close: vi.fn(),
       };
@@ -593,7 +598,8 @@ describe("ConfigChannel", () => {
       dataContent = null;
       await channel["onLocalChange"](dataPath("dv"));
 
-      const e = configMap.get(dataPath("dv"))!;
+      const e = configMap.get(dataPath("dv"));
+      if (e === undefined) throw new Error("expected plugin-data entry");
       expect(e.deleted).not.toBe(true); // entry preserved, no tombstone
     });
 
@@ -605,18 +611,18 @@ describe("ConfigChannel", () => {
       let dataContent: Uint8Array | null = enc(`{"a":1,"ts":1100}`);
       let clockNow = 0;
       const configReadFn = vi.fn((path: string) => {
-        if (path.endsWith("/manifest.json") && manifestBytes !== null) {
+        if (path.endsWith("/manifest.json")) {
           return Promise.resolve(manifestBytes);
         }
         if (path === dataPath("dv")) return Promise.resolve(dataContent);
         return Promise.resolve(null as Uint8Array | null);
       });
       const configPort: ConfigPort = {
-        read: configReadFn as ConfigPort["read"],
+        read: configReadFn,
         writeAtomic: vi.fn(() => Promise.resolve()),
         remove: vi.fn(() => Promise.resolve()),
-        list: vi.fn(() => Promise.resolve([])) as unknown as ConfigPort["list"],
-        onChange: (_cb) => () => undefined,
+        list: vi.fn(() => Promise.resolve([])),
+        onChange: () => () => undefined,
         rescan: vi.fn(() => Promise.resolve()),
         close: vi.fn(),
       };
@@ -655,18 +661,18 @@ describe("ConfigChannel", () => {
 
       let clockNow = 0;
       const configReadFn = vi.fn((path: string) => {
-        if (path.endsWith("/manifest.json") && manifestBytes !== null) {
+        if (path.endsWith("/manifest.json")) {
           return Promise.resolve(manifestBytes);
         }
         if (path === dataPath("dv")) return Promise.resolve(enc(`{"a":2}`));
         return Promise.resolve(null as Uint8Array | null);
       });
       const configPort: ConfigPort = {
-        read: configReadFn as ConfigPort["read"],
+        read: configReadFn,
         writeAtomic: vi.fn(() => Promise.resolve()),
         remove: vi.fn(() => Promise.resolve()),
-        list: vi.fn(() => Promise.resolve([])) as unknown as ConfigPort["list"],
-        onChange: (_cb) => () => undefined,
+        list: vi.fn(() => Promise.resolve([])),
+        onChange: () => () => undefined,
         rescan: vi.fn(() => Promise.resolve()),
         close: vi.fn(),
       };
@@ -698,11 +704,16 @@ describe("ConfigChannel", () => {
     });
 
     it("themes: a local delete STILL tombstones (unchanged)", async () => {
-      const { ch, config, configRead, fireOnChange } = makeChannel({ themes: true, snippets: true });
+      const { ch, config, configRead, fireOnChange } = makeChannel({
+        themes: true,
+        snippets: true,
+      });
 
       const bytes = new Uint8Array([1, 2, 3]);
       configRead.mockResolvedValue(bytes);
-      const themePath = ".obsidian/snippets/x.css" as Parameters<typeof ConfigChannel.prototype.publish>[0];
+      const themePath = ".obsidian/snippets/x.css" as Parameters<
+        typeof ConfigChannel.prototype.publish
+      >[0];
       await ch.publish(themePath, bytes);
       expect(config.get(themePath)).toBeDefined();
 
@@ -712,7 +723,7 @@ describe("ConfigChannel", () => {
       fireOnChange(themePath);
 
       await poll(() => {
-        expect(config.get(themePath)!.deleted).toBe(true);
+        expect(config.get(themePath)?.deleted).toBe(true);
       });
     });
   });

@@ -52,9 +52,9 @@ describe("isConflictArtifactPath (folder-only — real backups, NOT synced recov
   it("does NOT recognize a beside-original (conflict, …) filename (indistinguishable from orphan recovery, which must SYNC)", () => {
     // A beside-original conflict-style name is a RECOVERY path (live, syncing) — folder-only
     // classification must NOT exclude it, and must not risk unsyncing a user's real note.
-    expect(
-      isConflictArtifactPath(path("notes/a (conflict, dev-b, 2026-06-11T12-00-00Z).md")),
-    ).toBe(false);
+    expect(isConflictArtifactPath(path("notes/a (conflict, dev-b, 2026-06-11T12-00-00Z).md"))).toBe(
+      false,
+    );
     expect(
       isConflictArtifactPath(path("notes/README (conflict, dev-b, 2026-06-11T12-00-00Z)")),
     ).toBe(false);

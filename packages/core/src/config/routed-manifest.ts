@@ -11,12 +11,22 @@ import { configReady, configSiblings } from "./config-ready.js";
  * blobs are vault content), so entries()/observe() merge without collision.
  */
 export class RoutedManifest implements CrdtMap<BlobManifestEntry> {
-  private readonly cats: { themes: boolean; snippets: boolean; plugins?: boolean; "plugin-data"?: boolean };
+  private readonly cats: {
+    themes: boolean;
+    snippets: boolean;
+    plugins?: boolean;
+    "plugin-data"?: boolean;
+  };
 
   constructor(
     private readonly blobs: CrdtMap<BlobManifestEntry>,
     private readonly config: CrdtMap<ConfigEntry>,
-    enabledCategories?: { themes: boolean; snippets: boolean; plugins?: boolean; "plugin-data"?: boolean },
+    enabledCategories?: {
+      themes: boolean;
+      snippets: boolean;
+      plugins?: boolean;
+      "plugin-data"?: boolean;
+    },
     private readonly gate?: {
       allows(path: VaultPath): boolean;
       observe?(cb: (changedPluginIds: string[]) => void): Unsubscribe;
@@ -110,7 +120,11 @@ export class RoutedManifest implements CrdtMap<BlobManifestEntry> {
       );
     }
     if (this.versionGate?.observe !== undefined) {
-      subs.push(this.versionGate.observe((keys) => cb(expand(keys))));
+      subs.push(
+        this.versionGate.observe((keys) => {
+          cb(expand(keys));
+        }),
+      );
     }
     return () => {
       for (const u of subs) u();

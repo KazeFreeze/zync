@@ -464,7 +464,7 @@ describe("RoutedManifest", () => {
           blocks: (p: VaultPath) => held.has(p),
           observe: (cb: (k: string[]) => void): Unsubscribe => {
             observers.push(cb);
-            return () => {};
+            return () => undefined;
           },
         },
       );

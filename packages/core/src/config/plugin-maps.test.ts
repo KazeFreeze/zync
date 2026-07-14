@@ -13,10 +13,7 @@ function gate(isMobile: boolean) {
 const code = (id: string) => `.obsidian/plugins/${id}/main.js` as VaultPath;
 const data = (id: string) => `.obsidian/plugins/${id}/data.json` as VaultPath;
 
-function gateWithSettings(
-  optIn: [string, boolean][],
-  settings: [string, boolean][] = [],
-) {
+function gateWithSettings(optIn: [string, boolean][], settings: [string, boolean][] = []) {
   const o = new FakeCrdtMap<boolean>();
   for (const [k, v] of optIn) o.set(k, v);
   const s = new FakeCrdtMap<boolean>();
@@ -68,8 +65,6 @@ describe("PluginGate — settingsSync (Slice 3)", () => {
     expect(g.allows(code("dv"))).toBe(true);
   });
   it("data path denied when not opted-in regardless of settingsSync", () => {
-    expect(
-      gateWithSettings([["dv", false]], [["dv", true]]).allows(data("dv")),
-    ).toBe(false);
+    expect(gateWithSettings([["dv", false]], [["dv", true]]).allows(data("dv"))).toBe(false);
   });
 });

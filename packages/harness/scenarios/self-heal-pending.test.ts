@@ -66,69 +66,65 @@ describe("self-heal-pending", () => {
     // No partition/heal levers used; nothing to clean up.
   });
 
-  test(
-    "startup self-heal drains pendingDocs to 0 after synced-stamp store loss over the relay",
-    async () => {
-      // ── Phase 1: confirm initial convergence ──
+  test("startup self-heal drains pendingDocs to 0 after synced-stamp store loss over the relay", async () => {
+    // ── Phase 1: confirm initial convergence ──
 
-      // Both devices must start fully quiescent (pendingDocs === 0) before we wipe stamps.
-      const [initA, initB] = await Promise.all([a.status(), b.status()]);
-      expect(initA.pendingDocs).toBe(0);
-      expect(initB.pendingDocs).toBe(0);
+    // Both devices must start fully quiescent (pendingDocs === 0) before we wipe stamps.
+    const [initA, initB] = await Promise.all([a.status(), b.status()]);
+    expect(initA.pendingDocs).toBe(0);
+    expect(initB.pendingDocs).toBe(0);
 
-      // Snapshot the converged tree to compare after the heal.
-      const treeBeforeA = await a.tree();
-      const treeBeforeB = await b.tree();
-      expect(treesEqual(treeBeforeA, treeBeforeB)).toBe(true);
-      // Confirm there is actual content to heal (the mini fixture has notes).
-      const noteCount = Object.keys(treeBeforeA).length;
-      expect(noteCount).toBeGreaterThan(0);
+    // Snapshot the converged tree to compare after the heal.
+    const treeBeforeA = await a.tree();
+    const treeBeforeB = await b.tree();
+    expect(treesEqual(treeBeforeA, treeBeforeB)).toBe(true);
+    // Confirm there is actual content to heal (the mini fixture has notes).
+    const noteCount = Object.keys(treeBeforeA).length;
+    expect(noteCount).toBeGreaterThan(0);
 
-      // ── Phase 2: simulate synced-stamp loss that survives restart ──
+    // ── Phase 2: simulate synced-stamp loss that survives restart ──
 
-      // Stop A's engine. The container + control API stay up.
-      await a.stop();
+    // Stop A's engine. The container + control API stay up.
+    await a.stop();
 
-      // Clear all synced stamps while the engine is stopped. The route calls
-      // FsEngineStateStore.clearAllSyncedStamps() which flushes the cleared
-      // state to disk atomically — the cleared state persists across the restart.
-      await a.clearSyncedStamps();
+    // Clear all synced stamps while the engine is stopped. The route calls
+    // FsEngineStateStore.clearAllSyncedStamps() which flushes the cleared
+    // state to disk atomically — the cleared state persists across the restart.
+    await a.clearSyncedStamps();
 
-      // Start A's engine again. It loads from the persisted (now-cleared) state file:
-      // no synced stamps exist → every live doc is re-pending → the F2 startup
-      // self-heal is armed and begins draining over the relay.
-      await a.start();
+    // Start A's engine again. It loads from the persisted (now-cleared) state file:
+    // no synced stamps exist → every live doc is re-pending → the F2 startup
+    // self-heal is armed and begins draining over the relay.
+    await a.start();
 
-      // Immediately after start, A should have a non-zero pendingDocs count (all the
-      // notes that lost their stamps). We do NOT assert a specific number here because
-      // the self-heal may have already begun draining by the time we read status, but
-      // we verify this by checking convergence at the end.
-      // (Asserting > 0 would be a TOCTOU race — the heal can beat the read.)
+    // Immediately after start, A should have a non-zero pendingDocs count (all the
+    // notes that lost their stamps). We do NOT assert a specific number here because
+    // the self-heal may have already begun draining by the time we read status, but
+    // we verify this by checking convergence at the end.
+    // (Asserting > 0 would be a TOCTOU race — the heal can beat the read.)
 
-      // ── Phase 3: assert self-heal drains pendingDocs back to 0 (no manual flush) ──
+    // ── Phase 3: assert self-heal drains pendingDocs back to 0 (no manual flush) ──
 
-      // Poll until A's pendingDocs reaches 0. NO flush is issued — the startup self-heal
-      // must drain autonomously. A generous 120s covers a large relay round-trip under load.
-      await waitSelfHealDrained(120_000);
+    // Poll until A's pendingDocs reaches 0. NO flush is issued — the startup self-heal
+    // must drain autonomously. A generous 120s covers a large relay round-trip under load.
+    await waitSelfHealDrained(120_000);
 
-      // After the self-heal, A's pendingDocs is 0.
-      const finalA = await a.status();
-      expect(finalA.pendingDocs).toBe(0);
+    // After the self-heal, A's pendingDocs is 0.
+    const finalA = await a.status();
+    expect(finalA.pendingDocs).toBe(0);
 
-      // ── Phase 4: assert no data loss — content unchanged and both devices converged ──
+    // ── Phase 4: assert no data loss — content unchanged and both devices converged ──
 
-      const [treeAfterA, treeAfterB] = await Promise.all([a.tree(), b.tree()]);
+    const [treeAfterA, treeAfterB] = await Promise.all([a.tree(), b.tree()]);
 
-      // A's tree matches B's tree: the self-heal did not corrupt any files.
-      expect(treesEqual(treeAfterA, treeAfterB)).toBe(true);
+    // A's tree matches B's tree: the self-heal did not corrupt any files.
+    expect(treesEqual(treeAfterA, treeAfterB)).toBe(true);
 
-      // A's tree is byte-for-byte identical to the pre-wipe snapshot: no data loss.
-      expect(treesEqual(treeAfterA, treeBeforeA)).toBe(true);
+    // A's tree is byte-for-byte identical to the pre-wipe snapshot: no data loss.
+    expect(treesEqual(treeAfterA, treeBeforeA)).toBe(true);
 
-      // B is still quiescent (the heal did not disturb B's state).
-      const finalB = await b.status();
-      expect(finalB.pendingDocs).toBe(0);
-    },
-    300_000,
-  );
+    // B is still quiescent (the heal did not disturb B's state).
+    const finalB = await b.status();
+    expect(finalB.pendingDocs).toBe(0);
+  }, 300_000);
 });

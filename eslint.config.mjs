@@ -26,6 +26,17 @@ export default tseslint.config(
   },
   ...tseslint.configs.strictTypeChecked,
   ...tseslint.configs.stylisticTypeChecked,
+  // Allow bracket access to private/protected class members — TypeScript permits `obj["priv"]`
+  // as a deliberate escape hatch (e.g. tests exercising a private method), so lint's dot-notation
+  // rule must not force it into `obj.priv` (a TS2341 private-access error).
+  {
+    rules: {
+      "@typescript-eslint/dot-notation": [
+        "error",
+        { allowPrivateClassPropertyAccess: true, allowProtectedClassPropertyAccess: true },
+      ],
+    },
+  },
   {
     languageOptions: {
       parserOptions: {

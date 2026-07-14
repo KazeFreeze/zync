@@ -45,7 +45,7 @@ export class ObsidianPluginRuntime implements PluginRuntimePort {
 
   async applyExternalSettings(id: string): Promise<boolean> {
     try {
-      const inst = this.pm?.plugins?.[id];
+      const inst = this.pm?.plugins[id];
       const hook = inst?.onExternalSettingsChange;
       if (typeof hook !== "function") return false;
       await Promise.resolve(hook.call(inst)); // plugin re-reads its data.json live

@@ -52,12 +52,7 @@ async function waitConflictSettled(timeoutMs: number): Promise<void> {
   for (;;) {
     await Promise.all([a.flush().catch(() => undefined), b.flush().catch(() => undefined)]);
 
-    const [sa, sb, treeA, treeB] = await Promise.all([
-      a.status(),
-      b.status(),
-      a.tree(),
-      b.tree(),
-    ]);
+    const [sa, sb, treeA, treeB] = await Promise.all([a.status(), b.status(), a.tree(), b.tree()]);
     const alphaA = treeA["notes/alpha.md"]?.sha256;
     const alphaB = treeB["notes/alpha.md"]?.sha256;
 
@@ -91,20 +86,12 @@ async function waitReconverged(timeoutMs: number): Promise<void> {
   for (;;) {
     await Promise.all([a.flush().catch(() => undefined), b.flush().catch(() => undefined)]);
 
-    const [sa, sb, treeA, treeB] = await Promise.all([
-      a.status(),
-      b.status(),
-      a.tree(),
-      b.tree(),
-    ]);
+    const [sa, sb, treeA, treeB] = await Promise.all([a.status(), b.status(), a.tree(), b.tree()]);
     const alphaA = treeA["notes/alpha.md"]?.sha256;
     const alphaB = treeB["notes/alpha.md"]?.sha256;
 
     const reconverged =
-      sa.pendingDocs === 0 &&
-      sb.pendingDocs === 0 &&
-      alphaA !== undefined &&
-      alphaA === alphaB;
+      sa.pendingDocs === 0 && sb.pendingDocs === 0 && alphaA !== undefined && alphaA === alphaB;
     if (reconverged) return;
 
     if (Date.now() >= deadline) {
@@ -128,81 +115,77 @@ describe("conflict artifact — device-local across engine restart", () => {
     await heal("device-a").catch(() => undefined);
   });
 
-  test(
-    "conflict artifact is NOT re-published to peer after A's engine restarts",
-    async () => {
-      // ── Phase 1: manufacture a same-line conflict on A (mirrors same-line-conflict.test.ts) ──
+  test("conflict artifact is NOT re-published to peer after A's engine restarts", async () => {
+    // ── Phase 1: manufacture a same-line conflict on A (mirrors same-line-conflict.test.ts) ──
 
-      // Open an editor on A → the note's CRDT becomes active-bound.
-      await a.editorOpen("notes/alpha.md");
+    // Open an editor on A → the note's CRDT becomes active-bound.
+    await a.editorOpen("notes/alpha.md");
 
-      // Diverge the CRDT from base on the STATUS line without touching disk.
-      const before = (await a.doc("notes/alpha.md")).text;
-      const valueAt = before.indexOf("pristine");
-      expect(valueAt).toBeGreaterThanOrEqual(0);
-      await a.editorType({
-        path: "notes/alpha.md",
-        at: valueAt,
-        del: "pristine".length,
-        ins: "edited-in-editor",
-      });
+    // Diverge the CRDT from base on the STATUS line without touching disk.
+    const before = (await a.doc("notes/alpha.md")).text;
+    const valueAt = before.indexOf("pristine");
+    expect(valueAt).toBeGreaterThanOrEqual(0);
+    await a.editorType({
+      path: "notes/alpha.md",
+      at: valueAt,
+      del: "pristine".length,
+      ins: "edited-in-editor",
+    });
 
-      // Racing external write to the SAME line: merge3(base=pristine, disk=DISK_SIDE,
-      // crdt=CRDT_SIDE) → NON-clean → one conflict artifact + one inbox entry on A.
-      await a.edit({ path: "notes/alpha.md", find: ANCHOR, replace: DISK_SIDE });
+    // Racing external write to the SAME line: merge3(base=pristine, disk=DISK_SIDE,
+    // crdt=CRDT_SIDE) → NON-clean → one conflict artifact + one inbox entry on A.
+    await a.edit({ path: "notes/alpha.md", find: ANCHOR, replace: DISK_SIDE });
 
-      // Wait for both devices to settle: alpha.md converged + inbox synced to B.
-      await waitConflictSettled(90_000);
+    // Wait for both devices to settle: alpha.md converged + inbox synced to B.
+    await waitConflictSettled(90_000);
 
-      // Confirm the artifact exists on A (device-local) and NOT on B.
-      const artifactsA_before = conflictArtifacts(await a.tree());
-      const artifactsB_before = conflictArtifacts(await b.tree());
-      expect(artifactsA_before).toHaveLength(1);
-      expect(artifactsB_before).toHaveLength(0);
+    // Confirm the artifact exists on A (device-local) and NOT on B.
+    const artifactsA_before = conflictArtifacts(await a.tree());
+    const artifactsB_before = conflictArtifacts(await b.tree());
+    expect(artifactsA_before).toHaveLength(1);
+    expect(artifactsB_before).toHaveLength(0);
 
-      // Confirm the inbox entry reached B (synced-inbox property).
-      const conflictsA_before = (await a.status()).conflicts as {
-        id: string;
-        artifactPath?: string;
-      }[];
-      const conflictsB_before = (await b.status()).conflicts as {
-        id: string;
-        artifactPath?: string;
-      }[];
-      expect(conflictsA_before).toHaveLength(1);
-      expect(conflictsB_before).toEqual(conflictsA_before);
+    // Confirm the inbox entry reached B (synced-inbox property).
+    const conflictsA_before = (await a.status()).conflicts as {
+      id: string;
+      artifactPath?: string;
+    }[];
+    const conflictsB_before = (await b.status()).conflicts as {
+      id: string;
+      artifactPath?: string;
+    }[];
+    expect(conflictsA_before).toHaveLength(1);
+    expect(conflictsB_before).toEqual(conflictsA_before);
 
-      // ── Phase 2: RESTART A's sync engine (the new coverage) ──
+    // ── Phase 2: RESTART A's sync engine (the new coverage) ──
 
-      // Stop then immediately re-start A's sync engine — same stop/start the
-      // config-conflict scenario uses. This triggers a full bootstrap re-scan.
-      // Before the _conflicts/ classification exclusion this caused the artifact
-      // to be re-classified as prose and published to B.
-      await a.stop();
-      await a.start();
+    // Stop then immediately re-start A's sync engine — same stop/start the
+    // config-conflict scenario uses. This triggers a full bootstrap re-scan.
+    // Before the _conflicts/ classification exclusion this caused the artifact
+    // to be re-classified as prose and published to B.
+    await a.stop();
+    await a.start();
 
-      // Allow the re-bootstrapped engine to re-converge with B.
-      await waitReconverged(90_000);
+    // Allow the re-bootstrapped engine to re-converge with B.
+    await waitReconverged(90_000);
 
-      // ── Phase 3: assert artifact is STILL device-local after the restart ──
+    // ── Phase 3: assert artifact is STILL device-local after the restart ──
 
-      // A still holds its local copy of the conflict artifact.
-      const artifactsA_after = conflictArtifacts(await a.tree());
-      expect(artifactsA_after).toHaveLength(1);
-      // The artifact path is unchanged.
-      expect(artifactsA_after[0]).toBe(artifactsA_before[0]);
+    // A still holds its local copy of the conflict artifact.
+    const artifactsA_after = conflictArtifacts(await a.tree());
+    expect(artifactsA_after).toHaveLength(1);
+    // The artifact path is unchanged.
+    expect(artifactsA_after[0]).toBe(artifactsA_before[0]);
 
-      // B's tree is STILL free of conflict artifacts — the restart bootstrap did NOT
-      // re-publish the artifact to B. This assertion would FAIL before the fix.
-      const artifactsB_after = conflictArtifacts(await b.tree());
-      expect(artifactsB_after).toHaveLength(0);
+    // B's tree is STILL free of conflict artifacts — the restart bootstrap did NOT
+    // re-publish the artifact to B. This assertion would FAIL before the fix.
+    const artifactsB_after = conflictArtifacts(await b.tree());
+    expect(artifactsB_after).toHaveLength(0);
 
-      // B's normal prose content (alpha.md) is unchanged / still converged with A.
-      const winnerA = await a.read("notes/alpha.md");
-      const winnerB = await b.read("notes/alpha.md");
-      expect(winnerA).toEqual(winnerB);
-      expect(winnerA).toContain(CRDT_SIDE);
-    },
-    240_000,
-  );
+    // B's normal prose content (alpha.md) is unchanged / still converged with A.
+    const winnerA = await a.read("notes/alpha.md");
+    const winnerB = await b.read("notes/alpha.md");
+    expect(winnerA).toEqual(winnerB);
+    expect(winnerA).toContain(CRDT_SIDE);
+  }, 240_000);
 });

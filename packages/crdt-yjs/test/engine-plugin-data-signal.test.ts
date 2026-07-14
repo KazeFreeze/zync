@@ -118,8 +118,8 @@ describe("onPluginDataMaterialized engine signal (Slice 3b)", () => {
   let b: Device;
 
   afterEach(async () => {
-    await a?.engine.stop();
-    await b?.engine.stop();
+    await a.engine.stop();
+    await b.engine.stop();
   });
 
   it("fires (id) when a data.json materializes for a desired-active plugin on the receiving device", async () => {
@@ -225,7 +225,7 @@ describe("onPluginDataMaterialized engine signal (Slice 3b)", () => {
     // onPluginCodeMaterialized, NOT onPluginDataMaterialized.
     const mainJsPath = vp(".obsidian/plugins/dv/main.js");
     const mainJsBytes = enc("// plugin code");
-    await a.configFiles.set(mainJsPath, mainJsBytes);
+    a.configFiles.set(mainJsPath, mainJsBytes);
     // Publish via setPluginOptIn bundle publishing by directly calling configChannel.
     // Since A already opted in, re-calling setPluginOptIn would be a no-op for the CRDT
     // but republishes the bundle files. We use writePluginData equivalent for the code file

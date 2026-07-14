@@ -123,7 +123,8 @@ export class PluginDataVersionGate {
       const pid = pluginIdOf(p);
       if (pid === undefined || (ids !== undefined && !ids.includes(pid))) continue;
       const e = this.d.config.get(p);
-      if (e === undefined || e.deleted === true || e.category !== "plugin-data") this.held.delete(p);
+      if (e === undefined || e.deleted === true || e.category !== "plugin-data")
+        this.held.delete(p);
     }
     if (released.length > 0) for (const cb of this.cbs) cb(released);
   }
