@@ -9,6 +9,7 @@ import type {
   EngineStateStore,
   AttachedDoc,
   CrdtDoc,
+  CrdtMap,
   DeviceId,
   DocId,
   Sha256,
@@ -19,9 +20,24 @@ import type {
 } from "./ports.js";
 import { INDEX_DOC_ID } from "./ports.js";
 import { ConfigChannel } from "./config/config-channel.js";
+import {
+  PluginEnabledChannel,
+  type CommunityPluginsPort,
+} from "./config/plugin-enabled-channel.js";
 import { RoutedManifest } from "./config/routed-manifest.js";
+import { PluginDataVersionGate } from "./config/plugin-data-gate.js";
+import { readManifestVersion } from "./config/manifest.js";
 import { RoutedVault } from "./config/routed-vault.js";
-import { configCategoryOf, isConfigZone, type ConfigEntry } from "./config/config-entry.js";
+import { configIdentitySha, configStoredBytes } from "./config/canonical.js";
+import {
+  configCategoryOf,
+  isConfigZone,
+  pluginIdOf,
+  PLUGIN_BUNDLE_FILES,
+  type ConfigEntry,
+} from "./config/config-entry.js";
+import { PluginGate, type PluginMeta } from "./config/plugin-maps.js";
+import { groupKeyOf, groupMembers } from "./config/config-group.js";
 import type { Route } from "./classify/classify.js";
 import { classify, type Caps } from "./classify/classify.js";
 import { EchoLedger } from "./bridge/echo.js";
@@ -43,7 +59,7 @@ import { orphanSweep, orphanRecoveryPath, type OrphanMeta } from "./protocol/orp
 import { makeStamp, stampHash, stampsEqual } from "./protocol/stamp.js";
 import { BlobEngine, type BlobFetchPolicy, type BlobManifestEntry } from "./blobs/blob-engine.js";
 import { Inbox } from "./conflicts/inbox.js";
-import { conflictArtifactPath, writeConflictArtifact } from "./conflicts/artifact.js";
+import { withConflictSuffix, writeConflictArtifact } from "./conflicts/artifact.js";
 import {
   ArtifactNotLocalError,
   type ResolveAction,
@@ -62,6 +78,8 @@ export interface EnginePorts {
   identity: IdentityPort;
   engineState: EngineStateStore;
   config?: ConfigPort;
+  /** Slice 2b: read/write/watch `.obsidian/community-plugins.json` for the enabled-list channel. */
+  communityPlugins?: CommunityPluginsPort;
 }
 
 export interface EngineConfig {
@@ -112,12 +130,23 @@ export interface EngineConfig {
    */
   ingestDisabled?: boolean;
   /**
-   * Per-category config-zone sync toggle. When absent, BOTH categories are enabled
+   * Per-category config-zone sync toggle. When absent, themes and snippets are enabled
    * (back-compat: existing engine constructions without this field behave as before).
    * Publish and materialize both respect this policy: a disabled category is never
    * uploaded from this device and never downloaded/materialized onto it.
+   * `plugins` defaults `false` (opt-in only; enabled via {@link SyncEngine.setPluginOptIn}).
    */
-  configCategories?: { themes: boolean; snippets: boolean };
+  configCategories?: {
+    themes: boolean;
+    snippets: boolean;
+    plugins?: boolean;
+    "plugin-data"?: boolean;
+  };
+  /**
+   * Platform flag injected by the adapter. `true` = mobile (Obsidian iOS/Android);
+   * drives per-device plugin platform-gating via `Caps.isMobile`. Defaults `false`.
+   */
+  isMobile?: boolean;
 }
 
 const utf8 = (s: string): Uint8Array => new TextEncoder().encode(s);
@@ -184,6 +213,54 @@ export const AUDIT_QUIESCENCE_MS = 15_000;
  * is the load-bearing O(n^2) guard — tests verify removing it causes repeated firing.
  */
 export const AUDIT_MAX_STALENESS_MS = 30_000;
+
+/**
+ * CONFIG RECONCILE BACKSTOP: debounce (ms) after the last config-map change before the drift
+ * re-scan fires. Must be long enough that a reconnect batch of config-map updates has SETTLED (the
+ * transient adopt-then-resettle sequence has fully drained) before the scan runs, so the scan reads
+ * the final settled map — not an intermediate value. 2.5s sits above the config-echo cadence yet is
+ * short enough to close the split-brain promptly. Re-armed (clear+set) on every config-map change.
+ */
+export const CONFIG_RECONCILE_DEBOUNCE_MS = 2_500;
+
+/**
+ * F2 SELF-HEAL: backoff schedule (ms) between consecutive background self-heal passes.
+ *
+ * After the synced-stamp store is lost (relay reset / server migration), docs whose
+ * CONTENT is unchanged but whose synced stamp is gone stay pending forever — nothing
+ * change-triggers the reconcile loop (the loop is purely change-driven; `waitConverged`
+ * is TEST-ONLY). The self-heal re-runs {@link SyncEngine.runFullConvergencePass} (which
+ * re-pushes every `stamp != syncedStamp` doc and re-stamps it on the real relay ACK)
+ * until pending drains — but SPACED by this backoff so a large vault is not hammered and
+ * the relay is not stormed ({@link SyncEngine.pendingDocs} is an O(n) disk scan).
+ *
+ * The step is chosen by the number of CONSECUTIVE no-set-exit passes so far, capped at
+ * the last entry. At steady state the self-heal is ~free: one pending check finds nothing
+ * pending and the driver disarms.
+ */
+export const SELFHEAL_BACKOFF_MS = [2_000, 5_000, 10_000] as const;
+
+/**
+ * F2 SELF-HEAL: PER-DOC-SET progress bound. After this many CONSECUTIVE self-heal passes
+ * where NOT ONE docId that was pending BEFORE the pass cleared, STOP. The remaining docs
+ * are genuinely un-ackable (a real stuck relay / unresolved conflict) — they stay VISIBLY
+ * pending (never silently "healed") and their ids are logged. Re-arms only when pending
+ * transitions non-empty again from a fresh trigger (a later reset re-triggers).
+ *
+ * Set-based (not count-based) progress is load-bearing: raw `pendingDocs().length` masks
+ * churn (one doc heals while another newly diverges), so a count that stays flat could
+ * either mean "stuck" or "healing-and-diverging in lockstep". Snapshotting the specific
+ * docId SET before a pass and requiring ≥1 of THOSE ids to clear is unambiguous.
+ */
+export const SELFHEAL_MAX_NO_PROGRESS = 3;
+
+/**
+ * F2 SELF-HEAL: hard cap on total self-heal passes per arming, independent of progress.
+ * A safety ceiling so a pathological healing-and-re-diverging churn (which keeps making
+ * set-progress but never fully drains) cannot loop unboundedly. Generous: a real vault
+ * converges in a handful of rounds (cf. {@link SyncEngine.waitConverged}'s 50-round cap).
+ */
+export const SELFHEAL_MAX_PASSES = 50;
 
 /** A pending debounced bump: its settle promise is tracked by {@link SyncEngine.whenIdle}. */
 interface PendingBump {
@@ -271,6 +348,29 @@ export class SyncEngine {
   private blobEngine!: BlobEngine;
   private configChannel: ConfigChannel | undefined;
   private configUnsub: Unsubscribe = () => undefined;
+  /** Shared CRDT map: per-plugin sync-consent (keyed by plugin id). Non-null after start(). */
+  private pluginsOptIn: CrdtMap<boolean> | null = null;
+  /** Shared CRDT map: per-plugin metadata (isDesktopOnly). Non-null after start(). */
+  private pluginsMeta: CrdtMap<PluginMeta> | null = null;
+  /** Shared CRDT map: per-plugin active state (true = enabled across all managed devices). Non-null after start(). */
+  private pluginsEnabled: CrdtMap<boolean> | null = null;
+  /** Shared CRDT map: per-plugin data-sync consent (keyed by plugin id; false = off-switch). Non-null after start(). */
+  private pluginsSettingsSync: CrdtMap<boolean> | null = null;
+  /** Slice 2b: device-local suppress set (non-synced; loaded from EngineStateStore on start()). */
+  private localSuppress = new Set<string>();
+  /** Slice 2b: bidirectional community-plugins.json channel. Assigned in start() when communityPlugins port is present. */
+  private pluginEnabledChannel: PluginEnabledChannel | null = null;
+  private enabledUnsub: Unsubscribe = () => undefined;
+  /** Slice 2b: callbacks fired when the desired-active plugin set could have changed (enabled/optIn/meta/suppress). */
+  private readonly pluginsChangedCbs = new Set<() => void>();
+  /** Task 8: ids of plugins with newly-materialized code while already running (staged, not hot-reloaded). */
+  private readonly pendingUpdates = new Set<string>();
+  /** Task 8: callbacks notified when pendingUpdates changes. */
+  private readonly pendingCbs = new Set<() => void>();
+  /** Task 8: callbacks notified (with the plugin id) when a desired-active plugin's code materializes. */
+  private readonly pluginMatCbs = new Set<(id: string) => void>();
+  /** Slice 3b: callbacks notified (with the plugin id) when a desired-active plugin's data.json materializes. */
+  private readonly pluginDataMatCbs = new Set<(id: string) => void>();
 
   // ── subscriptions to unwind on stop() ───────────────────────────────────
   private vaultUnsub: Unsubscribe | null = null;
@@ -470,6 +570,69 @@ export class SyncEngine {
   private reconcileProgressTick = 0;
 
   /**
+   * CONFIG RECONCILE BACKSTOP: debounce timer that re-scans disk-vs-config-map after the config
+   * map SETTLES (armed on every config-map change, cleared+rearmed each time). This closes the
+   * observe-only drift hole: config materialize only re-checks a path's disk when that path's CRDT
+   * map entry mutates, so during a reconnect race a device can adopt a TRANSIENT map value and then
+   * the map settles to a DIFFERENT value with NO further observe for that device — a stable
+   * split-brain. When this fires (map quiescent for CONFIG_RECONCILE_DEBOUNCE_MS) it drives
+   * {@link reconcileConfigDrift}, which force-resolves any disk≠map path through the SAME materialize
+   * seam the observe path uses. Loop-safe: the materialize write is echo-guarded and after it settles
+   * disk===map so a re-scan is a no-op (an assertLocal map write it triggers re-arms the debounce
+   * once, then settles). Cleared in {@link stop}. Nullable + clear-and-rearm mirrors the audit timers.
+   */
+  private configReconcileTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // ── F2: bounded, single-flight, progress-gated background self-heal ──────────
+  //
+  // PROBLEM (correctness): `pendingDocs()` marks a live doc pending when
+  // `entry.stamp !== getSyncedStamp(docId)`. After the synced-stamp store is lost
+  // (relay reset / server migration), every un-acked doc's synced stamp is gone, so it
+  // stays pending — but nothing re-triggers convergence: the reconcile loop is purely
+  // change-driven and `waitConverged` is TEST-ONLY. So pending never drains on its own.
+  //
+  // SOLUTION: re-run `runFullConvergencePass` (the SAME idempotent chain waitConverged
+  // loops — it re-pushes every `stamp != syncedStamp` doc and re-stamps it ONLY on the
+  // real relay ACK, so no new write/stamp path, no false-heal, no data loss) until
+  // pending drains, but:
+  //   • SINGLE-FLIGHT (D3): the pass runs ONLY in the audit branch of `runReconcileLoop`
+  //     — the ONE single-threaded loop. The self-heal driver never runs a pass itself; it
+  //     only sets `auditRequested = true` + `scheduleReconcile()` after a backoff, which
+  //     re-enters that same serialized audit iteration. `reconcileLoopRunning` guarantees
+  //     no second loop, so NO pass ever overlaps a scoped/rename/delete pass.
+  //   • YIELD (D2): the pass is spaced by a TIMER (never an in-loop sleep), so a fresh user
+  //     change that lands in `pendingChangedPaths` while the backoff is pending arms the
+  //     loop immediately and is processed first; the self-heal never blocks live work.
+  //   • PROGRESS (D1): progress is SET-based — snapshot the pending docId set BEFORE a
+  //     pass; a pass made progress iff ≥1 of THOSE ids is no longer pending AFTER.
+  //   • BOUNDED: after SELFHEAL_MAX_NO_PROGRESS consecutive no-set-exit passes (or the
+  //     hard SELFHEAL_MAX_PASSES cap) STOP + log the stuck docIds (they stay visibly
+  //     pending). Re-arm only when pending transitions non-empty again from a fresh trigger.
+
+  /**
+   * F2: true while a self-heal EPISODE is active (armed via {@link requestSelfHeal} and not yet
+   * drained/stopped). The self-heal's progress/arm/stop logic in {@link evaluateSelfHeal} runs
+   * ONLY when this is set — so an UNRELATED audit (a quiescence/watchdog full pass, or a test's
+   * explicit audit) does NOT get turned into a multi-pass self-heal storm. This keeps the
+   * established audit-once semantics intact: the self-heal is an OPT-IN drain, not a side effect
+   * of every audit. Set true by requestSelfHeal; cleared when the episode drains (disarm) or hits
+   * its bound (stop).
+   */
+  private selfHealActive = false;
+  /** F2: backoff timer that re-arms the next self-heal pass; null when disarmed. */
+  private selfHealTimer: ReturnType<typeof setTimeout> | null = null;
+  /** F2: consecutive self-heal passes with no set-exit (bound: SELFHEAL_MAX_NO_PROGRESS). */
+  private selfHealNoProgress = 0;
+  /** F2: total self-heal passes since the last arm (hard cap: SELFHEAL_MAX_PASSES). */
+  private selfHealPasses = 0;
+  /**
+   * F2: true once the self-heal has STOPPED for the current pending episode (bound hit,
+   * stuck docs logged). Blocks re-arming until pending drops to empty (which resets it),
+   * so a genuinely-stuck relay does not re-log/re-storm every quiescence. Reset to false
+   * whenever pending is observed empty (the episode is over — a later reset re-arms fresh).
+   */
+  private selfHealStopped = false;
+  /**
    * The single in-flight rename-transaction settle: a tracked, RE-ARMABLE timer (see
    * {@link scheduleRenameSettle}). Re-arming on each suppressed fallout event keeps the
    * quarantine open until the async/reordered watcher traffic has drained, then the
@@ -523,7 +686,11 @@ export class SyncEngine {
     this.ports = ports;
     this.config = config;
     this.substrate = config.substrate ?? "yjs";
-    this.caps = { maxProseBytes: config.maxProseBytes, configDir: config.configDir };
+    this.caps = {
+      maxProseBytes: config.maxProseBytes,
+      configDir: config.configDir,
+      isMobile: config.isMobile ?? false,
+    };
     this.debounceMs = config.stampDebounceMs ?? DEFAULT_DEBOUNCE_MS;
     this.renameSettleMs = config.renameSettleMs ?? DEFAULT_RENAME_SETTLE_MS;
     this.renameWindowMs = config.renameWindowMs ?? DEFAULT_RENAME_WINDOW_MS;
@@ -564,10 +731,55 @@ export class SyncEngine {
     // 2. Blob engine over the index `blobs` map (+ optional config map via RoutedManifest).
     const blobsMap = indexDoc.getMap<BlobManifestEntry>("blobs");
     const configMap = indexDoc.getMap<ConfigEntry>("config");
-    // Resolve per-category policy once: absent => both enabled (back-compat).
-    const cats = this.config.configCategories ?? { themes: true, snippets: true };
+    // Plugin opt-in + meta maps (shared CRDT state; written by setPluginOptIn).
+    const pluginsOptIn = indexDoc.getMap<boolean>("pluginsOptIn");
+    const pluginsMeta = indexDoc.getMap<PluginMeta>("pluginsMeta");
+    this.pluginsOptIn = pluginsOptIn;
+    this.pluginsMeta = pluginsMeta;
+    const pluginsEnabled = indexDoc.getMap<boolean>("pluginsEnabled");
+    this.pluginsEnabled = pluginsEnabled;
+    const pluginsSettingsSync = indexDoc.getMap<boolean>("pluginsSettingsSync");
+    this.pluginsSettingsSync = pluginsSettingsSync;
+    // Slice 2b: load per-device suppress set from durable store.
+    for (const id of await this.ports.engineState.getLocalSuppress()) this.localSuppress.add(id);
+    // Slice 2b: wire the community-plugins.json channel when the port is present.
+    if (this.ports.communityPlugins !== undefined) {
+      this.pluginEnabledChannel = new PluginEnabledChannel({
+        optIn: pluginsOptIn,
+        enabled: pluginsEnabled,
+        meta: pluginsMeta,
+        port: this.ports.communityPlugins,
+        isMobile: this.caps.isMobile,
+        suppress: () => this.localSuppress,
+      });
+      this.enabledUnsub = this.pluginEnabledChannel.start();
+    }
+    const pluginGate = new PluginGate(
+      pluginsOptIn,
+      pluginsMeta,
+      this.caps.isMobile,
+      pluginsSettingsSync,
+    );
+    // Resolve per-category policy once: absent => themes+snippets on, plugins off (opt-in).
+    const cats = this.config.configCategories ?? {
+      themes: true,
+      snippets: true,
+      plugins: false,
+      "plugin-data": false,
+    };
     const configPort = this.ports.config;
-    if (configPort !== undefined) {
+    // Slice 3a Task 8: version-gate for plugin-data. Holds a data.json whose writer stamped a
+    // NEWER plugin version than the locally-installed manifest (or whose code isn't installed
+    // yet). Releases automatically when the plugin's code catches up (its manifest materializes),
+    // routing release back through the NORMAL materialize path (divergence/base check → D4-safe).
+    const pluginDataGate =
+      configPort !== undefined
+        ? new PluginDataVersionGate({
+            config: configMap,
+            localVersion: (id) => readManifestVersion(configPort, id),
+          })
+        : undefined;
+    if (configPort !== undefined && pluginDataGate !== undefined) {
       this.configChannel = new ConfigChannel({
         config: configMap,
         blobStore: this.ports.blobs,
@@ -575,12 +787,35 @@ export class SyncEngine {
         identity,
         echo: this.echo,
         enabledCategories: cats,
+        gate: pluginGate,
+        engineState: this.ports.engineState,
+        now: () => this.ports.clock.now(),
       });
       this.configUnsub = this.configChannel.start();
       await this.configChannel.bootstrap();
+      // Any config-map change touching a plugin id re-evaluates the held set (a fresh newer
+      // data.json arrives held; a superseding write can also change the verdict).
+      configMap.observe((keys) => {
+        pluginDataGate.holdPaths(keys); // pessimistic sync hold; reeval releases the OK ones (I1: structural hold)
+        const ids = [
+          ...new Set(
+            keys.map((k) => pluginIdOf(k as VaultPath)).filter((x): x is string => x !== undefined),
+          ),
+        ];
+        if (ids.length > 0) void pluginDataGate.reeval(ids);
+        // CONFIG RECONCILE BACKSTOP: arm the settle-debounce on every config-map change. When the map
+        // stops changing for CONFIG_RECONCILE_DEBOUNCE_MS, re-scan disk-vs-map and force-resolve any
+        // drift the observe path missed (the split-brain forms AFTER the reconnect batch settles, with
+        // no further observe for the stuck device — so this timer, NOT a per-mutation observe, closes
+        // it). Clear+rearm mirrors the audit-timer idiom.
+        this.armConfigReconcile();
+      });
     }
     this.blobEngine = new BlobEngine({
-      manifest: configPort !== undefined ? new RoutedManifest(blobsMap, configMap, cats) : blobsMap,
+      manifest:
+        configPort !== undefined
+          ? new RoutedManifest(blobsMap, configMap, cats, pluginGate, pluginDataGate)
+          : blobsMap,
       blobStore: this.ports.blobs,
       vault:
         configPort !== undefined ? new RoutedVault(this.ports.vault, configPort) : this.ports.vault,
@@ -597,13 +832,51 @@ export class SyncEngine {
       },
       ...(configPort !== undefined
         ? {
+            identitySha: (p, b) => configIdentitySha(p, b),
             onDivergence: (path, info) => this.onConfigDivergence(path, info),
             onMaterialized: (path, sha256) => {
-              if (isConfigZone(path)) void this.ports.engineState.setConfigBase(path, sha256);
+              if (isConfigZone(path)) {
+                void this.ports.engineState.setConfigBase(path, sha256);
+                // CONFIG RECONCILE BACKSTOP TRIGGER (split-brain #4 fix): arm the settle-debounce on
+                // every config DISK WRITE, not only on config-MAP changes. A materialize can adopt a
+                // TRANSIENT map value and land its disk write AFTER the map has already settled to a
+                // DIFFERENT winner — leaving disk≠settled-map with NO further map observe to re-arm the
+                // scan (the observe-only trigger's timing hole: the loser sits split-brained forever).
+                // Arming here re-scans ~CONFIG_RECONCILE_DEBOUNCE_MS after the write; the trailing scan
+                // sees the drift and force-resolves it (a clean fast-forward, since base === the just-
+                // written disk sha). Loop-safe: a no-drift scan writes nothing, fires no onMaterialized,
+                // and does not re-arm — so convergence settles in one extra debounce.
+                this.armConfigReconcile();
+              }
+              if (configCategoryOf(path) === "plugin-data") {
+                // version-aware convergence: the on-disk value now equals the remote entry, so adopt
+                // its edit-version as our local version. Absent (versionless peer) ⇒ 0.
+                const remoteVersion = configMap.get(path)?.dataVersion ?? 0;
+                void this.ports.engineState.setConfigLocalVersion(path, remoteVersion);
+                this.configChannel?.noteMaterialized(path, this.ports.clock.now());
+                this.firePluginDataReload(path);
+              }
+              // Task 8: when a bundle file materializes for a desired-active plugin, fire the
+              // code-materialized hook with the id. The caller (main.ts, where runtime.enabledIds()
+              // is available) decides: an ALREADY-RUNNING plugin -> stage as a pending update; a
+              // FIRST-TIME plugin -> re-run the reconciler now that its files are present. The engine
+              // cannot make this call itself (it has no view of the live app.plugins running set).
+              if (configCategoryOf(path) === "plugins") {
+                const id = pluginIdOf(path);
+                if (id !== undefined) {
+                  // Release any held data.json now this plugin's code/manifest is present.
+                  void pluginDataGate?.reeval([id]);
+                  if (this.desiredActivePlugins().includes(id)) {
+                    for (const cb of this.pluginMatCbs) cb(id);
+                  }
+                }
+              }
             },
           }
         : {}),
     });
+    // Initial hold computation MUST run before the fetch queue can materialize a newer data.json.
+    if (pluginDataGate !== undefined) await pluginDataGate.reeval();
     this.blobUnsub = this.blobEngine.start();
 
     // 3. Ingest pipeline (file → CRDT) — SHARED echo (cross-pipeline loop-breaker).
@@ -683,6 +956,14 @@ export class SyncEngine {
     // 6. Bootstrap: seed local prose that has no index entry yet; then sweep orphans.
     await this.bootstrap();
 
+    // 6b. CONFIG RECONCILE BACKSTOP (startup): after the initial config sweep has settled, re-scan
+    //     disk-vs-config-map once to catch drift left by a PREVIOUS session — a device that was
+    //     stuck holding disk≠settled-map when it last shut down (the observe-only hole) reconciles
+    //     on boot instead of staying split-brained until the next config-map change. Tracked so
+    //     whenIdle()/tests await it. Idempotent (no drift => no write), so it is a no-op on a clean
+    //     boot. The settle-debounce (armConfigReconcile) covers drift that forms LIVE after start.
+    this.track(this.reconcileConfigDrift());
+
     // 7. Subscribe vault events (each handler tracked so whenIdle awaits it).
     this.vaultUnsub = this.ports.vault.onEvent((e) => {
       this.onVaultEvent(e);
@@ -723,7 +1004,17 @@ export class SyncEngine {
     //    F1: set startupDone BEFORE tracking the pass so the onStatus handler (subscribed
     //    in step 10) never fires a SECOND full pass for the initial connect.
     this.startupDone = true;
-    this.track(this.runFullConvergencePass());
+    // F2 AUTO-HEAL (startup): run the initial full pass, then — if pending is STILL non-empty after
+    // it — arm the bounded self-heal. This is the user's "restart doesn't drain" case: a device that
+    // boots with LOST or MISSING synced stamps (relay reset / fresh state store) has every un-acked
+    // doc pending with no content change to re-trigger convergence. One full pass re-pushes what it
+    // can; if anything remains pending, requestSelfHeal drives the active-bound-safe self-heal loop
+    // (backoff-spaced, bounded) until it drains — so recovery is automatic, no manual trigger needed.
+    this.track(
+      this.runFullConvergencePass().then(async () => {
+        if ((await this.durablePendingDocs()).length > 0) this.requestSelfHeal();
+      }),
+    );
 
     // 10. F1 reconnect-backstop: subscribe to transport status changes and fire a
     //     reconnect catch-up on every genuine offline→connected RECONNECT (not the
@@ -773,6 +1064,17 @@ export class SyncEngine {
         // S6c audit — bounded staleness, NOT loss.
         sawOfflineSinceConnected = false;
         this.track(this.lazyAttach.runCatchUp(new Set()));
+        // F2 AUTO-HEAL (reconnect) — DEFERRED, deliberately NOT wired here. Although runSelfHealPass
+        // is now active-bound-safe (empty openDocIds, so it does NOT false-latch open editors — that
+        // regression is fixed), arming the self-heal on EVERY reconnect changes reconnect semantics
+        // in a way that is not pure gain: the self-heal pass runs structuralReconcile → the ORPHAN
+        // SWEEP, which recovers an LWW-loser orphan (surfacing its conflict artifact) at RECONNECT
+        // rather than at the later quiescence audit. That is arguably better, but it is a behavior
+        // change (it breaks orphan-recovery-observe's "not-recovered-until-the-audit" timing
+        // assertion) and needs its own review — so the reconnect trigger is a SEPARATE follow-up.
+        // The STARTUP auto-trigger (see step 9) covers the primary restart-doesn't-drain case; the
+        // explicit requestSelfHeal() control seam and the harness relay-reset→drain scenario cover
+        // the rest. See requestSelfHeal's doc comment.
       }
     });
   }
@@ -792,6 +1094,24 @@ export class SyncEngine {
     this.configUnsub();
     this.configUnsub = () => undefined;
     this.configChannel = undefined;
+    this.pluginsOptIn = null;
+    this.pluginsMeta = null;
+    this.pluginsEnabled = null;
+    this.pluginsSettingsSync = null;
+    // Slice 2b: stop the community-plugins channel and clear localSuppress cache.
+    this.enabledUnsub();
+    this.enabledUnsub = () => undefined;
+    this.ports.communityPlugins?.close();
+    this.pluginEnabledChannel = null;
+    this.localSuppress.clear();
+    // Self-clean the plugins-changed subscribers so the engine leaves no dangling callbacks
+    // if a consumer forgot to unsubscribe (the reconciler unsubscribes in main.ts, but be defensive).
+    this.pluginsChangedCbs.clear();
+    // Task 8: clear pending-update state so a restart does not carry over stale entries.
+    this.pendingUpdates.clear();
+    this.pendingCbs.clear();
+    this.pluginMatCbs.clear();
+    this.pluginDataMatCbs.clear();
 
     for (const pending of this.pendingBumps.values()) {
       if (pending.timer !== null) clearTimeout(pending.timer);
@@ -808,6 +1128,15 @@ export class SyncEngine {
       clearTimeout(this.auditStaleTimer);
       this.auditStaleTimer = null;
     }
+
+    // CONFIG RECONCILE BACKSTOP: clear the settle-debounce so no dangling drift re-scan fires after stop().
+    if (this.configReconcileTimer !== null) {
+      clearTimeout(this.configReconcileTimer);
+      this.configReconcileTimer = null;
+    }
+
+    // F2: cancel + reset the self-heal so no dangling backoff timer fires after stop().
+    this.disarmSelfHeal();
 
     // M3: clear the live-rename debounce timer so no dangling drain fires after stop() (whenIdle above
     // already force-drained the buffer; this only releases an armed-but-not-yet-fired timer).
@@ -1039,63 +1368,69 @@ export class SyncEngine {
   async resolveConfigConflict(id: string, action: ResolveConfigAction): Promise<void> {
     const entry = this.inbox.list().find((e) => e.id === id);
     if (entry === undefined) return; // idempotent
-    if (
-      entry.kind !== "config-file" ||
-      entry.localSha === undefined ||
-      entry.remoteSha === undefined
-    ) {
+    if (entry.kind !== "config-file") {
       throw new Error(`resolveConfigConflict: ${id} is not a config-file conflict`);
     }
-    const category = configCategoryOf(entry.path);
-    if (category === undefined)
-      throw new Error(`resolveConfigConflict: not a config path: ${entry.path}`);
     if (this.ports.config === undefined) throw new Error("resolveConfigConflict: no config port");
     const indexDoc = this.indexDoc;
     if (indexDoc === null) throw new Error("resolveConfigConflict: engine not started");
+    const configMap = indexDoc.getMap<ConfigEntry>("config");
+    const groupKey = groupKeyOf(entry.path);
+    const members = groupMembers(
+      groupKey,
+      configMap.entries().map(([k]) => k),
+    );
+    const deviceId = this.ports.identity.deviceId();
 
-    if (action === "keep-mine") {
-      // m5(b): Re-read the CURRENT local file so we keep current bytes, not the (possibly stale)
-      // sha stored in the inbox entry. If the file was deleted in the meantime, just resolve.
-      // No writeAtomic (disk already holds the current bytes) and no echo.recordWrite (no write).
-      const cur = await this.ports.config.read(entry.path);
-      if (cur === null) {
-        // File was deleted — nothing local to keep; close the entry.
-        this.inbox.resolve(id);
-        return;
+    for (const m of members) {
+      const mp = m as VaultPath;
+      const category = configCategoryOf(mp);
+      if (category === undefined) continue;
+      if (action === "keep-mine") {
+        // m5(b): Re-read the CURRENT local file so we keep current bytes, not the (possibly stale)
+        // sha stored in the inbox entry. No writeAtomic (disk already holds the current bytes)
+        // and no echo.recordWrite (no write). Iterates all group members atomically.
+        const cur = await this.ports.config.read(mp);
+        if (cur === null) {
+          // absent locally -> my "absent" wins: tombstone so peers drop it too
+          const prev = configMap.get(m);
+          if (prev !== undefined && prev.deleted !== true) {
+            configMap.set(m, { ...prev, deleted: true, deviceId });
+          }
+          continue;
+        }
+        const content = configStoredBytes(mp, cur);
+        const curSha = await sha256OfBytes(content);
+        if (!(await this.ports.blobs.has(curSha))) await this.ports.blobs.put(curSha, content);
+        configMap.set(m, { sha256: curSha, size: content.length, category, deviceId });
+        await this.ports.engineState.setConfigBase(mp, curSha);
+      } else {
+        // keep-theirs: write the winner's bytes to disk DIRECTLY (echo-guarded) — NOT via
+        // blobEngine.materialize, which would see the loser still on disk and re-trigger
+        // onConfigDivergence (a resolve loop). Iterates all group members atomically.
+        const remote = configMap.get(m);
+        if (remote === undefined) continue;
+        if (remote.deleted === true) {
+          // No echo.recordWrite here: config.remove fires onChange(null), and onLocalChange
+          // returns early on the null/prev.deleted path BEFORE reaching isEcho, so an echo entry
+          // would linger forever (no TTL) and could later falsely suppress a genuine re-write of
+          // the same sha (the m6 hazard). The prev.deleted early-return already prevents any loop.
+          await this.ports.config.remove(mp).catch(() => undefined);
+          await this.ports.engineState.setConfigBase(mp, remote.sha256);
+          continue;
+        }
+        const bytes = await this.ports.blobs.get(remote.sha256);
+        // keep-theirs relies on the ECHO ledger (not the quiescence window) to suppress the self-write's fs event.
+        this.echo.recordWrite(mp, remote.sha256);
+        await this.ports.config.writeAtomic(mp, bytes);
+        configMap.set(m, { sha256: remote.sha256, size: remote.size, category, deviceId });
+        await this.ports.engineState.setConfigBase(mp, remote.sha256);
+        // keep-theirs bypasses blobEngine.materialize (avoids a resolve loop), so onMaterialized
+        // never runs — fire the reload hook here so a hookless plugin picks up the winner's bytes.
+        this.firePluginDataReload(mp);
       }
-      const curSha = await sha256OfBytes(cur);
-      if (!(await this.ports.blobs.has(curSha))) await this.ports.blobs.put(curSha, cur);
-      // Publish the current (re-read) sha to the config map so peers converge on the local winner.
-      indexDoc.getMap<ConfigEntry>("config").set(entry.path, {
-        sha256: curSha,
-        size: cur.length,
-        category,
-        deviceId: this.ports.identity.deviceId(),
-      });
-      // Update the durable config base so the next remote push is not a spurious conflict.
-      await this.ports.engineState.setConfigBase(entry.path, curSha);
-      this.inbox.resolve(id);
-    } else {
-      // keep-theirs: write the winner's bytes to disk DIRECTLY (echo-guarded) — NOT via
-      // blobEngine.materialize, which would see the loser still on disk and re-trigger
-      // onConfigDivergence (a resolve loop).
-      const winner = entry.remoteSha;
-      const size = entry.remoteSize ?? 0;
-      const bytes = await this.ports.blobs.get(winner);
-      this.echo.recordWrite(entry.path, winner);
-      await this.ports.config.writeAtomic(entry.path, bytes);
-      // Publish the winner to the config map so both devices converge.
-      indexDoc.getMap<ConfigEntry>("config").set(entry.path, {
-        sha256: winner,
-        size,
-        category,
-        deviceId: this.ports.identity.deviceId(),
-      });
-      // Update the durable config base to the winner so the NEXT remote push for this path is
-      // treated as a normal update (local == new base) rather than triggering a spurious conflict.
-      await this.ports.engineState.setConfigBase(entry.path, winner);
-      this.inbox.resolve(id);
     }
+    this.inbox.resolve(id);
   }
 
   /**
@@ -1104,6 +1439,291 @@ export class SyncEngine {
    */
   async rescanConfig(): Promise<void> {
     await this.ports.config?.rescan();
+  }
+
+  /**
+   * Opt a plugin in or out of sync. On opt-in: reads `isDesktopOnly` from the local
+   * manifest (defensive; defaults `false`), writes meta + optIn to the shared CRDT maps,
+   * then publishes the bundle files (manifest.json, main.js, styles.css) via the config
+   * channel so they replicate to peers. On opt-out: sets `optIn=false`; NON-DESTRUCTIVE —
+   * peers keep their copies. Guards on the engine being started.
+   *
+   * NOTE: the publish step is a NO-OP unless the `plugins` config category is enabled on
+   * this device (ConfigChannel gates publish by category). The opt-in/meta CRDT writes
+   * still replicate regardless, so a peer with `plugins` enabled materializes the bundle
+   * once its bytes exist (a peer's RoutedManifest re-checks readiness on the opt-in change).
+   */
+  async setPluginOptIn(id: string, optIn: boolean): Promise<void> {
+    // Spec D4: `id === "zync"` must never enter pluginsOptIn/pluginsMeta.
+    // The zone allow-list already blocks any zync path, but honor the invariant explicitly.
+    if (id === "zync") return;
+    const optInMap = this.pluginsOptIn;
+    const metaMap = this.pluginsMeta;
+    const cfg = this.ports.config;
+    if (optInMap === null || metaMap === null)
+      throw new Error("setPluginOptIn: engine not started");
+    if (!optIn) {
+      optInMap.set(id, false);
+      return; // non-destructive opt-out
+    }
+    // Slice 2b: capture whether this plugin is currently ACTIVE locally (listed in
+    // community-plugins.json) BEFORE we opt it in. This MUST be read before `optInMap.set(id, true)`
+    // below, because that set fires a reproject during the publish awaits — and if the enabled bit
+    // is not yet seeded at that point, the reproject would REMOVE id from community-plugins.json
+    // (managed but enabled=false), then the file read for a post-hoc seed would find it already gone.
+    let wasEnabledLocally = false;
+    if (this.ports.communityPlugins !== undefined) {
+      const enabledIds = (await this.ports.communityPlugins.read()) ?? [];
+      wasEnabledLocally = enabledIds.includes(id);
+    }
+    // Parse isDesktopOnly from the local manifest (defensive: default false on any failure).
+    let isDesktopOnly = false;
+    if (cfg !== undefined) {
+      const mf = await cfg.read(`.obsidian/plugins/${id}/manifest.json` as VaultPath);
+      if (mf !== null) {
+        try {
+          const parsed = JSON.parse(new TextDecoder().decode(mf)) as { isDesktopOnly?: boolean };
+          isDesktopOnly = parsed.isDesktopOnly === true;
+        } catch {
+          /* malformed manifest -> treat as mobile-allowed */
+        }
+      }
+    }
+    metaMap.set(id, { isDesktopOnly });
+    // Seed the shared enabled bit BEFORE opting in so "I have X running and now consent to sync it"
+    // propagates X as enabled. Ordering: setting enabled=true while optIn is still false fires a
+    // reproject where id is NOT yet managed (optIn false) -> treated as local-only -> PRESERVED in
+    // the array. The subsequent optInMap.set then reprojects with id managed AND enabled -> kept.
+    // Only seed when actually listed: opting in an installed-but-disabled plugin leaves it disabled.
+    if (wasEnabledLocally && this.pluginsEnabled !== null) this.pluginsEnabled.set(id, true);
+    optInMap.set(id, true); // set BEFORE publish so the gate lets the bundle through
+    if (cfg !== undefined && this.configChannel !== undefined) {
+      for (const f of PLUGIN_BUNDLE_FILES) {
+        const filePath = `.obsidian/plugins/${id}/${f}` as VaultPath;
+        const bytes = await cfg.read(filePath);
+        if (bytes !== null) await this.configChannel.publish(filePath, bytes);
+      }
+    }
+  }
+
+  /**
+   * Return all plugins with an entry in the shared `pluginsOptIn` map. Because that map is
+   * shared CRDT state, this ALSO reflects opt-ins made on OTHER devices (the intended
+   * shared-consent model: opting a plugin in on one device surfaces it as opted-in
+   * everywhere). Returns `[]` when the engine is not started.
+   */
+  listPluginOptIn(): { id: string; optIn: boolean; isDesktopOnly: boolean }[] {
+    const optInMap = this.pluginsOptIn;
+    const metaMap = this.pluginsMeta;
+    if (optInMap === null || metaMap === null) return [];
+    return optInMap.entries().map(([id, optIn]) => ({
+      id,
+      optIn,
+      isDesktopOnly: metaMap.get(id)?.isDesktopOnly ?? false,
+    }));
+  }
+
+  /** Set a plugin's shared active state. `id === "zync"` is never enabled. Triggers projection. */
+  setPluginEnabled(id: string, enabled: boolean): void {
+    if (id === "zync") return;
+    const map = this.pluginsEnabled;
+    if (map === null) throw new Error("setPluginEnabled: engine not started");
+    map.set(id, enabled);
+  }
+
+  /**
+   * Set whether settings-sync is enabled for a plugin (shared CRDT state).
+   * Mirrors `setPluginEnabled` exactly; guards on `pluginsSettingsSync` being non-null.
+   */
+  setPluginSettingsSync(id: string, on: boolean): void {
+    const map = this.pluginsSettingsSync;
+    if (map === null) throw new Error("setPluginSettingsSync: engine not started");
+    map.set(id, on);
+  }
+
+  /** Plugin ids whose settings-sync is explicitly OFF (default is ON = absent from the map). */
+  settingsSyncOff(): string[] {
+    const out: string[] = [];
+    if (this.pluginsSettingsSync !== null)
+      for (const [id, v] of this.pluginsSettingsSync.entries()) if (!v) out.push(id);
+    return out;
+  }
+
+  /**
+   * Write a plugin's `data.json` to disk AND publish it to the relay deterministically.
+   * Uses `configPort.writeAtomic` (disk) + `configChannel.publish` (relay) — the same
+   * pattern as `setPluginOptIn` bundle publishing — so publish does NOT depend on fs.watch.
+   */
+  async writePluginData(id: string, bytes: Uint8Array): Promise<void> {
+    const cfg = this.ports.config;
+    if (cfg === undefined) throw new Error("writePluginData: config port not available");
+    if (this.configChannel === undefined) throw new Error("writePluginData: engine not started");
+    const filePath = `.obsidian/plugins/${id}/data.json` as VaultPath;
+    // disk write is unconditional; configChannel.publish below is the gate (no relay for un-opted/settingsSync-off/disabled-category).
+    await cfg.writeAtomic(filePath, bytes);
+    await this.configChannel.publish(filePath, bytes);
+  }
+
+  /**
+   * Read a plugin's `data.json` via the config port.
+   * Returns `null` when the config port is absent or the file does not exist.
+   */
+  async readPluginData(id: string): Promise<Uint8Array | null> {
+    return (
+      (await this.ports.config?.read(`.obsidian/plugins/${id}/data.json` as VaultPath)) ?? null
+    );
+  }
+
+  /** All plugins with a shared enabled entry (shared CRDT state — reflects other devices too). */
+  listPluginEnabled(): { id: string; enabled: boolean }[] {
+    const map = this.pluginsEnabled;
+    if (map === null) return [];
+    return map.entries().map(([id, enabled]) => ({ id, enabled }));
+  }
+
+  /** Durably suppress/unsuppress a plugin on THIS device (non-synced). Triggers a re-projection. */
+  async setPluginSuppressed(id: string, suppressed: boolean): Promise<void> {
+    if (suppressed) this.localSuppress.add(id);
+    else this.localSuppress.delete(id);
+    await this.ports.engineState.setLocalSuppress([...this.localSuppress]);
+    this.pluginEnabledChannel?.reproject();
+    // Slice 2b: notify the on-device apply reconciler that desired-active set may have changed.
+    for (const cb of this.pluginsChangedCbs) cb();
+  }
+
+  /** The set of plugin ids suppressed on this device (non-synced). */
+  listPluginSuppress(): string[] {
+    return [...this.localSuppress];
+  }
+
+  /**
+   * Slice 2b: the plugin ids that SHOULD be active on this device right now.
+   * Effective set = opted-in ∧ shared-enabled ∧ ¬suppressed ∧ platformAllowed ∧ id≠"zync".
+   * Returns [] when the engine is not started.
+   */
+  desiredActivePlugins(): string[] {
+    if (this.pluginsEnabled === null || this.pluginsOptIn === null || this.pluginsMeta === null)
+      return [];
+    const out: string[] = [];
+    for (const [id, on] of this.pluginsEnabled.entries()) {
+      if (!on || id === "zync") continue;
+      if (this.pluginsOptIn.get(id) !== true) continue;
+      if (this.localSuppress.has(id)) continue;
+      if (this.caps.isMobile && this.pluginsMeta.get(id)?.isDesktopOnly === true) continue;
+      out.push(id);
+    }
+    return out;
+  }
+
+  /**
+   * Fire the plugin-data reload hook for a plugin-data path of a desired-active plugin.
+   * Shared by the materialize path (onMaterialized) and conflict-resolve keep-theirs so a
+   * hookless plugin (no onExternalSettingsChange) is reloaded after its data.json changes.
+   * `desiredActivePlugins()` already excludes the engine's own id ("zync"), and
+   * `configCategoryOf`/`pluginIdOf` return undefined for a zync data.json — so a Zync-own
+   * data.json change can never reload Zync mid-flight (self-reload guard).
+   */
+  private firePluginDataReload(path: VaultPath): void {
+    if (configCategoryOf(path) !== "plugin-data") return;
+    const dataId = pluginIdOf(path);
+    if (dataId === undefined) return;
+    if (this.desiredActivePlugins().includes(dataId)) {
+      for (const cb of this.pluginDataMatCbs) cb(dataId);
+    }
+  }
+
+  /**
+   * Slice 2b: true when Zync OWNS this plugin's activation on this device
+   * (opted-in ∧ platformAllowed ∧ id≠"zync"). The reconciler uses this as the disable guard:
+   * it never disables a plugin Zync does not manage (a user's local-only plugin).
+   *
+   * DELIBERATELY EXCLUDES the ¬suppressed term (D6): a SUPPRESSED but running plugin is
+   * still managed (Zync owns its activation), so the reconciler must be allowed to LIVE-disable
+   * it immediately — suppress is an instant "don't run here" switch, not a wait-for-restart one.
+   * `desiredActivePlugins()` still excludes suppressed ids (a suppressed plugin is never ENABLED),
+   * so isManaged(true) + desired(false) is exactly the "disable it now" signal.
+   */
+  isManaged(id: string): boolean {
+    if (id === "zync") return false;
+    if (this.pluginsOptIn === null || this.pluginsMeta === null) return false;
+    if (this.pluginsOptIn.get(id) !== true) return false;
+    if (this.caps.isMobile && this.pluginsMeta.get(id)?.isDesktopOnly === true) return false;
+    return true;
+  }
+
+  /**
+   * Slice 2b: subscribe `cb` to fire whenever the desired-active plugin set could have changed
+   * (shared enabled/optIn/meta maps mutated, or suppress toggled). Returns an unsubscribe fn.
+   * The subscription is a no-op (but safe) when the engine is not started.
+   */
+  onPluginsChanged(cb: () => void): Unsubscribe {
+    const subs: Unsubscribe[] = [];
+    if (this.pluginsEnabled !== null) subs.push(this.pluginsEnabled.observe(cb));
+    if (this.pluginsOptIn !== null) subs.push(this.pluginsOptIn.observe(cb));
+    if (this.pluginsMeta !== null) subs.push(this.pluginsMeta.observe(cb));
+    this.pluginsChangedCbs.add(cb); // also fired by setPluginSuppressed
+    return () => {
+      for (const u of subs) u();
+      this.pluginsChangedCbs.delete(cb);
+    };
+  }
+
+  // ── Task 8: pending plugin-update tracking ───────────────────────────────
+
+  /** Plugin ids with newly-materialized code while already running (staged, not hot-reloaded). */
+  pendingPluginUpdates(): string[] {
+    return [...this.pendingUpdates];
+  }
+
+  /**
+   * Record a pending code update for an already-running plugin. Called by the on-device layer
+   * (main.ts) when a desired-active plugin's code materializes AND that plugin is currently running
+   * (a true update, not a first-time activation). Adds the id + notifies pending-update subscribers.
+   */
+  addPendingUpdate(id: string): void {
+    this.pendingUpdates.add(id);
+    for (const cb of this.pendingCbs) cb();
+  }
+
+  /**
+   * Clear the pending-update marker for a plugin id (called after the caller live-reloads the plugin
+   * via runtime.disable + runtime.enable). Notifies pending-update subscribers so the modal and
+   * status bar update immediately.
+   */
+  clearPluginUpdate(id: string): void {
+    this.pendingUpdates.delete(id);
+    for (const cb of this.pendingCbs) cb();
+  }
+
+  /**
+   * Subscribe `cb` to fire whenever the pending-update set changes (a new update lands, or one is
+   * cleared). Returns an unsubscribe fn. The set is cleared in `stop()`.
+   */
+  onPendingUpdates(cb: () => void): Unsubscribe {
+    this.pendingCbs.add(cb);
+    return () => this.pendingCbs.delete(cb);
+  }
+
+  /**
+   * Subscribe `cb(id)` to fire whenever a bundle file materializes for a DESIRED-ACTIVE plugin.
+   * The on-device layer uses this to distinguish a code update to an already-running plugin (stage
+   * it via {@link addPendingUpdate}) from a first-time activation (re-run the apply reconciler now
+   * that the plugin's files are present). Returns an unsubscribe fn; the set is cleared in `stop()`.
+   */
+  onPluginCodeMaterialized(cb: (id: string) => void): Unsubscribe {
+    this.pluginMatCbs.add(cb);
+    return () => this.pluginMatCbs.delete(cb);
+  }
+
+  /**
+   * Subscribe `cb(id)` to fire whenever a plugin's `data.json` materializes for a DESIRED-ACTIVE
+   * plugin. The on-device layer uses this to live-apply the new settings via
+   * `onExternalSettingsChange` or stage a reload. Returns an unsubscribe fn; the set is cleared
+   * in `stop()`.
+   */
+  onPluginDataMaterialized(cb: (id: string) => void): Unsubscribe {
+    this.pluginDataMatCbs.add(cb);
+    return () => this.pluginDataMatCbs.delete(cb);
   }
 
   /**
@@ -2036,9 +2656,9 @@ export class SyncEngine {
    * full-pass-only liveness-exposure class as the adjacent {@link runOrphanSweep}.
    *
    * PERF: the per-entry `loadCreateMeta` (docStore load + parse) + disk read run ONLY for conflict
-   * artifacts — `orphanRecoveryPath` (= `conflictArtifactPath`) ALWAYS emits the literal `"(conflict,"`
-   * suffix, so the cheap in-memory path pre-filter below is a behavior-preserving SUPERSET that bounds
-   * the I/O to the (typically 0–2) artifacts in the vault, not all N live entries.
+   * artifacts — `orphanRecoveryPath` (beside-original `withConflictSuffix`) ALWAYS emits the literal
+   * `"(conflict,"` suffix, so the cheap in-memory path pre-filter below is a behavior-preserving
+   * SUPERSET that bounds the I/O to the (typically 0–2) artifacts in the vault, not all N live entries.
    */
   private async diskIsRelocatedSibling(
     currentPath: VaultPath,
@@ -2108,6 +2728,151 @@ export class SyncEngine {
     if (this.lazyAttach.remoteUpdatedSinceSettleSnapshot().size > 0) return true;
     if (this.pendingDivergenceDocIds.size > 0) return true;
     return false;
+  }
+
+  /**
+   * F2 SELF-HEAL: the DURABLE subset of {@link pendingDocs} used for the self-heal's progress /
+   * stuck detection.
+   *
+   * `pendingDocs()` mixes DURABLE doc-level pending (stamp != synced, unmaterialized content,
+   * unapplied deletes — the F2 stamp-loss case) with TRANSIENT in-flight tokens: the
+   * `rename-target:<path>` synthetic token (a mid-drain rename-buffer target, never resolvable
+   * back to a doc) and open-rename-transaction docIds. Those transients flicker on/off DURING a
+   * pass (the self-heal samples mid-loop, NOT at a `whenIdle` force-drain boundary), which would
+   * inject PHANTOM progress/churn into the set comparison and — worse — a transiently-empty sample
+   * would falsely reset the bounded-stop latch. Excluding the `rename-target:` tokens gives the
+   * self-heal a stable, doc-level signal. (Real rename SOURCE / open-transaction docIds are left in:
+   * they name genuine in-flight work whose non-drain IS a legitimate not-yet-settled condition.)
+   */
+  private async durablePendingDocs(): Promise<DocId[]> {
+    return (await this.pendingDocs()).filter((id) => !id.startsWith("rename-target:"));
+  }
+
+  /**
+   * F2 SELF-HEAL: decide, AFTER a single-flight audit/self-heal pass, whether to arm another
+   * spaced pass so pending drains to 0 on its own after synced-stamp loss.
+   *
+   * Called ONLY from the audit branch of {@link runReconcileLoop} (single-threaded), right after
+   * {@link runFullConvergencePass}. It NEVER runs a convergence pass itself — it only arms a
+   * backoff timer that later sets `auditRequested = true` and calls `scheduleReconcile()`, which
+   * re-enters the SAME serialized audit branch. So the self-heal can never overlap a scoped /
+   * rename / delete pass (single-flight D3 is structural, not lock-based).
+   *
+   * PROGRESS is PER-DOC-SET (D1): `pendingBefore` is the pending docId set snapshotted BEFORE the
+   * pass. The pass made progress iff ≥1 of THOSE ids is no longer pending now. A raw count would
+   * mask churn (one heals while another diverges); requiring a specific pre-pass id to exit is
+   * unambiguous.
+   *
+   * BOUNDED: after {@link SELFHEAL_MAX_NO_PROGRESS} consecutive no-set-exit passes (or the hard
+   * {@link SELFHEAL_MAX_PASSES} cap), STOP and LOG the stuck docIds — they stay VISIBLY pending
+   * (never silently healed). `selfHealStopped` blocks re-arming until pending drops to empty
+   * (a genuinely stuck relay must not re-storm every wake).
+   *
+   * YIELD (D2): spacing is via a TIMER, never an in-loop sleep — a fresh user change that lands in
+   * `pendingChangedPaths` during the backoff arms the loop immediately and is processed first.
+   */
+  private async evaluateSelfHeal(pendingBefore: Set<DocId>): Promise<void> {
+    // OPT-IN GATE: only a self-heal episode (armed via requestSelfHeal) drives the arm/progress/
+    // stop logic. An UNRELATED audit (quiescence/watchdog full pass, or a test's explicit audit)
+    // must NOT become a multi-pass self-heal — that would change the established audit-once
+    // semantics and storm the relay. When inactive, this is a pure no-op (no extra I/O beyond the
+    // pendingBefore snapshot the caller already took). This is the ~free steady state.
+    if (!this.selfHealActive) return;
+
+    // If nothing durable was pending before this pass, the episode is already drained — reset it
+    // (a later trigger re-arms fresh).
+    if (pendingBefore.size === 0) {
+      this.disarmSelfHeal();
+      return;
+    }
+
+    const pendingAfterList = await this.durablePendingDocs();
+    if (pendingAfterList.length === 0) {
+      // Fully drained — the self-heal episode is over. Disarm + reset all counters.
+      this.disarmSelfHeal();
+      return;
+    }
+    const pendingAfter = new Set(pendingAfterList);
+
+    // If the self-heal already STOPPED for this episode (bound hit, stuck docs logged), do not
+    // touch counters or re-arm. Pending is still non-empty (a genuinely-stuck relay); we reach
+    // here only because an UNRELATED audit ran (quiescence/watchdog/an explicit external audit)
+    // while pending was non-empty. Leave the stuck docs visibly pending — no re-log, no re-storm.
+    // Checked BEFORE the counters so a stopped episode's counters cannot drift. A FRESH trigger
+    // (requestSelfHeal) or pending draining to empty (disarm) is what clears `selfHealStopped`.
+    if (this.selfHealStopped) return;
+
+    // PER-DOC-SET progress (D1): did ≥1 doc that was pending BEFORE clear AFTER?
+    let madeProgress = false;
+    for (const id of pendingBefore) {
+      if (!pendingAfter.has(id)) {
+        madeProgress = true;
+        break;
+      }
+    }
+
+    this.selfHealPasses++;
+    if (madeProgress) {
+      this.selfHealNoProgress = 0;
+    } else {
+      this.selfHealNoProgress++;
+    }
+
+    // BOUNDED stop: too many no-progress passes, or the hard cap. Log the stuck docIds and
+    // STOP re-arming. They remain in pendingDocs() (visible), never silently "healed".
+    if (
+      this.selfHealNoProgress >= SELFHEAL_MAX_NO_PROGRESS ||
+      this.selfHealPasses >= SELFHEAL_MAX_PASSES
+    ) {
+      this.selfHealStopped = true;
+      this.selfHealActive = false; // episode ended (stuck) — an unrelated audit will not re-drive it
+      this.clearSelfHealTimer();
+      const reason =
+        this.selfHealPasses >= SELFHEAL_MAX_PASSES
+          ? `hard cap (${String(SELFHEAL_MAX_PASSES)} passes)`
+          : `${String(SELFHEAL_MAX_NO_PROGRESS)} passes with no doc-set progress`;
+      const stuckSample = pendingAfterList.slice(0, 20).join(", ");
+      console.warn(
+        `[zync] self-heal STOPPED after ${reason}; ${String(pendingAfter.size)} doc(s) remain ` +
+          `un-ackable and stay pending (real stuck relay/conflict): ${stuckSample}`,
+      );
+      return;
+    }
+
+    // Still pending + under bound → arm the NEXT spaced pass via a backoff timer. Pick the step
+    // by the no-progress count (0-based index, clamped to the last entry). The timer only sets
+    // auditRequested + wakes the loop; it runs NO pass itself (single-flight preserved).
+    const idx = Math.min(this.selfHealNoProgress, SELFHEAL_BACKOFF_MS.length - 1);
+    const delay = SELFHEAL_BACKOFF_MS[idx] ?? SELFHEAL_BACKOFF_MS[SELFHEAL_BACKOFF_MS.length - 1];
+    this.clearSelfHealTimer();
+    this.selfHealTimer = setTimeout(() => {
+      this.selfHealTimer = null;
+      // Re-enter the single-flight audit branch. INTENTIONALLY not gated by inFullConvergencePass
+      // (mirrors the quiescence/watchdog wake): request the audit and wake the (possibly-idle) loop.
+      this.auditRequested = true;
+      this.scheduleReconcile();
+    }, delay);
+  }
+
+  /** F2: cancel a pending self-heal backoff timer (no-op if none). */
+  private clearSelfHealTimer(): void {
+    if (this.selfHealTimer !== null) {
+      clearTimeout(this.selfHealTimer);
+      this.selfHealTimer = null;
+    }
+  }
+
+  /**
+   * F2: reset the ENTIRE self-heal episode — cancel the timer and clear every counter/latch.
+   * Called when pending is observed empty (episode over → a later reset arms fresh) and from
+   * {@link stop} (teardown). Idempotent.
+   */
+  private disarmSelfHeal(): void {
+    this.clearSelfHealTimer();
+    this.selfHealActive = false;
+    this.selfHealNoProgress = 0;
+    this.selfHealPasses = 0;
+    this.selfHealStopped = false;
   }
 
   /**
@@ -2254,8 +3019,24 @@ export class SyncEngine {
           // at audit time means the full pass will cover it — clearing it here avoids an extra
           // backstop-only loop iteration after the audit completes.
           this.freshBackstopWork = false;
+          // F2 SELF-HEAL: snapshot the DURABLE pending docId SET *before* the pass so we can measure
+          // PER-DOC-SET progress after (D1 — ≥1 of THESE ids cleared, not a raw count). Uses the
+          // durable subset (excludes transient rename-target tokens) so the before/after comparison
+          // is over a stable doc-level signal. Read once here (O(n) disk scan); the post-pass read
+          // is the only other. Runs on EVERY audit iteration (quiescence/watchdog/self-heal) —
+          // harmless for the ordinary audit (which drains to empty in one pass → self-heal disarms).
+          const pendingBefore = new Set(await this.durablePendingDocs());
           try {
-            await this.runFullConvergencePass();
+            // F2: a SELF-HEAL episode uses the ACTIVE-BOUND-SAFE pass (empty openDocIds) so it never
+            // false-latches an open editor's synced stamp. An ORDINARY audit (quiescence/watchdog,
+            // selfHealActive === false) keeps the full pass — its openDocIds() force-select is the
+            // established audit behavior and is safe there because those audits run at quiescence,
+            // not mid-editor-merge like a reconnect/startup self-heal.
+            if (this.selfHealActive) {
+              await this.runSelfHealPass();
+            } else {
+              await this.runFullConvergencePass();
+            }
           } catch {
             // On audit failure: request another audit on next wakeup (do not re-queue a batch —
             // there is no batch for an audit iteration) and stop this loop; the fresh loop retried
@@ -2264,6 +3045,10 @@ export class SyncEngine {
             needsReschedule = true;
             break;
           }
+          // F2 SELF-HEAL: after the (single-flight) pass, decide whether to arm another spaced
+          // pass. This ONLY schedules a backoff timer (which later re-enters THIS same audit
+          // branch via auditRequested) — it never runs a pass, so single-flight is preserved.
+          await this.evaluateSelfHeal(pendingBefore);
           continue;
         }
 
@@ -2538,6 +3323,46 @@ export class SyncEngine {
   }
 
   /**
+   * F2 SELF-HEAL entry point — arm the bounded, single-flight, progress-gated self-heal.
+   *
+   * Requests ONE audit iteration (routed to the ACTIVE-BOUND-SAFE {@link runSelfHealPass}) via the
+   * reconcile loop; once that pass runs, {@link evaluateSelfHeal} takes over and loops-until-drained
+   * (spaced by backoff, bounded by no-progress). This is the seam to arm whenever pending may have
+   * transitioned non-empty with NO accompanying index/change event — the case the change-driven loop
+   * and the scoped-pass-armed quiescence timer both MISS. AUTO-WIRED at two triggers:
+   *
+   *   • STARTUP (see {@link start}): if the initial full pass leaves pending non-empty (a device
+   *     booting with LOST/MISSING synced stamps — the user's "restart doesn't drain" case).
+   *   • RECONNECT (see start's onStatus handler): a reconnect is where a relay reset / synced-stamp
+   *     loss surfaces. Now safe because the self-heal pass uses EMPTY openDocIds (mirrors the
+   *     reconnect catch-up) and cannot false-latch an active-bound doc's synced stamp.
+   *
+   * Also callable as a CONTROL-API HOOK: a production "drop synced stamps" operator action (force
+   * re-sync after a migration) would clear the synced stamps behind the EngineState port and then
+   * call THIS to arm the drain — no separate machinery needed.
+   *
+   * ACTIVE-BOUND SAFE: {@link runSelfHealPass} passes an EMPTY openDocIds set, so it re-acks every
+   * `stamp !== syncedStamp` doc (draining after stamp loss) WITHOUT force-attaching active-bound
+   * docs — which would otherwise advance an open editor's synced stamp against a still-lagging index
+   * and latch a permanent mismatch (the regression a full-openDocIds pass caused).
+   *
+   * SINGLE-FLIGHT: only sets `auditRequested` + wakes the loop; the pass runs in the one
+   * serialized audit branch (see {@link evaluateSelfHeal}). Also resets `selfHealStopped` so a
+   * FRESH trigger re-arms even after a prior episode gave up (a new reset deserves a new attempt).
+   * Idempotent + cheap (no I/O): safe to call redundantly.
+   */
+  requestSelfHeal(): void {
+    // A fresh trigger re-opens a stopped episode (a new reset warrants a new bounded attempt) and
+    // ACTIVATES the episode so evaluateSelfHeal's arm/progress/stop logic runs on the coming audit.
+    this.selfHealActive = true;
+    this.selfHealStopped = false;
+    this.selfHealNoProgress = 0;
+    this.selfHealPasses = 0;
+    this.auditRequested = true;
+    this.scheduleReconcile();
+  }
+
+  /**
    * FULL convergence pass — the existing chain, ALWAYS unscoped.
    *
    * Runs: `runCatchUp(openDocIds()) → structuralReconcile() → settleCleanDocs()`
@@ -2563,6 +3388,42 @@ export class SyncEngine {
       // Clean-settle (0b-3 Fix 6): re-advance the synced stamp of any doc that has fully
       // converged (doc==disk==index) but whose synced stamp is latched at an intermediate
       // merge hash. Runs AFTER structural reconcile so disk is materialized.
+      await this.lazyAttach.settleCleanDocs();
+    } finally {
+      this.inFullConvergencePass = false;
+    }
+  }
+
+  /**
+   * F2 SELF-HEAL convergence pass — ACTIVE-BOUND-SAFE variant of {@link runFullConvergencePass}.
+   *
+   * Runs the SAME full chain (`runCatchUp → structuralReconcile → settleCleanDocs`) with the SAME
+   * FULL (unscoped) catch-up path — so `computeCatchUpSet` still iterates EVERY live entry and
+   * re-attaches + re-acks every `stamp !== syncedStamp` doc, which is exactly what drains pending
+   * after synced-stamp loss. The ONLY difference: it passes an EMPTY openDocIds set instead of the
+   * live `openDocIds()`.
+   *
+   * WHY EMPTY openDocIds (the active-bound false-latch fix): `openDocIds()` force-selects every
+   * ACTIVE-BOUND doc for catch-up even when its `stamp === syncedStamp`. On a doc with a live
+   * editor whose index has NOT yet been bumped for the merged CRDT text, that force-select advances
+   * the synced stamp to the editor's merged text while the index still lags — latching a permanent
+   * `stamp !== synced` mismatch that never settles (the regression a naive full pass caused). An
+   * active-bound doc's editor edits are already handled by its CRDT binding / transport resync, so
+   * it does NOT need the dirty-reconcile catch-up here. Passing an empty set means an open doc is
+   * caught up ONLY if it is genuinely mismatched (`stamp !== synced`, e.g. a dirty-and-open doc) —
+   * never force-latched. This MIRRORS the reconnect backstop's `runCatchUp(new Set())` and the same
+   * ACTIVE-BOUND SAFETY rationale in {@link start}'s onStatus handler.
+   *
+   * Single-flight is unchanged: only ever called from the audit branch of {@link runReconcileLoop}.
+   * PRIVATE by contract: calling this outside the serialized audit branch would break single-flight.
+   */
+  private async runSelfHealPass(): Promise<void> {
+    this.inFullConvergencePass = true;
+    try {
+      // EMPTY openDocIds — full catch-up over all mismatched live entries, but NO force-attach of
+      // active-bound docs (their editor state is handled by the binding, not this reconcile).
+      await this.lazyAttach.runCatchUp(new Set());
+      await this.structuralReconcile();
       await this.lazyAttach.settleCleanDocs();
     } finally {
       this.inFullConvergencePass = false;
@@ -3160,7 +4021,11 @@ export class SyncEngine {
     // when the incoming's create-meta is unreadable (e.g. a zero-attach-adopted doc with no docStore snapshot).
     const ts = meta?.createdTs ?? incoming.hash.slice(0, 8);
     const by = meta?.createdBy ?? (`mv-${incoming.hash.slice(8, 16)}` as DeviceId);
-    const artifactPath = conflictArtifactPath(occupantPath, by, ts);
+    // BESIDE-ORIGINAL (withConflictSuffix), NOT under _conflicts/: this artifact is a RE-KEYED
+    // LIVE index entry that MUST sync (both bodies converge on every device — see the
+    // "same artifact on B" assertion in external-mv-collision). Only genuine device-local
+    // conflict BACKUPS (writeConflictArtifact/conflictArtifactPath) go in the excluded folder.
+    const artifactPath = withConflictSuffix(occupantPath, by, ts);
     // Park the incoming's content at the artifact, RE-KEYED (reuse docId; NOT tombstoneAndCleanup).
     // (recordWrite takes a plain string; setStamp needs a Sha256 — incoming.hash is base.fileHash, a Sha256.)
     this.echo.recordWrite(artifactPath, incoming.hash);
@@ -3891,28 +4756,167 @@ export class SyncEngine {
   ): Promise<boolean> {
     if (configCategoryOf(path) === undefined || this.ports.config === undefined) return false;
     const base = await this.ports.engineState.getConfigBase(path);
-    if (base !== null && info.localSha === base) return false; // local unchanged since last sync -> accept remote
+    if (base !== null && info.localSha === base) return false; // clean fast-forward: disk unchanged since last agreed -> adopt remote
+    // plugin-data version-aware convergence (LEAN, 2026-07-11, supersedes the sha-only tie-break).
+    // Order a diverged (or base-null) plugin-data value against the peer by a per-path numeric edit
+    // VERSION (recency) first, canonical-sha only for a true (equal-version) tie. This fixes the
+    // regression where a newer sequential edit with a lower content-hash was reverted. Recoverability
+    // is LEAN: only the equal-version (genuinely simultaneous) loser is backed up.
+    // plugin-data ONLY — themes/snippets/plugins bundles keep the conflict path (user-authored).
+    if (configCategoryOf(path) === "plugin-data") {
+      const localBytes = await this.ports.config.read(path);
+      if (localBytes === null) return false; // nothing local to preserve -> accept remote (materialize)
+      const content = configStoredBytes(path, localBytes);
+      const localCanonicalSha = await sha256OfBytes(content);
+      if (localCanonicalSha === info.expectedSha) return false; // canonical no-op -> accept remote (also stops self-echo of an assert)
+      const indexDoc = this.indexDoc;
+      if (indexDoc === null) return false;
+      const configMap = indexDoc.getMap<ConfigEntry>("config");
+      const localVersion = await this.ports.engineState.getConfigLocalVersion(path);
+      const remoteVersion = configMap.get(path)?.dataVersion ?? 0;
+      // Assert local into the config map (re-fire the peer's reconcile) + record base + version. The
+      // map write is the ONLY thing that re-triggers config materialize on the losing peer.
+      const assertLocal = async (): Promise<boolean> => {
+        if (!(await this.ports.blobs.has(localCanonicalSha)))
+          await this.ports.blobs.put(localCanonicalSha, content);
+        // ALWAYS write the map — do NOT skip when the map already holds our value. This map write is
+        // the ONLY signal that re-fires the losing peer's reconcile (config materialize is observe-
+        // only). If the winner's own publish already won its local Yjs LWW, a skip-if-unchanged guard
+        // would suppress the write, the loser would never be re-enqueued, and both devices would sit on
+        // their own bytes — a stable split-brain (harness-proven). A redundant same-value Yjs set still
+        // emits an observe; our own echo of it short-circuits at materialize ("already", disk===map),
+        // so there is no self-loop — the peer, however, diverges and adopts. Convergence is total.
+        configMap.set(path, {
+          sha256: localCanonicalSha,
+          size: content.length,
+          category: "plugin-data",
+          deviceId: this.ports.identity.deviceId(),
+          ...(localVersion > 0 ? { dataVersion: localVersion } : {}),
+        });
+        await this.ports.engineState.setConfigBase(path, localCanonicalSha);
+        return true; // keep local, do NOT materialize, NO inbox entry
+      };
+      // CONCURRENT (true tie) when versions are equal, OR the remote is versionless (0) while local is
+      // versioned (Fable's mixed-fleet guard: never let a versionless peer auto-lose to a version). In a
+      // tie the winner is the higher canonical sha; the loser (equal-version, unambiguous) is backed up.
+      if (localVersion === remoteVersion || (remoteVersion === 0 && localVersion > 0)) {
+        if (localCanonicalSha < info.expectedSha) {
+          // REMOTE wins the tie -> back up local (recoverable), then accept remote. `ts` = the loser's
+          // canonical content-hash prefix (deterministic + idempotent per content).
+          const backup = await writeConflictArtifact(
+            { vault: this.ports.vault, echo: this.echo },
+            path,
+            new TextDecoder().decode(content),
+            this.ports.identity.deviceId(),
+            localCanonicalSha.slice(0, 8),
+          );
+          console.warn(
+            `[zync] plugin-data convergence: backed up local settings ${path} -> ${backup} before adopting remote (equal-version tie)`,
+          );
+          return false; // let it materialize the (higher-sha) winner
+        }
+        return assertLocal(); // LOCAL wins the tie -> keep local; loser peer backs up on its side
+      }
+      // recency: remote is a strictly newer edit -> adopt it (materialize records base+localVersion).
+      // NO backup (lean): this is not a simultaneous conflict, it is a sequential edit.
+      if (remoteVersion > localVersion) return false;
+      // authority: local is a strictly newer edit -> assert it. NO backup (we keep local).
+      return assertLocal();
+    }
     const localBytes = await this.ports.config.read(path);
     if (localBytes === null) return false; // nothing local to preserve -> let it materialize
     // m4: re-hash the re-read bytes; don't trust the caller's (possibly stale) sha.
-    const actualLocalSha = await sha256OfBytes(localBytes);
+    // Store the CANONICAL content for plugin-data so the blob hashes to its (canonical) key.
+    const content = configStoredBytes(path, localBytes);
+    const actualLocalSha = await sha256OfBytes(content);
     if (!(await this.ports.blobs.has(actualLocalSha))) {
-      await this.ports.blobs.put(actualLocalSha, localBytes);
+      await this.ports.blobs.put(actualLocalSha, content);
     }
     const indexDoc = this.indexDoc;
     if (indexDoc === null) return false;
+    const groupKey = groupKeyOf(path);
     const remote = indexDoc.getMap<ConfigEntry>("config").get(path);
     this.inbox.add({
-      id: `config-file:${path}`, // m5(a): per-path id — re-divergence updates the one entry (no accumulation)
+      id: `config-file:${groupKey}`, // group-atomic: all files in a bundle share one entry (coalesce)
       kind: "config-file",
-      path,
+      path, // the triggering member; resolve re-derives the full group from the config map
       localSha: actualLocalSha, // m4: use actual re-read sha, not the potentially stale info.localSha
       remoteSha: info.expectedSha,
-      localSize: localBytes.length,
+      localSize: content.length,
       remoteSize: remote?.size ?? 0,
-      detail: "Config file changed on another device.",
+      detail: groupKey.endsWith("/")
+        ? `A synced bundle changed on another device (${groupKey}).`
+        : "Config file changed on another device.",
     });
     return true;
+  }
+
+  /**
+   * CONFIG RECONCILE BACKSTOP: arm (clear + rearm) the settle-debounce. Called on every config-map
+   * change (see the `configMap.observe` in {@link start}). When the map has been quiescent for
+   * CONFIG_RECONCILE_DEBOUNCE_MS, {@link reconcileConfigDrift} runs. Clear-and-rearm mirrors the
+   * audit-timer idiom; the timer is cleared in {@link stop}. `track()` lets whenIdle()/tests await
+   * the drift scan the fire kicks off (it is idempotent, so it never spuriously fails a settle).
+   */
+  private armConfigReconcile(): void {
+    if (this.configReconcileTimer !== null) clearTimeout(this.configReconcileTimer);
+    this.configReconcileTimer = setTimeout(() => {
+      this.configReconcileTimer = null;
+      this.track(this.reconcileConfigDrift());
+    }, CONFIG_RECONCILE_DEBOUNCE_MS);
+  }
+
+  /**
+   * CONFIG RECONCILE BACKSTOP: re-check on-disk-vs-config-map for EVERY config entry and force-resolve
+   * any drift, INDEPENDENT of per-mutation observe events. Config materialize is observe-only — it
+   * re-checks a path's disk ONLY when that path's CRDT map entry mutates. During a reconnect race a
+   * device can adopt a TRANSIENT map value, then the map settles to a DIFFERENT value with NO further
+   * observe for that device, leaving disk≠settled-map forever (a stable split-brain). This runs on
+   * STARTUP (drift left by a previous session) and after the config map SETTLES (the debounce — the
+   * case that actually closes the live reconnect race).
+   *
+   * For each drifted path it re-drives {@link BlobEngine.materialize} — the EXACT seam the observe
+   * path uses. materialize re-reads the (routed) manifest, compares disk, and on a mismatch calls
+   * {@link onConfigDivergence}: return true (local wins) asserts local into the map + records base
+   * (nothing more to do); return false (accept-remote) makes materialize fetch + echo-guarded-write
+   * the remote bytes + fire onMaterialized (setConfigBase + setConfigLocalVersion + the plugin-data
+   * reload hook). Reusing this seam — rather than duplicating the write — keeps the force-resolve
+   * byte-for-byte identical to the observe path (gating, generation-race close, reload hook, base +
+   * version records all included) and never double-fires onConfigDivergence.
+   *
+   * SCOPE: config-map entries ONLY (never touches blobs/prose). A MISSING local file is skipped
+   * (that is the normal not-yet-fetched path — the fetch queue owns it; we must not fight it). No
+   * inbox entries are created here (onConfigDivergence owns any conflict raise). Loop-safe: the
+   * materialize write is echo-guarded and after it resolves disk===map, so a re-scan is a no-op; an
+   * assertLocal map write re-arms the debounce once, then settles.
+   */
+  private async reconcileConfigDrift(): Promise<void> {
+    if (this.ports.config === undefined) return;
+    const configMap = this.indexDoc?.getMap<ConfigEntry>("config");
+    if (configMap === undefined) return;
+    // Snapshot entries up front so a concurrent map mutation during the awaits does not perturb the
+    // iteration (a mutation re-arms the debounce anyway, so any drift it introduces is re-scanned).
+    for (const [key, entry] of configMap.entries()) {
+      const path = key as VaultPath;
+      if (entry.deleted === true) continue; // a tombstoned entry has no expected disk content
+      const bytes = await this.ports.config.read(path);
+      // MISSING file: the normal not-yet-fetched path (the fetch queue materializes it). Skipping is
+      // correct — reconciling here would fight the fetch, and a genuine local-delete is a separate
+      // concern (structural reconcile / delete propagation), not drift.
+      if (bytes === null) continue;
+      const diskSha = await configIdentitySha(path, bytes);
+      if (diskSha === entry.sha256) continue; // no drift
+      // DRIFT: re-drive the observe path's materialize seam. It calls onConfigDivergence internally
+      // (assert-local / accept-remote / backup) and, on accept-remote, writes + fires onMaterialized.
+      // Any per-path failure is logged and does NOT abort the sweep (best-effort backstop).
+      try {
+        await this.blobEngine.materialize(path, entry.sha256);
+      } catch (err) {
+        console.warn(
+          `[zync] config reconcile backstop: materialize failed for ${path}: ${String(err)}`,
+        );
+      }
+    }
   }
 
   /**

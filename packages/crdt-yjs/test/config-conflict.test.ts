@@ -23,8 +23,10 @@ import { YjsCrdtProvider } from "../src/index.js";
 
 const vp = (s: string): VaultPath => s as VaultPath;
 
-// Config path inside the allow-listed zone so configCategoryOf returns "themes".
-const CONFIG_PATH = vp(".obsidian/themes/my-theme.css");
+// Config path inside the allow-listed zone so configCategoryOf returns "themes". A realistic
+// in-subdir theme path so groupKeyOf yields a proper theme-dir group ".obsidian/themes/my-theme/"
+// (a flat file directly under themes/ would degenerately group to ".obsidian/themes/").
+const CONFIG_PATH = vp(".obsidian/themes/my-theme/theme.css");
 
 // ── minimal in-test ConfigPort ────────────────────────────────────────────────
 
@@ -62,6 +64,10 @@ interface EngineWithConfigMap {
   indexDoc: null | {
     getMap(name: string): {
       get(key: string): { sha256: string; size: number } | undefined;
+      set(
+        key: string,
+        value: { sha256: string; size: number; category: string; deviceId: string },
+      ): void;
     };
   };
 }
@@ -129,6 +135,15 @@ describe("resolveConfigConflict", () => {
     await setup.blobStore.put(remoteSha, theirBytes);
     // Pre-seed: local bytes available in config port (simulates the local file state).
     setup.configPort.files.set(CONFIG_PATH, localBytes);
+    // Pre-seed the config CRDT map with the remote's published entry — exactly the state
+    // onConfigDivergence leaves in production (the remote's sha/size in the map, local disk
+    // diverged). The group-atomic resolve derives its members from these config-map keys.
+    (engine as unknown as EngineWithConfigMap).indexDoc?.getMap("config").set(CONFIG_PATH, {
+      sha256: remoteSha,
+      size: theirBytes.length,
+      category: "themes",
+      deviceId: "remote-dev",
+    });
 
     const id = `config-file:${CONFIG_PATH}:${localSha.slice(0, 8)}`;
     engine.inbox.add({
@@ -186,6 +201,15 @@ describe("resolveConfigConflict", () => {
     // Pre-seed: remote bytes in store; disk now holds currentBytes (not staleBytes).
     await setup.blobStore.put(remoteSha, remoteBytes);
     setup.configPort.files.set(CONFIG_PATH, currentBytes);
+    // Pre-seed the config CRDT map with the remote's published entry (production state after
+    // onConfigDivergence) so the group-atomic resolve finds the member; keep-mine then overwrites
+    // it with the CURRENT local sha re-read from disk.
+    (engine as unknown as EngineWithConfigMap).indexDoc?.getMap("config").set(CONFIG_PATH, {
+      sha256: remoteSha,
+      size: remoteBytes.length,
+      category: "themes",
+      deviceId: "remote-dev",
+    });
 
     // Inbox entry carries the old staleSha (as raised at conflict-detection time).
     const id = `config-file:${CONFIG_PATH}`;
@@ -374,10 +398,11 @@ describe("onConfigDivergence — config base tracking", () => {
     expect(inboxEntry?.localSha).not.toBe(staleSha);
   });
 
-  it("m5(a): entry id is 'config-file:{path}' with no sha suffix", async () => {
+  it("entry id is the GROUP key 'config-file:{dir}/' with no sha suffix", async () => {
     /**
-     * Per-path id ensures a re-divergence on the same path UPDATES the one inbox entry
-     * (LWW on the inbox map) instead of accumulating a stale second entry.
+     * Group-atomic id: a re-divergence on ANY member of the same bundle UPDATES the one inbox
+     * entry (LWW on the inbox map) instead of accumulating a stale second entry. For a theme dir
+     * the group key is the theme directory (m7) — coalescing all its files into one conflict.
      */
     const setup = makeSetup();
     engine = setup.engine;
@@ -404,8 +429,8 @@ describe("onConfigDivergence — config base tracking", () => {
       .list()
       .find((e) => e.kind === "config-file" && e.path === CONFIG_PATH);
     expect(inboxEntry).toBeDefined();
-    // m5(a): id must be "config-file:{path}" — no sha suffix.
-    expect(inboxEntry?.id).toBe(`config-file:${CONFIG_PATH}`);
+    // id must be the group (theme-dir) key — no sha suffix, no trailing filename.
+    expect(inboxEntry?.id).toBe("config-file:.obsidian/themes/my-theme/");
     expect(inboxEntry?.id).not.toMatch(/:[0-9a-f]{8}$/);
   });
 });

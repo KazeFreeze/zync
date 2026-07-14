@@ -217,6 +217,22 @@ describe("NodeFsVault — list()", () => {
     expect(paths).toContain(p("visible.md"));
   });
 
+  it("excludes .obsidian/plugins/ bundle files from list (regression: daemon crash)", async () => {
+    const dir = await makeTmpDir();
+    const vault = track(new NodeFsVault(dir));
+    // Write plugin bundle files directly (writeAtomic does not exclude — real Obsidian writes them)
+    const manifest = path.join(dir, ".obsidian", "plugins", "my-plugin", "manifest.json");
+    const mainJs = path.join(dir, ".obsidian", "plugins", "my-plugin", "main.js");
+    await fsp.mkdir(path.dirname(manifest), { recursive: true });
+    await fsp.writeFile(manifest, '{"id":"my-plugin"}');
+    await fsp.writeFile(mainJs, "/* bundle */");
+    await vault.writeAtomic(p("visible.md"), enc("hi"));
+    const paths = (await vault.list()).map((e) => e.path);
+    expect(paths).not.toContain(p(".obsidian/plugins/my-plugin/manifest.json"));
+    expect(paths).not.toContain(p(".obsidian/plugins/my-plugin/main.js"));
+    expect(paths).toContain(p("visible.md"));
+  });
+
   it("list returns size and mtime metadata", async () => {
     const dir = await makeTmpDir();
     const vault = track(new NodeFsVault(dir));
@@ -278,6 +294,25 @@ describe("NodeFsVault — external watcher events", () => {
     await new Promise<void>((r) => setTimeout(r, 200));
     const internal = received.filter((e) => e.path.includes("zync"));
     expect(internal).toHaveLength(0);
+  });
+
+  it("does not emit events for .obsidian/plugins/ bundle writes (regression: daemon crash)", async () => {
+    const dir = await makeTmpDir();
+    const vault = track(new NodeFsVault(dir));
+
+    const received: VaultEvent[] = [];
+    vault.onEvent((e) => received.push(e));
+
+    // Simulate Obsidian writing a plugin bundle file (the path that previously leaked into
+    // the prose/blob path and caused RoutedManifest to throw → daemon crash).
+    const bundleFile = path.join(dir, ".obsidian", "plugins", "my-plugin", "manifest.json");
+    await fsp.mkdir(path.dirname(bundleFile), { recursive: true });
+    await fsp.writeFile(bundleFile, '{"id":"my-plugin","version":"1.0.0"}');
+
+    // Wait long enough for coalesce timer (20 ms) + fs.stat callback to complete.
+    await new Promise<void>((r) => setTimeout(r, 200));
+    const pluginEvents = received.filter((e) => e.path.startsWith(".obsidian/plugins/"));
+    expect(pluginEvents).toHaveLength(0);
   });
 
   it("does not emit events for .zync-tmp-* temp files", async () => {

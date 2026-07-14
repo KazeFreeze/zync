@@ -27,6 +27,11 @@ interface StateFile {
   deleted?: string[];
   // Config base: last sha materialized from remote per config path. Optional for back-compat.
   configBases?: Record<string, string>;
+  // plugin-data version-aware convergence: numeric edit-version of the on-disk value per config path.
+  // Optional for back-compat (pre-tiebreak state files have no key → every path reads as version 0).
+  configLocalVersions?: Record<string, number>;
+  // Slice 2b: per-device suppress list. Optional for back-compat (pre-2b state files have no key).
+  localSuppress?: string[];
 }
 
 export class FsEngineStateStore implements EngineStateStore {
@@ -36,6 +41,8 @@ export class FsEngineStateStore implements EngineStateStore {
   private lastLive: Map<DocId, VaultPath>;
   private deletedDocs: Set<DocId>;
   private configBasesMap: Map<VaultPath, Sha256>;
+  private configLocalVersionsMap: Map<VaultPath, number>;
+  private localSuppressArr: string[];
 
   private constructor(
     filePath: string,
@@ -44,6 +51,8 @@ export class FsEngineStateStore implements EngineStateStore {
     lastLive: Map<DocId, VaultPath>,
     deletedDocs: Set<DocId>,
     configBasesMap: Map<VaultPath, Sha256>,
+    configLocalVersionsMap: Map<VaultPath, number>,
+    localSuppressArr: string[],
   ) {
     this.filePath = filePath;
     this.syncedStamps = syncedStamps;
@@ -51,6 +60,8 @@ export class FsEngineStateStore implements EngineStateStore {
     this.lastLive = lastLive;
     this.deletedDocs = deletedDocs;
     this.configBasesMap = configBasesMap;
+    this.configLocalVersionsMap = configLocalVersionsMap;
+    this.localSuppressArr = localSuppressArr;
   }
 
   /** Async factory: loads existing state or starts fresh. */
@@ -61,6 +72,8 @@ export class FsEngineStateStore implements EngineStateStore {
     const lastLive = new Map<DocId, VaultPath>();
     const deletedDocs = new Set<DocId>();
     const configBasesMap = new Map<VaultPath, Sha256>();
+    const configLocalVersionsMap = new Map<VaultPath, number>();
+    const localSuppressArr: string[] = [];
     try {
       const raw = await fsp.readFile(abs, "utf8");
       const data = JSON.parse(raw) as StateFile;
@@ -81,11 +94,26 @@ export class FsEngineStateStore implements EngineStateStore {
       for (const [k, v] of Object.entries(data.configBases ?? {})) {
         configBasesMap.set(k as VaultPath, v as Sha256);
       }
+      // Back-compat: pre-tiebreak state files have no configLocalVersions field.
+      for (const [k, v] of Object.entries(data.configLocalVersions ?? {})) {
+        configLocalVersionsMap.set(k as VaultPath, v);
+      }
+      // Back-compat: pre-slice-2b state files have no localSuppress field.
+      for (const id of data.localSuppress ?? []) localSuppressArr.push(id);
     } catch (err) {
       if (!isEnoent(err)) throw err;
       // No file yet → start empty
     }
-    return new FsEngineStateStore(abs, syncedStamps, dirty, lastLive, deletedDocs, configBasesMap);
+    return new FsEngineStateStore(
+      abs,
+      syncedStamps,
+      dirty,
+      lastLive,
+      deletedDocs,
+      configBasesMap,
+      configLocalVersionsMap,
+      localSuppressArr,
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -160,6 +188,44 @@ export class FsEngineStateStore implements EngineStateStore {
     await this.persist();
   }
 
+  getConfigLocalVersion(path: VaultPath): Promise<number> {
+    return Promise.resolve(this.configLocalVersionsMap.get(path) ?? 0);
+  }
+
+  async setConfigLocalVersion(path: VaultPath, version: number): Promise<void> {
+    if (this.configLocalVersionsMap.get(path) === version) return; // skip-if-unchanged
+    this.configLocalVersionsMap.set(path, version);
+    await this.persist();
+  }
+
+  getLocalSuppress(): Promise<string[]> {
+    return Promise.resolve([...this.localSuppressArr]);
+  }
+
+  async setLocalSuppress(ids: string[]): Promise<void> {
+    this.localSuppressArr = [...ids];
+    await this.persist();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test/operator helpers (not part of the EngineStateStore port interface)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Drop ALL persisted synced stamps and atomically rewrite the state file so the
+   * cleared state SURVIVES a daemon restart. After this, every live doc's stamp is
+   * absent from the store, so on the next `engine.start()` every doc is re-pending —
+   * the startup self-heal must drain them back to zero over the relay.
+   *
+   * Calling this while the engine is STOPPED (but the control API is up) is the
+   * correct usage: the in-memory map is updated + flushed to disk before the engine
+   * reads it again on the next start, so no in-flight setSyncedStamp call races.
+   */
+  async clearAllSyncedStamps(): Promise<void> {
+    this.syncedStamps.clear();
+    await this.persist();
+  }
+
   // ---------------------------------------------------------------------------
   // Internal persistence (atomic write)
   // ---------------------------------------------------------------------------
@@ -174,6 +240,8 @@ export class FsEngineStateStore implements EngineStateStore {
       lastLivePaths: Object.fromEntries(this.lastLive),
       deleted: [...this.deletedDocs],
       configBases: Object.fromEntries(this.configBasesMap),
+      configLocalVersions: Object.fromEntries(this.configLocalVersionsMap),
+      localSuppress: [...this.localSuppressArr],
     };
     const json = JSON.stringify(data);
     await atomicWriteBytes(this.filePath, new TextEncoder().encode(json));

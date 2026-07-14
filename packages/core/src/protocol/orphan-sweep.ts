@@ -4,7 +4,7 @@ import { sha256OfText } from "../hash.js";
 import type { EchoLedger } from "../bridge/echo.js";
 import type { BaseStore } from "../bridge/base.js";
 import type { Inbox } from "../conflicts/inbox.js";
-import { conflictArtifactPath } from "../conflicts/artifact.js";
+import { withConflictSuffix } from "../conflicts/artifact.js";
 import type { IndexDoc } from "./index-doc.js";
 
 const utf8 = (s: string): Uint8Array => new TextEncoder().encode(s);
@@ -42,10 +42,16 @@ export function findOrphans(index: IndexDoc, docSet: DocId[]): DocId[] {
 /**
  * The DETERMINISTIC recovery path from create-metadata: `"x/a.md"` →
  * `"x/a (conflict, <createdBy>, <createdTs>).md"`. A pure function of `meta` — every
- * device computes the same name (reuses {@link conflictArtifactPath}'s suffix rule).
+ * device computes the same name (via {@link withConflictSuffix}'s suffix rule).
+ *
+ * BESIDE-ORIGINAL, NOT under `_conflicts/`: the recovered orphan is a LIVE, SYNCING
+ * index entry (the concurrent-create loser whose content must reach every device), so
+ * it must NOT be relocated into the device-local `_conflicts/` folder nor excluded by
+ * classify. This is why it uses {@link withConflictSuffix} directly rather than
+ * {@link conflictArtifactPath} (which adds the `_conflicts/` prefix).
  */
 export function orphanRecoveryPath(meta: OrphanMeta): VaultPath {
-  return conflictArtifactPath(meta.originalPath, meta.createdBy, meta.createdTs);
+  return withConflictSuffix(meta.originalPath, meta.createdBy, meta.createdTs);
 }
 
 /**

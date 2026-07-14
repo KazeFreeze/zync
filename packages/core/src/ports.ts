@@ -183,7 +183,37 @@ export interface EngineStateStore {
    */
   getConfigBase(path: VaultPath): Promise<Sha256 | null>;
   setConfigBase(path: VaultPath, sha256: Sha256): Promise<void>;
+  /**
+   * plugin-data version-aware convergence: the numeric edit-version of the value currently on this
+   * device's disk at a config path. Durable — survives restart. Set on materialize (→ the remote
+   * entry's version), on publish (→ localVersion+1), and on a local-wins assert (→ local version).
+   * Absent ⇒ `0` (back-compat; no plugin-data has ever published a version).
+   */
+  getConfigLocalVersion(path: VaultPath): Promise<number>;
+  setConfigLocalVersion(path: VaultPath, version: number): Promise<void>;
+  /** Device-local, NON-synced set of plugin ids this device refuses to enable (Slice 2b suppress). */
+  getLocalSuppress(): Promise<string[]>;
+  setLocalSuppress(ids: string[]): Promise<void>;
 }
+/**
+ * Slice 2b: narrow wrapper around the undocumented `app.plugins` runtime API. Confined to the
+ * vault-obsidian package (ObsidianPluginRuntime) — no `any` sprinkled elsewhere. Every call
+ * wraps the underlying API in a .catch(() => undefined) so a missing/failed internal degrades
+ * gracefully to "reload to apply" rather than throwing.
+ */
+export interface PluginRuntimePort {
+  /** The set of currently-active plugin ids. */
+  enabledIds(): string[];
+  /** Attempt to enable a plugin via app.plugins — degrades silently on failure. */
+  enable(id: string): Promise<void>;
+  /** Attempt to disable a plugin via app.plugins — degrades silently on failure. */
+  disable(id: string): Promise<void>;
+  /** Ask the running plugin to re-read its data.json LIVE via Obsidian's onExternalSettingsChange
+   *  (API >=1.5.7). Returns true if the hook existed and was invoked; false if unsupported (caller
+   *  then stages a reload). Degrades silently (returns false) on any error. */
+  applyExternalSettings(id: string): Promise<boolean>;
+}
+
 export interface ClockPort {
   now(): number;
 }

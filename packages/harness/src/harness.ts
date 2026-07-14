@@ -212,6 +212,67 @@ export class Device {
     return this.getJson<ConfigList>("/config/list");
   }
 
+  /** Opt a plugin in or out of sync on this device. */
+  pluginOptIn(id: string, optIn: boolean): Promise<void> {
+    return this.postOk("/plugins/opt-in", { id, optIn });
+  }
+
+  /** List all plugins that have ever been opted-in or opted-out on this device. */
+  pluginList(): Promise<{ plugins: { id: string; optIn: boolean; isDesktopOnly: boolean }[] }> {
+    return this.getJson<{ plugins: { id: string; optIn: boolean; isDesktopOnly: boolean }[] }>(
+      "/plugins/list",
+    );
+  }
+
+  /** Set the shared enabled state for a plugin across the sync group. */
+  pluginEnabled(id: string, enabled: boolean): Promise<void> {
+    return this.postOk("/plugins/enabled", { id, enabled });
+  }
+
+  /** Suppress/unsuppress a plugin on this device only (non-synced). */
+  pluginSuppress(id: string, suppressed: boolean): Promise<void> {
+    return this.postOk("/plugins/suppress", { id, suppressed });
+  }
+
+  /** Read community-plugins.json (the list of currently enabled plugin ids) on this device. */
+  communityList(): Promise<{ enabled: string[] }> {
+    return this.getJson<{ enabled: string[] }>("/plugins/community-list");
+  }
+
+  /** Write community-plugins.json atomically via the CommunityPluginsPort (native edit simulation). */
+  communityWrite(ids: string[]): Promise<void> {
+    return this.postOk("/plugins/community-write", { ids });
+  }
+
+  /** Write a plugin's data.json via the engine (writeAtomic + deterministic relay publish). */
+  pluginDataWrite(id: string, json: unknown): Promise<void> {
+    return this.postOk("/plugins/data", { id, json });
+  }
+
+  /** Read a plugin's data.json on this device (returns { json: parsed-or-null }). */
+  pluginData(id: string): Promise<{ json: unknown }> {
+    return this.getJson<{ json: unknown }>(`/plugins/data?id=${encodeURIComponent(id)}`);
+  }
+
+  /** Set whether settings-sync is enabled for a plugin (shared CRDT state). */
+  pluginSettingsSync(id: string, on: boolean): Promise<void> {
+    return this.postOk("/plugins/settings-sync", { id, on });
+  }
+
+  // -- engine state helpers --------------------------------------------------
+
+  /**
+   * Clear ALL synced stamps on this device and atomically persist the cleared state to
+   * disk so it SURVIVES the next daemon restart. Call with the engine STOPPED (after
+   * {@link stop}) so no in-flight `setSyncedStamp` races the clear: the engine is not
+   * running, the control API remains up, and the next {@link start} loads from the
+   * persisted (cleared) file — every live doc is re-pending, and the startup self-heal
+   * drains them back to zero over the relay without any external mutation.
+   */
+  clearSyncedStamps(): Promise<void> {
+    return this.postOk("/engine/clear-synced-stamps", {});
+  }
+
   // -- reads -----------------------------------------------------------------
 
   async read(path: string): Promise<string> {

@@ -2,7 +2,8 @@
  * NodeFsConfig — ConfigPort implementation over node:fs/promises.
  *
  * Scopes ALL reads, writes, and listings to the config zone:
- * `.obsidian/themes/**` and `.obsidian/snippets/**`.
+ * `.obsidian/themes/**`, `.obsidian/snippets/**`, and the file-allow-listed
+ * `.obsidian/plugins/<id>/{manifest.json,main.js,styles.css}` arm.
  *
  * Change detection is layered:
  *   1. `fs.watch` on `<root>/.obsidian` (recursive) — fires quickly for in-process writes.
@@ -178,6 +179,7 @@ export class NodeFsConfig implements ConfigPort {
       } else if (entry.isFile()) {
         const stat = await fsp.stat(absEntry);
         const rel = path.relative(this.root, absEntry).split(path.sep).join("/") as VaultPath;
+        if (!isConfigZone(rel)) continue;
         results.push({ path: rel, size: stat.size });
       }
     }
@@ -204,6 +206,7 @@ export class NodeFsConfig implements ConfigPort {
         try {
           const stat = await fsp.stat(absEntry);
           const rel = path.relative(this.root, absEntry).split(path.sep).join("/");
+          if (!isConfigZone(rel as VaultPath)) continue;
           out.set(rel, { mtime: stat.mtimeMs, size: stat.size });
         } catch (err) {
           if (!isEnoent(err)) throw err;

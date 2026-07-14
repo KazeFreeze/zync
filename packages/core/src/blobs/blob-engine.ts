@@ -60,6 +60,8 @@ export interface BlobEngineDeps {
     path: VaultPath,
     info: { localSha: Sha256; expectedSha: Sha256 },
   ) => Promise<boolean>;
+  /** Identity sha for the disk-vs-manifest comparison; canonical for plugin-data. Defaults to raw sha256. */
+  identitySha?: (path: VaultPath, bytes: Uint8Array) => Promise<Sha256>;
   /** Called after a blob is successfully materialized (written to disk). The engine uses it to record
    *  the config base sha for config-zone paths. Fires for ALL materialized blobs; the handler filters. */
   onMaterialized?: (path: VaultPath, sha256: Sha256) => void;
@@ -137,7 +139,7 @@ export class BlobEngine {
     // Compute the on-disk sha ONCE so it can be reused for the divergence hook below.
     const onDisk = await d.vault.read(path);
     if (onDisk !== null) {
-      const onDiskSha = await sha256OfBytes(onDisk);
+      const onDiskSha = await (d.identitySha ?? ((_p, b) => sha256OfBytes(b)))(path, onDisk);
       if (onDiskSha === expectedSha) return "already";
       if (d.onDivergence !== undefined) {
         const handled = await d.onDivergence(path, { localSha: onDiskSha, expectedSha });

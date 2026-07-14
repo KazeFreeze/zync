@@ -132,6 +132,20 @@
   text-decoration: underline;
 }
 
+/* Settings — per-plugin toggle captions ("Synced plugins" section).
+   Renders a short muted label before each of the three toggles so the row
+   reads: Sync plugin [•]  Don't run here [•]  Sync settings [•]. */
+.zync-toggle-label {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  margin-left: 14px;
+  margin-right: 5px;
+  white-space: nowrap;
+}
+.zync-toggle-label:first-child {
+  margin-left: 0;
+}
+
 /* Empty state */
 .zync-empty {
   display: flex;

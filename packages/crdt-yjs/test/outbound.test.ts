@@ -25,7 +25,7 @@ const CONFIG = ".obsidian";
 const NOTE = path("notes/a.md");
 const DOC = "doc-a" as DocId;
 const DEVICE_B = "dev-b" as DeviceId;
-const CAPS: Caps = { maxProseBytes: 1_000_000, configDir: CONFIG };
+const CAPS: Caps = { maxProseBytes: 1_000_000, configDir: CONFIG, isMobile: false };
 
 /**
  * Poll `predicate` every `intervalMs` until it returns true or `timeoutMs` elapses.

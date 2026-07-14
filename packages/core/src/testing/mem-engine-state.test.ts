@@ -80,3 +80,14 @@ describe("MemEngineState (in-memory EngineStateStore for tests)", () => {
     expect(await s.wasDeleted(id("d"))).toBe(true);
   });
 });
+
+describe("MemEngineState localSuppress", () => {
+  it("round-trips the suppress list", async () => {
+    const s = new MemEngineState();
+    expect(await s.getLocalSuppress()).toEqual([]);
+    await s.setLocalSuppress(["dv", "tp"]);
+    expect((await s.getLocalSuppress()).sort()).toEqual(["dv", "tp"]);
+    await s.setLocalSuppress(["dv"]);
+    expect(await s.getLocalSuppress()).toEqual(["dv"]);
+  });
+});

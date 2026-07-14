@@ -25,7 +25,7 @@ const CONFIG = ".obsidian";
 const NOTE = path("notes/n.md");
 const DOC = id("doc-1");
 const DEVICE = "dev-test" as DeviceId;
-const CAPS: Caps = { maxProseBytes: 1_000_000, configDir: CONFIG };
+const CAPS: Caps = { maxProseBytes: 1_000_000, configDir: CONFIG, isMobile: false };
 
 /** A test harness wiring real core pieces + a real YjsCrdtDoc on the CRDT side. */
 interface Harness {

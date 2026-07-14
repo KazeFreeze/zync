@@ -65,7 +65,7 @@ describe("supervisedImport (divergent bootstrap — adopt server, park local, NO
       { path: NOTE, docId: DOC, localText: LOCAL, serverText: SERVER, deviceId: DEV_B, ts: TS },
     );
 
-    expect(artifactPath).toBe("notes/a (conflict, dev-b, 2026-06-11T12-00-00Z).md");
+    expect(artifactPath).toBe("_conflicts/notes/a (conflict, dev-b, 2026-06-11T12-00-00Z).md");
     const bytes = await h.vault.read(artifactPath);
     expect(new TextDecoder().decode(bytes ?? new Uint8Array())).toBe(LOCAL);
   });

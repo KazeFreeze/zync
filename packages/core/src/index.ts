@@ -8,8 +8,14 @@ export {
 } from "./errors.js";
 export { classify } from "./classify/classify.js";
 export type { Route, Caps, Classification } from "./classify/classify.js";
-export { CONFIG_ZONE_PREFIXES, isConfigZone, configCategoryOf } from "./config/config-entry.js";
+export {
+  CONFIG_ZONE_PREFIXES,
+  COMMUNITY_PLUGINS_PATH,
+  isConfigZone,
+  configCategoryOf,
+} from "./config/config-entry.js";
 export type { ConfigEntry, ConfigCategory } from "./config/config-entry.js";
+export type { CommunityPluginsPort } from "./config/plugin-enabled-channel.js";
 export { sha256OfBytes, sha256OfText } from "./hash.js";
 export { diffToEdits, merge3, applyEdits } from "./bridge/merge.js";
 export { EchoLedger } from "./bridge/echo.js";
@@ -56,7 +62,14 @@ export { ArtifactNotLocalError } from "./conflicts/resolve.js";
 export type { ResolveAction, ResolveConfigAction } from "./conflicts/resolve.js";
 export { describeInboxEntry, isActionableConflict } from "./conflicts/entry-view.js";
 export type { EntryView, EntryAction, EntryActionSpec } from "./conflicts/entry-view.js";
-export { SyncEngine, AUDIT_QUIESCENCE_MS, AUDIT_MAX_STALENESS_MS } from "./engine.js";
+export {
+  SyncEngine,
+  AUDIT_QUIESCENCE_MS,
+  AUDIT_MAX_STALENESS_MS,
+  SELFHEAL_BACKOFF_MS,
+  SELFHEAL_MAX_NO_PROGRESS,
+  SELFHEAL_MAX_PASSES,
+} from "./engine.js";
 export type { EnginePorts, EngineConfig } from "./engine.js";
 export { BlobEngine } from "./blobs/blob-engine.js";
 export type { BlobManifestEntry, BlobFetchPolicy, BlobEngineDeps } from "./blobs/blob-engine.js";

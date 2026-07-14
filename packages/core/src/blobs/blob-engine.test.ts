@@ -8,8 +8,10 @@ import { FakeBlobStore } from "../testing/fake-blob-store.js";
 import { FakeCrdtMap } from "../testing/fake-crdt-map.js";
 import { FakeClock } from "../testing/fake-clock.js";
 import { BlobEngine, type BlobFetchPolicy, type BlobManifestEntry } from "./blob-engine.js";
+import { canonicalJsonBytes, configIdentitySha } from "../config/canonical.js";
 
 const path = (s: string): VaultPath => s as VaultPath;
+const enc = (s: string): Uint8Array => new TextEncoder().encode(s);
 const DEV_A = "dev-a" as DeviceId;
 
 const identity = (deviceId: DeviceId): IdentityPort => ({
@@ -412,6 +414,95 @@ describe("BlobEngine.materialize — onDivergence hook", () => {
     });
     // On-disk bytes are unchanged — writeAtomic was never called.
     expect(await vault.read(path(".obsidian/snippets/x.css"))).toEqual(diskBytes);
+  });
+});
+
+describe("BlobEngine.materialize — injected identitySha (canonical plugin-data disk compare)", () => {
+  const dataPath = path(".obsidian/plugins/dataview/data.json");
+
+  it("plugin-data: KEY-REORDERED on-disk bytes short-circuit to 'already' (no re-write, no onDivergence)", async () => {
+    const manifest = new FakeCrdtMap<BlobManifestEntry>();
+    const blobStore = new FakeBlobStore();
+    const vault = new FakeVault();
+    const echo = new EchoLedger();
+
+    // The STORED blob is the canonical form of {"a":2,"b":1}; expectedSha is its raw sha.
+    const canonical = canonicalJsonBytes(enc(`{"a":2,"b":1}`));
+    const expectedSha = await sha256OfBytes(canonical);
+    await blobStore.put(expectedSha, canonical);
+    manifest.set(dataPath, { sha256: expectedSha, size: canonical.length, deviceId: DEV_A });
+
+    // On disk: the SAME object but key-REORDERED (a cosmetic plugin re-save). Raw bytes differ,
+    // but the canonical identity sha equals expectedSha.
+    const reordered = enc(`{"b":1,"a":2}`);
+    vault.writeSilently(dataPath, reordered);
+
+    const onDivergence = vi.fn(() => Promise.resolve(true));
+    let written = false;
+    vault.onEvent(() => {
+      written = true;
+    });
+
+    const engine = new BlobEngine({
+      manifest,
+      blobStore,
+      vault,
+      echo,
+      identity: identity(DEV_A),
+      policy: "lazy",
+      clock: new FakeClock(),
+      concurrency: 4,
+      maxInFlightBytes: 1_000_000_000,
+      maxRetries: 4,
+      retryTickMs: 1_000_000_000,
+      onBlobFailure: () => undefined,
+      onDivergence,
+      identitySha: (p, b) => configIdentitySha(p, b),
+    });
+
+    expect(await engine.materialize(dataPath, expectedSha)).toBe("already");
+    expect(onDivergence).not.toHaveBeenCalled();
+    expect(written).toBe(false);
+    // Disk untouched — the reordered bytes are still there (no canonical re-write).
+    expect(await vault.read(dataPath)).toEqual(reordered);
+  });
+
+  it("plugin-data: genuinely value-CHANGED on-disk bytes do NOT short-circuit (divergence fires)", async () => {
+    const manifest = new FakeCrdtMap<BlobManifestEntry>();
+    const blobStore = new FakeBlobStore();
+    const vault = new FakeVault();
+    const echo = new EchoLedger();
+
+    const canonical = canonicalJsonBytes(enc(`{"a":2,"b":1}`));
+    const expectedSha = await sha256OfBytes(canonical);
+    await blobStore.put(expectedSha, canonical);
+    manifest.set(dataPath, { sha256: expectedSha, size: canonical.length, deviceId: DEV_A });
+
+    // On disk: a DIFFERENT value (b changed 1 -> 9). Canonical identity sha != expectedSha.
+    vault.writeSilently(dataPath, enc(`{"a":2,"b":9}`));
+
+    const onDivergence = vi.fn(() => Promise.resolve(true));
+
+    const engine = new BlobEngine({
+      manifest,
+      blobStore,
+      vault,
+      echo,
+      identity: identity(DEV_A),
+      policy: "lazy",
+      clock: new FakeClock(),
+      concurrency: 4,
+      maxInFlightBytes: 1_000_000_000,
+      maxRetries: 4,
+      retryTickMs: 1_000_000_000,
+      onBlobFailure: () => undefined,
+      onDivergence,
+      identitySha: (p, b) => configIdentitySha(p, b),
+    });
+
+    // Not 'already' — the divergence hook is consulted (and handles it here).
+    expect(await engine.materialize(dataPath, expectedSha)).toBe("conflict");
+    expect(onDivergence).toHaveBeenCalledOnce();
   });
 });
 

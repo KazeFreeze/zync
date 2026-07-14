@@ -1,4 +1,4 @@
-import { Plugin, PluginSettingTab, Setting, Notice, type App } from "obsidian";
+import { Plugin, Platform, PluginSettingTab, Setting, Notice, type App } from "obsidian";
 import {
   SyncEngine,
   isActionableConflict,
@@ -7,6 +7,7 @@ import {
   type IdentityPort,
 } from "@zync/core";
 import { ConflictInboxModal } from "./conflict-inbox-modal.js";
+import { PendingUpdatesModal } from "./pending-updates-modal.js";
 import { YjsCrdtProvider, HocuspocusTransport } from "@zync/crdt-yjs";
 import { HttpBlobStore } from "@zync/blob-http";
 import {
@@ -17,7 +18,14 @@ import {
   DEFAULT_ZYNC_DB_NAME,
   type ZyncDb,
 } from "@zync/store-idb";
-import { ObsidianVaultPort, ObsidianEditorBinding, ObsidianConfigPort } from "@zync/vault-obsidian";
+import {
+  ObsidianVaultPort,
+  ObsidianEditorBinding,
+  ObsidianConfigPort,
+  ObsidianCommunityPlugins,
+  ObsidianPluginRuntime,
+} from "@zync/vault-obsidian";
+import type { PluginRuntimePort } from "@zync/core";
 import { PortProfiler } from "./profiling.js";
 
 /**
@@ -43,8 +51,10 @@ interface ZyncSettings {
   deviceName: string;
   /** Stable per-install device id — auto-generated on first run, never user-edited. */
   deviceId: string;
-  /** Config-zone sync toggles. Defaults OFF — opt-in per category. Restart required to apply. */
-  syncConfig: { themes: boolean; snippets: boolean };
+  /** Config-zone sync toggles. Defaults OFF for themes/snippets, ON for plugins (the per-plugin
+   *  opt-in map is the real gate so nothing syncs until a plugin is explicitly opted in).
+   *  Restart required to apply. */
+  syncConfig: { themes: boolean; snippets: boolean; plugins: boolean; "plugin-data": boolean };
 }
 
 const DEFAULT_SETTINGS: ZyncSettings = {
@@ -53,7 +63,7 @@ const DEFAULT_SETTINGS: ZyncSettings = {
   token: "",
   deviceName: "obsidian-desktop",
   deviceId: "",
-  syncConfig: { themes: false, snippets: false },
+  syncConfig: { themes: false, snippets: false, plugins: true, "plugin-data": true },
 };
 
 const CONFIG_DIR = ".obsidian/zync"; // vault-relative; the BaseStore zone ObsidianVaultPort excludes
@@ -76,6 +86,17 @@ export default class ZyncPlugin extends Plugin {
   private editorBinding: ObsidianEditorBinding | null = null;
   private vault: ObsidianVaultPort | null = null;
   private configPort: ObsidianConfigPort | null = null;
+  private communityPluginsPort: ObsidianCommunityPlugins | null = null;
+  /** Slice 2b: live app.plugins runtime wrapper for the apply reconciler. */
+  private runtime: PluginRuntimePort | null = null;
+  /** Slice 2b: unsubscribe fn for the onPluginsChanged reconciler subscription. */
+  private reconcileUnsub: (() => void) | null = null;
+  /** Task 8: unsubscribe fn for onPendingUpdates (status-bar refresh). */
+  private pendingUpdatesUnsub: (() => void) | null = null;
+  /** Task 8: unsubscribe fn for onPluginCodeMaterialized (first-time activation retry / real-update staging). */
+  private pluginMatUnsub: (() => void) | null = null;
+  /** Slice 3b: unsubscribe fn for onPluginDataMaterialized (live-apply or stage settings updates). */
+  private pluginDataMatUnsub: (() => void) | null = null;
   private transport: HocuspocusTransport | null = null;
   private db: ZyncDb | null = null;
   private dbName: string | null = null;
@@ -101,7 +122,18 @@ export default class ZyncPlugin extends Plugin {
     this.renderStatus(0);
     if (this.statusBar !== null) {
       this.statusBar.style.cursor = "pointer";
-      this.statusBar.addEventListener("click", () => this.openInbox());
+      // Route to pending-updates modal when there are staged plugin updates; inbox otherwise.
+      this.statusBar.addEventListener("click", () => {
+        if (
+          this.engineReady &&
+          this.engine !== null &&
+          this.engine.pendingPluginUpdates().length > 0
+        ) {
+          this.openPendingUpdates();
+        } else {
+          this.openInbox();
+        }
+      });
     }
 
     this.addSettingTab(new ZyncSettingTab(this.app, this));
@@ -111,6 +143,13 @@ export default class ZyncPlugin extends Plugin {
       name: "Zync: open sync inbox",
       callback: () => {
         this.openInbox();
+      },
+    });
+    this.addCommand({
+      id: "zync-pending-updates",
+      name: "Zync: pending plugin updates",
+      callback: () => {
+        this.openPendingUpdates();
       },
     });
     this.addCommand({
@@ -188,11 +227,27 @@ export default class ZyncPlugin extends Plugin {
 
       // Construct the config port only when at least one category toggle is on.
       // Gated here (not in the constructor) so the port — which registers a "raw" watcher —
-      // is never created when neither theme nor snippet sync is requested.
+      // is never created when no config sync is requested.
       let configPort: ObsidianConfigPort | undefined;
-      if (this.settings.syncConfig.themes || this.settings.syncConfig.snippets) {
+      if (
+        this.settings.syncConfig.themes ||
+        this.settings.syncConfig.snippets ||
+        this.settings.syncConfig.plugins
+      ) {
         configPort = new ObsidianConfigPort(this.app.vault);
         this.configPort = configPort;
+      }
+
+      // Slice 2b: the live app.plugins runtime wrapper (always constructed — used by the reconciler).
+      const runtime = new ObsidianPluginRuntime(this.app);
+      this.runtime = runtime;
+
+      // Slice 2b: construct the community-plugins.json port only when the plugins toggle is on.
+      // Gated the same way as configPort (registers a "raw" watcher; no cost when not needed).
+      let communityPluginsPort: ObsidianCommunityPlugins | undefined;
+      if (this.settings.syncConfig.plugins) {
+        communityPluginsPort = new ObsidianCommunityPlugins(this.app.vault);
+        this.communityPluginsPort = communityPluginsPort;
       }
 
       const engine = new SyncEngine(
@@ -206,6 +261,7 @@ export default class ZyncPlugin extends Plugin {
           identity,
           engineState,
           ...(configPort !== undefined ? { config: configPort } : {}),
+          ...(communityPluginsPort !== undefined ? { communityPlugins: communityPluginsPort } : {}),
         },
         // blobPolicy "eager": a desktop device materializes synced blobs to disk (parity with the
         // headless peer's default). Blobs-at-scale + lazy mobile fetch are M2.
@@ -216,6 +272,7 @@ export default class ZyncPlugin extends Plugin {
           // Thread the per-category toggle through to ConfigChannel + RoutedManifest so
           // a device with "snippets on, themes off" never uploads or downloads theme files.
           configCategories: this.settings.syncConfig,
+          isMobile: Platform.isMobile,
         },
       );
       this.engine = engine;
@@ -229,6 +286,46 @@ export default class ZyncPlugin extends Plugin {
 
       await engine.start();
       this.engineReady = true; // blobProgress()/inbox are now valid to read from renderStatus
+
+      // Slice 2b: wire the live apply reconciler. Fires on any change to the desired-active set
+      // (enabled/optIn/meta/suppress maps), then does a single diff-and-apply pass. The
+      // community-plugins.json projection (floor) is already wired inside the engine via the
+      // PluginEnabledChannel; this is the fast-path live apply on top of it.
+      if (this.settings.syncConfig.plugins) {
+        this.reconcileUnsub = engine.onPluginsChanged(() => {
+          this.reconcilePlugins();
+        });
+        // Task 8: when a desired-active plugin's code materializes, decide here (where the live
+        // running set is available): a plugin ALREADY running -> stage a real pending update; a
+        // FIRST-TIME plugin -> re-run the reconciler now that its files are present (the initial
+        // enable() may have raced ahead of materialization and failed silently). Reconcile is
+        // idempotent + cheap, so firing once per bundle file converges once all files are present.
+        this.pluginMatUnsub = engine.onPluginCodeMaterialized((id) => {
+          if (id === this.manifest.id) return; // never reload ourselves mid-flight (self-reload guard)
+          const running = new Set(this.runtime?.enabledIds() ?? []);
+          if (running.has(id)) engine.addPendingUpdate(id);
+          else this.reconcilePlugins();
+        });
+        this.pluginDataMatUnsub = engine.onPluginDataMaterialized((id) => {
+          if (id === this.manifest.id) return; // never reload ourselves mid-flight (self-reload guard)
+          const running = new Set(this.runtime?.enabledIds() ?? []);
+          if (!running.has(id)) return; // not running → loads on next activation (the safe floor)
+          void this.runtime
+            ?.applyExternalSettings(id)
+            .then((applied) => {
+              if (!applied) engine.addPendingUpdate(id);
+            }) // no live hook → stage a reload
+            .catch(() => engine.addPendingUpdate(id));
+        });
+        // Run once immediately post-start to apply any desired state that arrived before this device
+        // started (e.g. another device enabled a plugin while this one was offline).
+        this.reconcilePlugins();
+      }
+
+      // Task 8: refresh the status bar whenever a pending plugin-update arrives or is cleared.
+      this.pendingUpdatesUnsub = engine.onPendingUpdates(() => {
+        this.renderStatus(this.lastPending);
+      });
 
       // Surface sync conflicts as they land.
       this.unsubs.push(
@@ -271,6 +368,20 @@ export default class ZyncPlugin extends Plugin {
     this.editorBinding?.stop();
     this.editorBinding = null;
     for (const u of this.unsubs.splice(0)) u();
+    // Slice 2b: unsubscribe the reconciler BEFORE engine.stop() so its CRDT observers are
+    // unregistered while the index doc is still live (stop() destroys the doc). Then drop the
+    // runtime — no more app.plugins calls after teardown.
+    this.reconcileUnsub?.();
+    this.reconcileUnsub = null;
+    // Task 8: unsubscribe the pending-updates + code-materialized listeners before engine.stop()
+    // clears their callback sets.
+    this.pendingUpdatesUnsub?.();
+    this.pendingUpdatesUnsub = null;
+    this.pluginMatUnsub?.();
+    this.pluginMatUnsub = null;
+    this.pluginDataMatUnsub?.();
+    this.pluginDataMatUnsub = null;
+    this.runtime = null;
     if (this.engine !== null) {
       try {
         await this.engine.stop();
@@ -289,6 +400,11 @@ export default class ZyncPlugin extends Plugin {
       }
       this.transport = null;
     }
+    // Slice 2b: close the community-plugins port. engine.stop() already closed it (the engine holds
+    // the same port in its EnginePorts and closes it during teardown), so this is a harmless,
+    // idempotent second close — close() clears its watcher refs + callbacks and is safe to re-run.
+    this.communityPluginsPort?.close();
+    this.communityPluginsPort = null;
     this.configPort?.close();
     this.configPort = null;
     this.vault?.close();
@@ -344,8 +460,11 @@ export default class ZyncPlugin extends Plugin {
         : "";
     const nConf = engine ? engine.inbox.list().filter(isActionableConflict).length : 0;
     const conf = nConf > 0 ? ` · ⚠ ${String(nConf)}` : "";
+    // Task 8: append ⟳ N when there are staged plugin-code updates waiting to be applied.
+    const nUpdates = engine ? engine.pendingPluginUpdates().length : 0;
+    const updates = nUpdates > 0 ? ` · ⟳ ${String(nUpdates)}` : "";
     this.statusBar?.setText(
-      `Zync: ${this.connText}${pending > 0 ? ` · ${String(pending)} pending` : ""}${files}${conf}`,
+      `Zync: ${this.connText}${pending > 0 ? ` · ${String(pending)} pending` : ""}${files}${conf}${updates}`,
     );
   }
 
@@ -367,11 +486,70 @@ export default class ZyncPlugin extends Plugin {
     new ConflictInboxModal(this.app, this.engine).open();
   }
 
+  /** Task 8: open the batched pending-plugin-update modal. */
+  private openPendingUpdates(): void {
+    const engine = this.engine;
+    const runtime = this.runtime;
+    if (engine === null) {
+      new Notice("Zync: sync not started.");
+      return;
+    }
+    new PendingUpdatesModal(this.app, engine, (id) => {
+      if (runtime === null) {
+        // No live runtime — the staged bytes are already on disk, so a restart applies them.
+        // ALWAYS clear the marker so the entry never sticks forever, then nudge the user to reload.
+        engine.clearPluginUpdate(id);
+        new Notice(`Zync: could not live-reload ${id}. Restart Obsidian to apply the update.`);
+        return;
+      }
+      // Disable then re-enable to live-reload the plugin with its newly-materialized code.
+      void runtime
+        .disable(id)
+        .then(() => runtime.enable(id))
+        .then(() => engine.clearPluginUpdate(id))
+        .catch(() => {
+          // Degrade gracefully — the staged bytes are already on disk, so a full restart works.
+          engine.clearPluginUpdate(id);
+          new Notice(`Zync: could not live-reload ${id}. Restart Obsidian to apply the update.`);
+        });
+    }).open();
+  }
+
+  /**
+   * Slice 2b: live apply reconciler.
+   *
+   * Diffs `engine.desiredActivePlugins()` (the managed+enabled set) against `runtime.enabledIds()`
+   * (what app.plugins currently has running). Enables anything desired-but-not-running, and disables
+   * anything running-but-not-desired IF Zync manages it (never touch a user's local-only plugin).
+   *
+   * Each call is fire-and-forget (void). Failures in enable/disable are caught inside
+   * ObsidianPluginRuntime and degrade silently — the community-plugins.json projection (floor) still
+   * ensures the plugin activates after the next Obsidian restart.
+   */
+  private reconcilePlugins(): void {
+    if (!this.engineReady || this.engine === null || this.runtime === null) return;
+    const desired = new Set(this.engine.desiredActivePlugins());
+    const running = new Set(this.runtime.enabledIds());
+    for (const id of desired) {
+      if (!running.has(id)) void this.runtime.enable(id);
+    }
+    for (const id of running) {
+      if (!desired.has(id) && this.engine.isManaged(id)) void this.runtime.disable(id);
+    }
+  }
+
   // ── settings ───────────────────────────────────────────────────────────────
 
   private async loadSettings(): Promise<void> {
     const loaded = (await this.loadData()) as Partial<ZyncSettings> | null;
-    this.settings = { ...DEFAULT_SETTINGS, ...loaded };
+    // Deep-merge syncConfig so newly-added fields (e.g. `plugins`) fall back to their defaults
+    // when a user's persisted data.json pre-dates the field — a shallow spread would swallow the
+    // nested object and leave the new field undefined.
+    this.settings = {
+      ...DEFAULT_SETTINGS,
+      ...loaded,
+      syncConfig: { ...DEFAULT_SETTINGS.syncConfig, ...loaded?.syncConfig },
+    };
     if (this.settings.deviceId === "") {
       this.settings.deviceId = crypto.randomUUID();
       await this.saveData(this.settings);
@@ -381,6 +559,78 @@ export default class ZyncPlugin extends Plugin {
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
   }
+
+  /** Returns all plugins with a shared opt-in entry. Empty when engine is not yet started. */
+  listPluginOptIn(): { id: string; optIn: boolean; isDesktopOnly: boolean }[] {
+    if (!this.engineReady || this.engine === null) return [];
+    return this.engine.listPluginOptIn();
+  }
+
+  /** Opt a plugin in/out of sync. No-op when engine is not yet started. */
+  async setPluginOptIn(id: string, optIn: boolean): Promise<void> {
+    if (this.engineReady && this.engine !== null) {
+      await this.engine.setPluginOptIn(id, optIn);
+    }
+  }
+
+  // ── Task 9: suppress control + enabled indicator delegates ───────────────
+
+  /** Plugin ids suppressed on this device. Empty when engine is not yet started. */
+  listPluginSuppress(): string[] {
+    if (!this.engineReady || this.engine === null) return [];
+    return this.engine.listPluginSuppress();
+  }
+
+  /** Durably suppress/unsuppress a plugin on this device. No-op when engine is not yet started. */
+  async setPluginSuppressed(id: string, suppressed: boolean): Promise<void> {
+    if (this.engineReady && this.engine !== null) {
+      await this.engine.setPluginSuppressed(id, suppressed);
+    }
+  }
+
+  /** All plugins with a shared enabled entry (shared CRDT state). Empty when not yet started. */
+  listPluginEnabled(): { id: string; enabled: boolean }[] {
+    if (!this.engineReady || this.engine === null) return [];
+    return this.engine.listPluginEnabled();
+  }
+
+  // ── Slice 3b: per-plugin settings-sync control ──────────────────────────────
+
+  /** Plugin ids excluded from settings (data.json) sync on this device. Empty when not started. */
+  listPluginSettingsSyncOff(): string[] {
+    return this.engine?.settingsSyncOff() ?? [];
+  }
+
+  /** Enable/disable data.json sync for a specific plugin. No-op when engine is not yet started. */
+  async setPluginSettingsSync(id: string, on: boolean): Promise<void> {
+    this.engine?.setPluginSettingsSync(id, on);
+  }
+}
+
+interface InstalledPlugin {
+  id: string;
+  name: string;
+  isDesktopOnly: boolean;
+}
+function installedCommunityPlugins(app: App): InstalledPlugin[] {
+  const pm = (
+    app as unknown as {
+      plugins?: {
+        manifests?: Record<
+          string,
+          {
+            id: string;
+            name?: string;
+            isDesktopOnly?: boolean;
+          }
+        >;
+      };
+    }
+  ).plugins;
+  const manifests = pm?.manifests ?? {};
+  return Object.values(manifests)
+    .filter((m) => m.id !== "zync")
+    .map((m) => ({ id: m.id, name: m.name ?? m.id, isDesktopOnly: m.isDesktopOnly === true }));
 }
 
 class ZyncSettingTab extends PluginSettingTab {
@@ -461,6 +711,97 @@ class ZyncSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         }),
       );
+
+    new Setting(containerEl)
+      .setName("Sync plugins")
+      .setDesc("Sync installed community plugins across devices. Restart required to apply.")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.syncConfig.plugins).onChange(async (v) => {
+          this.plugin.settings.syncConfig.plugins = v;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName("Sync plugin settings")
+      .setDesc(
+        "Sync each synced plugin's data.json (settings) across devices. Restart required to apply.",
+      )
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.syncConfig["plugin-data"]).onChange(async (v) => {
+          this.plugin.settings.syncConfig["plugin-data"] = v;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    containerEl.createEl("h3", { text: "Synced plugins" });
+    const optedIn = new Set(
+      this.plugin
+        .listPluginOptIn()
+        .filter((p) => p.optIn)
+        .map((p) => p.id),
+    );
+    // Task 9: seed suppress + enabled state once per display() call.
+    const suppressed = new Set(this.plugin.listPluginSuppress());
+    const settingsOff = new Set(this.plugin.listPluginSettingsSyncOff());
+    const enabledIds = new Set(
+      this.plugin
+        .listPluginEnabled()
+        .filter((p) => p.enabled)
+        .map((p) => p.id),
+    );
+    for (const p of installedCommunityPlugins(this.app)) {
+      const isEnabled = enabledIds.has(p.id);
+      const isSuppressed = suppressed.has(p.id);
+      const baseDesc = p.isDesktopOnly
+        ? "Desktop-only — excluded from mobile devices."
+        : `Plugin id: ${p.id}`;
+      // Reflect enabled state: " · active" only when shared-enabled AND not locally suppressed
+      // (a suppressed plugin is not running here); "active on other devices" when enabled-but-suppressed.
+      const suffix = isEnabled ? (isSuppressed ? " · active on other devices" : " · active") : "";
+      const desc = `${baseDesc}${suffix}`;
+      // Each toggle carries a short caption in the control row so the three
+      // switches are self-explanatory (previously they were bare + tooltip-only).
+      const caption = (s: Setting, text: string): Setting => {
+        s.controlEl.createSpan({ text, cls: "zync-toggle-label" });
+        return s;
+      };
+      new Setting(containerEl)
+        .setName(p.name)
+        .setDesc(desc)
+        // First toggle: opt-in to sync this plugin's code (same as 2a).
+        .then((s) => caption(s, "Sync plugin"))
+        .addToggle((t) =>
+          t
+            .setValue(optedIn.has(p.id))
+            .setTooltip("Sync this plugin (its code) across your devices")
+            .onChange(async (v) => {
+              await this.plugin.setPluginOptIn(p.id, v);
+            }),
+        )
+        // Task 9: second toggle — "Don't run on this device" (device-local suppress).
+        .then((s) => caption(s, "Don't run here"))
+        .addToggle((t) =>
+          t
+            .setValue(suppressed.has(p.id))
+            .setTooltip("Keep synced, but keep this plugin disabled on this device")
+            .onChange(async (v) => {
+              await this.plugin.setPluginSuppressed(p.id, v);
+            }),
+        )
+        // Slice 3b: third toggle — sync this plugin's data.json (settings).
+        .then((s) => caption(s, "Sync settings"))
+        .addToggle((t) =>
+          t
+            .setValue(!settingsOff.has(p.id)) // default ON (absent = sync); OFF only if explicitly excluded
+            .setTooltip(
+              "Sync this plugin's settings (data.json). Only effective while opted-in above.",
+            )
+            .onChange(async (v) => {
+              await this.plugin.setPluginSettingsSync(p.id, v);
+            }),
+        );
+    }
 
     new Setting(containerEl)
       .setName("Apply + restart sync")

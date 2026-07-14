@@ -4,7 +4,7 @@ import type { VaultPath } from "../ports.js";
 
 const p = (s: string) => s as VaultPath;
 const enc = (s: string) => new TextEncoder().encode(s);
-const caps = { maxProseBytes: 1_000_000, configDir: ".obsidian" };
+const caps = { maxProseBytes: 1_000_000, configDir: ".obsidian", isMobile: false };
 
 describe("classify", () => {
   it("routes prose markdown to crdt-prose", () => {
@@ -35,5 +35,41 @@ describe("classify", () => {
     expect(classify(p(".obsidian/workspace.json"), enc("{}"), caps).route).toBe("excluded");
     expect(classify(p(".obsidian/zync/base/x.json"), enc("{}"), caps).route).toBe("excluded");
     expect(classify(p(".trash/old.md"), enc("x"), caps).route).toBe("excluded");
+  });
+
+  it("excludes conflict backups under _conflicts/ (device-local, folder-based)", () => {
+    expect(
+      classify(
+        p("_conflicts/notes/x (conflict, dev, ts).md"),
+        enc("losing text"),
+        caps,
+      ).route,
+    ).toBe("excluded");
+  });
+
+  it("does NOT exclude a beside-original (conflict, …) path — that is a synced orphan RECOVERY, not a device-local backup", () => {
+    // Only the _conflicts/ FOLDER is device-local. A beside-original recovery path is a
+    // LIVE, SYNCING doc; excluding it would make recovered concurrent-create losers non-syncing.
+    expect(
+      classify(
+        p("notes/x (conflict, dev, ts).md"),
+        enc("recovered orphan text"),
+        caps,
+      ).route,
+    ).toBe("crdt-prose");
+  });
+
+  it("does NOT exclude a benign note that happens to mention 'conflict'", () => {
+    expect(classify(p("notes/x.md"), enc("# hi"), caps).route).toBe("crdt-prose");
+  });
+  it("Caps.isMobile is accepted and does not alter route decisions", () => {
+    // Compile-level guarantee: a Caps literal with isMobile:true must be accepted.
+    const mobileCaps: Parameters<typeof classify>[2] = {
+      maxProseBytes: 1_000_000,
+      configDir: ".obsidian",
+      isMobile: true,
+    };
+    expect(classify(p("notes/a.md"), enc("# hi"), mobileCaps).route).toBe("crdt-prose");
+    expect(classify(p(".obsidian/plugins/dv/main.js"), enc(""), mobileCaps).route).toBe("config");
   });
 });

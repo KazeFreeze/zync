@@ -35,7 +35,7 @@ const CONFIG = ".obsidian";
 const NOTE = path("notes/n.md");
 const DOC = id("doc-1");
 const DEVICE = "dev-test" as DeviceId;
-const CAPS: Caps = { maxProseBytes: 1_000_000, configDir: CONFIG };
+const CAPS: Caps = { maxProseBytes: 1_000_000, configDir: CONFIG, isMobile: false };
 const BASE = "L1\nL2\nL3\n";
 
 /** Wires real core pieces + a real YjsCrdtDoc + a SimulatedEditor bound to it. */

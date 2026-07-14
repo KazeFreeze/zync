@@ -283,6 +283,8 @@ const DAILY_MD = path("daily.md");
 
 function lossPath(loserDeviceId: string, original: VaultPath = DAILY_MD): VaultPath {
   // FakeClock starts at 0, so createdTs is "0" for a pre-start seed.
+  // ORPHAN RECOVERY is BESIDE-ORIGINAL (a live, SYNCING index entry) — NOT under
+  // _conflicts/. Only real conflict BACKUPS go device-local; recovered content syncs.
   const dot = original.lastIndexOf(".");
   const suffix = ` (conflict, ${loserDeviceId}, 0)`;
   return (original.slice(0, dot) + suffix + original.slice(dot)) as VaultPath;

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { ConfigChannel } from "./config-channel.js";
 import { sha256OfBytes } from "../hash.js";
+import { canonicalJsonBytes } from "./canonical.js";
 import type { CrdtMap, BlobStorePort, ConfigPort, IdentityPort, Unsubscribe } from "../ports.js";
 import type { ConfigEntry } from "./config-entry.js";
 import type { EchoLedger } from "../bridge/echo.js";
@@ -48,7 +49,41 @@ function memMap<V>(): CrdtMap<V> & { fire: (keys: string[]) => void } {
   };
 }
 
-function makeChannel(enabledCategories = { themes: true, snippets: true }) {
+const stubGate = (allow: (id: string) => boolean) => ({
+  allows: (path: string) => {
+    const m = /^\.obsidian\/plugins\/([^/]+)\//.exec(path);
+    const id = m?.[1];
+    return id === undefined ? true : allow(id);
+  },
+  platformAllowed: () => true,
+});
+
+/** In-memory blob store that actually tracks puts so get() returns stored content. */
+function memBlobStore(): BlobStorePort & { blobs: Map<string, Uint8Array> } {
+  const blobs = new Map<string, Uint8Array>();
+  return {
+    blobs,
+    has: (sha) => Promise.resolve(blobs.has(sha)),
+    put: (sha, bytes) => {
+      blobs.set(sha, bytes);
+      return Promise.resolve();
+    },
+    get: (sha) => Promise.resolve(blobs.get(sha) ?? new Uint8Array()),
+  };
+}
+
+function makeChannel(
+  enabledCategories: {
+    themes: boolean;
+    snippets: boolean;
+    plugins?: boolean;
+    "plugin-data"?: boolean;
+  } = {
+    themes: true,
+    snippets: true,
+  },
+  gate?: { allows(path: string): boolean },
+) {
   const config = memMap<ConfigEntry>();
 
   const blobHas = vi.fn(() => Promise.resolve(false));
@@ -100,6 +135,8 @@ function makeChannel(enabledCategories = { themes: true, snippets: true }) {
     identity,
     echo,
     enabledCategories,
+    now: () => 0,
+    ...(gate !== undefined ? { gate } : {}),
   });
   return {
     ch,
@@ -271,6 +308,64 @@ describe("ConfigChannel", () => {
     expect(blobPut).toHaveBeenCalledTimes(2);
   });
 
+  describe("PluginGate integration", () => {
+    it("publish: gate.allows() false -> blobPut not called and config entry absent", async () => {
+      const { ch, config, blobPut } = makeChannel(
+        { themes: true, snippets: true, plugins: true },
+        stubGate(() => false),
+      );
+      const bytes = new Uint8Array([1, 2, 3]);
+      await ch.publish(".obsidian/plugins/dv/main.js" as never, bytes);
+      expect(blobPut).not.toHaveBeenCalled();
+      expect(config.get(".obsidian/plugins/dv/main.js")).toBeUndefined();
+    });
+
+    it("publish: gate.allows() true -> published with category plugins", async () => {
+      const { ch, config, blobPut } = makeChannel(
+        { themes: true, snippets: true, plugins: true },
+        stubGate(() => true),
+      );
+      const bytes = new Uint8Array([4, 5, 6]);
+      const expectedSha = await sha256OfBytes(bytes);
+      await ch.publish(".obsidian/plugins/dv/main.js" as never, bytes);
+      expect(blobPut).toHaveBeenCalledWith(expectedSha, bytes);
+      expect(config.get(".obsidian/plugins/dv/main.js")).toMatchObject({
+        sha256: expectedSha,
+        category: "plugins",
+      });
+    });
+
+    it("onLocalChange: gate.allows() false -> blobPut not called", async () => {
+      const { ch, blobPut, configRead, fireOnChange } = makeChannel(
+        { themes: true, snippets: true, plugins: true },
+        stubGate(() => false),
+      );
+      configRead.mockResolvedValue(new Uint8Array([7, 8]));
+      ch.start();
+      fireOnChange(".obsidian/plugins/dv/main.js");
+      await new Promise((r) => setTimeout(r, 80));
+      expect(blobPut).not.toHaveBeenCalled();
+    });
+
+    it("bootstrap: gate.allows() false -> plugin path skipped", async () => {
+      const { ch, config, blobPut, configRead, configList } = makeChannel(
+        { themes: true, snippets: true, plugins: true },
+        stubGate(() => false),
+      );
+      const snippetBytes = new Uint8Array([10, 11]);
+      const snippetSha = await sha256OfBytes(snippetBytes);
+      configList.mockResolvedValue([
+        { path: ".obsidian/snippets/a.css", size: 2 },
+        { path: ".obsidian/plugins/dv/main.js", size: 3 },
+      ]);
+      configRead.mockResolvedValueOnce(snippetBytes);
+      await ch.bootstrap();
+      expect(config.get(".obsidian/snippets/a.css")).toMatchObject({ sha256: snippetSha });
+      expect(config.get(".obsidian/plugins/dv/main.js")).toBeUndefined();
+      expect(blobPut).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe("enabledCategories policy", () => {
     it("publish: themes-disabled device does NOT upload a theme file", async () => {
       const { ch, config, blobPut } = makeChannel({ themes: false, snippets: true });
@@ -339,6 +434,286 @@ describe("ConfigChannel", () => {
       expect(config.get(".obsidian/themes/b.css")).toBeUndefined();
       expect(blobPut).toHaveBeenCalledTimes(1);
       expect(blobPut).toHaveBeenCalledWith(snippetSha, snippetBytes);
+    });
+  });
+
+  describe("plugin-data", () => {
+    const enc = (s: string) => new TextEncoder().encode(s);
+    const dataPath = (id: string) =>
+      `.obsidian/plugins/${id}/data.json` as Parameters<typeof ConfigChannel.prototype.publish>[0];
+    const manifestPath = (id: string) =>
+      `.obsidian/plugins/${id}/manifest.json` as Parameters<typeof ConfigChannel.prototype.publish>[0];
+
+    /** Build a channel wired with a real in-memory blob store and configPort that can return manifest bytes. */
+    function makePluginDataChannel(manifestBytes: Uint8Array | null) {
+      const configMap = memMap<ConfigEntry>();
+      const blobStore = memBlobStore();
+
+      const configReadFn = vi.fn((path: string) => {
+        if (path.endsWith("/manifest.json") && manifestBytes !== null) {
+          return Promise.resolve(manifestBytes);
+        }
+        return Promise.resolve(null as Uint8Array | null);
+      });
+      const configPort: ConfigPort = {
+        read: configReadFn as ConfigPort["read"],
+        writeAtomic: vi.fn(() => Promise.resolve()),
+        remove: vi.fn(() => Promise.resolve()),
+        list: vi.fn(() => Promise.resolve([])) as unknown as ConfigPort["list"],
+        onChange: (_cb) => () => undefined,
+        rescan: vi.fn(() => Promise.resolve()),
+        close: vi.fn(),
+      };
+
+      const identity: IdentityPort = {
+        deviceId: vi.fn(() => "d" as never),
+        deviceName: vi.fn(() => "dev"),
+      };
+
+      const echo = {
+        recordWrite: vi.fn(() => undefined),
+        isEcho: vi.fn(() => false),
+        clear: vi.fn(),
+      } as unknown as EchoLedger;
+
+      const ch = new ConfigChannel({
+        config: configMap,
+        blobStore,
+        configPort,
+        identity,
+        echo,
+        enabledCategories: { themes: true, snippets: true, plugins: true, "plugin-data": true },
+        gate: stubGate(() => true),
+        now: () => 0,
+      });
+
+      return { ch, configMap, blobStore };
+    }
+
+    it("plugin-data: publishes canonical bytes + stamps version from sibling manifest", async () => {
+      const manifestBytes = enc(JSON.stringify({ version: "1.2.0" }));
+      const { ch, configMap, blobStore } = makePluginDataChannel(manifestBytes);
+
+      await ch.publish(dataPath("dv"), enc(`{"b":1,"a":2}`));
+
+      const entry = configMap.get(dataPath("dv"))!;
+      expect(entry).toBeDefined();
+      expect(entry.category).toBe("plugin-data");
+      expect(entry.version).toBe("1.2.0");
+
+      const stored = await blobStore.get(entry.sha256);
+      expect(stored).toEqual(canonicalJsonBytes(enc(`{"b":1,"a":2}`)));
+    });
+
+    it("plugin-data: cosmetic re-save does not republish (canonical churn guard)", async () => {
+      const manifestBytes = enc(JSON.stringify({ version: "1.0.0" }));
+      const { ch, configMap } = makePluginDataChannel(manifestBytes);
+
+      await ch.publish(dataPath("dv"), enc(`{"a":1,"b":2}`));
+      const sha1 = configMap.get(dataPath("dv"))!.sha256;
+
+      await ch.publish(dataPath("dv"), enc(`{"b":2,"a":1}`));
+      expect(configMap.get(dataPath("dv"))!.sha256).toBe(sha1);
+    });
+
+    it("plugin-data: no manifest -> entry published without version field", async () => {
+      const { ch, configMap } = makePluginDataChannel(null);
+
+      await ch.publish(dataPath("dv"), enc(`{"x":1}`));
+
+      const entry = configMap.get(dataPath("dv"))!;
+      expect(entry).toBeDefined();
+      expect(entry.version).toBeUndefined();
+      expect(entry.category).toBe("plugin-data");
+    });
+
+    it("non-plugin-data path: raw bytes stored, no canonicalization (themes unchanged)", async () => {
+      const { ch, configMap, blobStore } = makePluginDataChannel(null);
+
+      const rawBytes = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
+      await ch.publish(".obsidian/themes/Foo/theme.css" as Parameters<typeof ConfigChannel.prototype.publish>[0], rawBytes);
+
+      const entry = configMap.get(".obsidian/themes/Foo/theme.css");
+      expect(entry).toBeDefined();
+      expect(entry!.category).toBe("themes");
+      expect(entry!.version).toBeUndefined();
+      const stored = await blobStore.get(entry!.sha256);
+      // Raw bytes, not canonicalized
+      expect(stored).toEqual(rawBytes);
+    });
+
+    it("plugin-data: a local delete does NOT tombstone (uninstall must not wipe peers)", async () => {
+      const manifestBytes = enc(JSON.stringify({ version: "1.0.0" }));
+      const configMap = memMap<ConfigEntry>();
+      const blobStore = memBlobStore();
+
+      let dataContent: Uint8Array | null = enc(`{"a":1}`);
+      const configReadFn = vi.fn((path: string) => {
+        if (path.endsWith("/manifest.json") && manifestBytes !== null) {
+          return Promise.resolve(manifestBytes);
+        }
+        if (path === dataPath("dv")) return Promise.resolve(dataContent);
+        return Promise.resolve(null as Uint8Array | null);
+      });
+      const configPort: ConfigPort = {
+        read: configReadFn as ConfigPort["read"],
+        writeAtomic: vi.fn(() => Promise.resolve()),
+        remove: vi.fn(() => Promise.resolve()),
+        list: vi.fn(() => Promise.resolve([])) as unknown as ConfigPort["list"],
+        onChange: (_cb) => () => undefined,
+        rescan: vi.fn(() => Promise.resolve()),
+        close: vi.fn(),
+      };
+      const identity: IdentityPort = {
+        deviceId: vi.fn(() => "d" as never),
+        deviceName: vi.fn(() => "dev"),
+      };
+      const echo = {
+        recordWrite: vi.fn(() => undefined),
+        isEcho: vi.fn(() => false),
+        clear: vi.fn(),
+      } as unknown as EchoLedger;
+
+      const channel = new ConfigChannel({
+        config: configMap,
+        blobStore,
+        configPort,
+        identity,
+        echo,
+        enabledCategories: { themes: true, snippets: true, plugins: true, "plugin-data": true },
+        gate: stubGate(() => true),
+        now: () => 0,
+      });
+
+      // publish first so config has an entry
+      await channel.publish(dataPath("dv"), enc(`{"a":1}`));
+      expect(configMap.get(dataPath("dv"))).toBeDefined();
+
+      // simulate the file being removed on disk
+      dataContent = null;
+      await channel["onLocalChange"](dataPath("dv"));
+
+      const e = configMap.get(dataPath("dv"))!;
+      expect(e.deleted).not.toBe(true); // entry preserved, no tombstone
+    });
+
+    it("plugin-data: a re-save within the quiescence window is not republished", async () => {
+      const manifestBytes = enc(JSON.stringify({ version: "1.0.0" }));
+      const configMap = memMap<ConfigEntry>();
+      const blobStore = memBlobStore();
+
+      let dataContent: Uint8Array | null = enc(`{"a":1,"ts":1100}`);
+      let clockNow = 0;
+      const configReadFn = vi.fn((path: string) => {
+        if (path.endsWith("/manifest.json") && manifestBytes !== null) {
+          return Promise.resolve(manifestBytes);
+        }
+        if (path === dataPath("dv")) return Promise.resolve(dataContent);
+        return Promise.resolve(null as Uint8Array | null);
+      });
+      const configPort: ConfigPort = {
+        read: configReadFn as ConfigPort["read"],
+        writeAtomic: vi.fn(() => Promise.resolve()),
+        remove: vi.fn(() => Promise.resolve()),
+        list: vi.fn(() => Promise.resolve([])) as unknown as ConfigPort["list"],
+        onChange: (_cb) => () => undefined,
+        rescan: vi.fn(() => Promise.resolve()),
+        close: vi.fn(),
+      };
+      const identity: IdentityPort = {
+        deviceId: vi.fn(() => "d" as never),
+        deviceName: vi.fn(() => "dev"),
+      };
+      const echo = {
+        recordWrite: vi.fn(() => undefined),
+        isEcho: vi.fn(() => false),
+        clear: vi.fn(),
+      } as unknown as EchoLedger;
+
+      const channel = new ConfigChannel({
+        config: configMap,
+        blobStore,
+        configPort,
+        identity,
+        echo,
+        enabledCategories: { themes: true, snippets: true, plugins: true, "plugin-data": true },
+        gate: stubGate(() => true),
+        now: () => clockNow,
+      });
+
+      channel.noteMaterialized(dataPath("dv"), 1000); // materialized at t=1000
+      clockNow = 1100; // 100ms later, plugin re-saves a normalized variant
+      dataContent = enc(`{"a":1,"ts":1100}`);
+      await channel["onLocalChange"](dataPath("dv"));
+      expect(configMap.get(dataPath("dv"))).toBeUndefined(); // suppressed within window; not published
+    });
+
+    it("plugin-data: a re-save AFTER the window publishes normally", async () => {
+      const manifestBytes = enc(JSON.stringify({ version: "1.0.0" }));
+      const configMap = memMap<ConfigEntry>();
+      const blobStore = memBlobStore();
+
+      let clockNow = 0;
+      const configReadFn = vi.fn((path: string) => {
+        if (path.endsWith("/manifest.json") && manifestBytes !== null) {
+          return Promise.resolve(manifestBytes);
+        }
+        if (path === dataPath("dv")) return Promise.resolve(enc(`{"a":2}`));
+        return Promise.resolve(null as Uint8Array | null);
+      });
+      const configPort: ConfigPort = {
+        read: configReadFn as ConfigPort["read"],
+        writeAtomic: vi.fn(() => Promise.resolve()),
+        remove: vi.fn(() => Promise.resolve()),
+        list: vi.fn(() => Promise.resolve([])) as unknown as ConfigPort["list"],
+        onChange: (_cb) => () => undefined,
+        rescan: vi.fn(() => Promise.resolve()),
+        close: vi.fn(),
+      };
+      const identity: IdentityPort = {
+        deviceId: vi.fn(() => "d" as never),
+        deviceName: vi.fn(() => "dev"),
+      };
+      const echo = {
+        recordWrite: vi.fn(() => undefined),
+        isEcho: vi.fn(() => false),
+        clear: vi.fn(),
+      } as unknown as EchoLedger;
+
+      const channel = new ConfigChannel({
+        config: configMap,
+        blobStore,
+        configPort,
+        identity,
+        echo,
+        enabledCategories: { themes: true, snippets: true, plugins: true, "plugin-data": true },
+        gate: stubGate(() => true),
+        now: () => clockNow,
+      });
+
+      channel.noteMaterialized(dataPath("dv"), 1000);
+      clockNow = 1000 + 1500 + 1; // past QUIESCENCE_MS (1500)
+      await channel["onLocalChange"](dataPath("dv"));
+      expect(configMap.get(dataPath("dv"))).toBeDefined();
+    });
+
+    it("themes: a local delete STILL tombstones (unchanged)", async () => {
+      const { ch, config, configRead, fireOnChange } = makeChannel({ themes: true, snippets: true });
+
+      const bytes = new Uint8Array([1, 2, 3]);
+      configRead.mockResolvedValue(bytes);
+      const themePath = ".obsidian/snippets/x.css" as Parameters<typeof ConfigChannel.prototype.publish>[0];
+      await ch.publish(themePath, bytes);
+      expect(config.get(themePath)).toBeDefined();
+
+      // simulate the file being removed on disk
+      configRead.mockResolvedValue(null);
+      ch.start();
+      fireOnChange(themePath);
+
+      await poll(() => {
+        expect(config.get(themePath)!.deleted).toBe(true);
+      });
     });
   });
 });

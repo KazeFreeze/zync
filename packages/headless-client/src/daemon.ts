@@ -30,6 +30,7 @@ import { NodeFsConfig } from "./adapters/node-fs-config.js";
 import { FsDocStore } from "./adapters/fs-docstore.js";
 import { FsEngineStateStore } from "./adapters/fs-engine-state.js";
 import { createControlApi, type DaemonState } from "./control-api.js";
+import { NodeFsCommunityPlugins } from "./adapters/node-fs-community-plugins.js";
 
 /** Daemon configuration. Env-derived in {@link configFromEnv}; explicit in tests. */
 export interface DaemonConfig {
@@ -67,6 +68,12 @@ export interface DaemonConfig {
   maxProseBytes: number;
   /** Projector mode — the engine will not ingest local writes (Part C). */
   ingestDisabled: boolean;
+  /**
+   * Mobile platform flag. Set `true` when the daemon runs as a simulated mobile peer
+   * (e.g. `ZYNC_IS_MOBILE=1`). Drives plugin platform-gating via `Caps.isMobile`.
+   * Defaults `false` (desktop). Task 9 wires the env var end-to-end.
+   */
+  isMobile?: boolean;
   /**
    * Blob fetch policy (0b-3 Fix 3). `"eager"` (the headless-follower default) materializes
    * a synced blob onto disk as soon as its manifest entry replicates — without it a blob
@@ -120,6 +127,7 @@ export async function createDaemon(config: DaemonConfig): Promise<Daemon> {
       : undefined,
   );
   const configPort = new NodeFsConfig(config.vaultDir);
+  const communityPluginsPort = new NodeFsCommunityPlugins(config.vaultDir);
   const docStore = new FsDocStore(config.docStoreDir);
   const engineState = await FsEngineStateStore.open(config.stateFile);
   const blobs = new HttpBlobStore(config.serverHttp, config.token);
@@ -138,7 +146,18 @@ export async function createDaemon(config: DaemonConfig): Promise<Daemon> {
   };
 
   const engine = new SyncEngine(
-    { vault, crdt, transport, blobs, docStore, clock, identity, engineState, config: configPort },
+    {
+      vault,
+      crdt,
+      transport,
+      blobs,
+      docStore,
+      clock,
+      identity,
+      engineState,
+      config: configPort,
+      communityPlugins: communityPluginsPort,
+    },
     {
       configDir: config.engineConfigDir,
       maxProseBytes: config.maxProseBytes,
@@ -146,9 +165,9 @@ export async function createDaemon(config: DaemonConfig): Promise<Daemon> {
       // Wire the blob fetch policy end-to-end (0b-3 Fix 3) so a synced blob materializes
       // onto this follower's disk. Only pass it when set so the engine's own default applies.
       ...(config.blobPolicy !== undefined ? { blobPolicy: config.blobPolicy } : {}),
-      // Harness daemon: both categories always on so all config-themes/config-conflict
-      // scenarios run unaffected. A per-device env-based toggle can be added later.
-      configCategories: { themes: true, snippets: true },
+      // Harness daemon: all config categories on so themes/snippets/plugins scenarios run.
+      configCategories: { themes: true, snippets: true, plugins: true, "plugin-data": true },
+      isMobile: config.isMobile ?? false,
     },
   );
 
@@ -183,6 +202,7 @@ export async function createDaemon(config: DaemonConfig): Promise<Daemon> {
     transport,
     vault,
     config: configPort,
+    communityPlugins: communityPluginsPort,
     vaultDir: path.resolve(config.vaultDir),
     docStoreDir: path.resolve(config.docStoreDir),
     fixturesDir: path.resolve(config.fixturesDir),
@@ -191,6 +211,7 @@ export async function createDaemon(config: DaemonConfig): Promise<Daemon> {
     setStarted: (v) => {
       started = v;
     },
+    engineState,
   });
 
   let server: http.Server | null = null;
@@ -222,6 +243,7 @@ export async function createDaemon(config: DaemonConfig): Promise<Daemon> {
       await transport.close();
       vault.close();
       configPort.close();
+      communityPluginsPort.close();
       const s = server;
       if (s !== null) {
         await new Promise<void>((resolve, reject) => {
@@ -261,6 +283,8 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): DaemonConfi
         ? Number(env.ZYNC_MAX_PROSE_BYTES)
         : DEFAULT_MAX_PROSE_BYTES,
     ingestDisabled: env.ZYNC_INGEST_DISABLED === "true" || env.ZYNC_INGEST_DISABLED === "1",
+    // Mobile flag: `ZYNC_IS_MOBILE=1` simulates a mobile peer (blocks desktop-only plugins).
+    isMobile: env.ZYNC_IS_MOBILE === "1",
     // Follower default is EAGER (0b-3 Fix 3): synced blobs must land on disk, not just in
     // the server store. Only `"lazy"` opts out (fetch-on-open); any other value falls back
     // to eager so a typo never silently disables materialization.

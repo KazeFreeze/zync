@@ -1,7 +1,8 @@
 /**
  * ObsidianConfigPort — ConfigPort implementation over the Obsidian DataAdapter for the config zone
- * (`.obsidian/themes/` and `.obsidian/snippets/`). The Vault API cannot enumerate dot-folders, so
- * all IO goes through `vault.adapter` (DataAdapter) directly.
+ * (`.obsidian/themes/`, `.obsidian/snippets/`, and the file-allow-listed
+ * `.obsidian/plugins/<id>/{manifest.json,main.js,styles.css}` arm). The Vault API cannot enumerate
+ * dot-folders, so all IO goes through `vault.adapter` (DataAdapter) directly.
  *
  * Change detection is a best-effort two-layer approach:
  *  1. `vault.on("raw", cb)` — fires for any DataAdapter write Obsidian observes (not in official
@@ -195,6 +196,7 @@ export class ObsidianConfigPort implements ConfigPort {
     }
     for (const filePath of listed.files) {
       if (isSelfExcluded(filePath)) continue;
+      if (!isConfigZone(filePath as VaultPath)) continue;
       const stat = await this.vault.adapter.stat(filePath);
       if (stat !== null && stat.type === "file") {
         out.push({ path: filePath as VaultPath, size: stat.size });

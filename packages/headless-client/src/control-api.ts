@@ -20,10 +20,17 @@ import * as http from "node:http";
 import * as fsp from "node:fs/promises";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ConfigPort, CrdtDoc, TransportPort, VaultPath } from "@zync/core";
+import type {
+  ConfigPort,
+  CommunityPluginsPort,
+  CrdtDoc,
+  TransportPort,
+  VaultPath,
+} from "@zync/core";
 import { SyncEngine, sha256OfText, sha256OfBytes } from "@zync/core";
 import { SimulatedEditor } from "@zync/core/testing";
 import type { NodeFsVault } from "./adapters/node-fs-vault.js";
+import type { FsEngineStateStore } from "./adapters/fs-engine-state.js";
 
 /**
  * Mutable observability bag the daemon maintains and the control API reads. The
@@ -57,6 +64,8 @@ export interface ControlApiDeps {
   vault: NodeFsVault;
   /** ConfigPort for the config zone (.obsidian/themes, .obsidian/snippets). */
   config: ConfigPort;
+  /** CommunityPluginsPort for reading community-plugins.json (Slice 2b). */
+  communityPlugins?: CommunityPluginsPort;
   /** Absolute path to the vault root (for direct external fs writes). */
   vaultDir: string;
   /** Absolute path to the FsDocStore directory (for /metrics docStoreBytes). */
@@ -67,6 +76,12 @@ export interface ControlApiDeps {
   /** True once `engine.start()` has been called (gates fixture loading). */
   isStarted: () => boolean;
   setStarted: (v: boolean) => void;
+  /**
+   * The durable engine-state store. Exposed so the control API can invoke
+   * operator/test helpers such as {@link FsEngineStateStore.clearAllSyncedStamps}
+   * that are not part of the {@link EngineStateStore} port interface.
+   */
+  engineState: FsEngineStateStore;
 }
 
 const vp = (s: string): VaultPath => s as VaultPath;
@@ -144,6 +159,24 @@ async function handle(deps: ControlApiDeps, req: http.IncomingMessage): Promise<
       return configRescan(deps);
     case "GET /config/list":
       return configList(deps);
+    case "POST /plugins/opt-in":
+      return pluginOptIn(deps, await readJson(req));
+    case "GET /plugins/list":
+      return pluginList(deps);
+    case "POST /plugins/enabled":
+      return pluginEnabled(deps, await readJson(req));
+    case "POST /plugins/suppress":
+      return pluginSuppress(deps, await readJson(req));
+    case "GET /plugins/community-list":
+      return pluginCommunityList(deps);
+    case "POST /plugins/community-write":
+      return pluginCommunityWrite(deps, await readJson(req));
+    case "POST /plugins/data":
+      return pluginDataWrite(deps, await readJson(req));
+    case "GET /plugins/data":
+      return pluginDataRead(deps, url);
+    case "POST /plugins/settings-sync":
+      return pluginSettingsSync(deps, await readJson(req));
     case "GET /fs/read":
       return fsRead(deps, url);
     case "GET /fs/tree":
@@ -160,6 +193,8 @@ async function handle(deps: ControlApiDeps, req: http.IncomingMessage): Promise<
       return editorClose(deps, await readJson(req));
     case "GET /metrics":
       return metrics(deps);
+    case "POST /engine/clear-synced-stamps":
+      return engineClearSyncedStamps(deps);
     default:
       throw new HttpError(404, `no route: ${route}`);
   }
@@ -435,6 +470,80 @@ async function configRescan(deps: ControlApiDeps): Promise<JsonResponse> {
   return { status: 200, body: { ok: true } };
 }
 
+// ── /plugins/* ────────────────────────────────────────────────────────────────
+
+async function pluginOptIn(deps: ControlApiDeps, raw: unknown): Promise<JsonResponse> {
+  const body = raw as { id?: string; optIn?: boolean };
+  if (typeof body.id !== "string" || typeof body.optIn !== "boolean")
+    throw new HttpError(400, "id and optIn are required");
+  await deps.engine.setPluginOptIn(body.id, body.optIn);
+  return { status: 200, body: { ok: true } };
+}
+
+function pluginList(deps: ControlApiDeps): JsonResponse {
+  return { status: 200, body: { plugins: deps.engine.listPluginOptIn() } };
+}
+
+function pluginEnabled(deps: ControlApiDeps, raw: unknown): JsonResponse {
+  const b = raw as { id?: string; enabled?: boolean };
+  if (typeof b.id !== "string" || typeof b.enabled !== "boolean")
+    throw new HttpError(400, "id and enabled required");
+  deps.engine.setPluginEnabled(b.id, b.enabled);
+  return { status: 200, body: { ok: true } };
+}
+
+async function pluginSuppress(deps: ControlApiDeps, raw: unknown): Promise<JsonResponse> {
+  const b = raw as { id?: string; suppressed?: boolean };
+  if (typeof b.id !== "string" || typeof b.suppressed !== "boolean")
+    throw new HttpError(400, "id and suppressed required");
+  await deps.engine.setPluginSuppressed(b.id, b.suppressed);
+  return { status: 200, body: { ok: true } };
+}
+
+async function pluginCommunityList(deps: ControlApiDeps): Promise<JsonResponse> {
+  return { status: 200, body: { enabled: (await deps.communityPlugins?.read()) ?? [] } };
+}
+
+async function pluginCommunityWrite(deps: ControlApiDeps, raw: unknown): Promise<JsonResponse> {
+  const b = raw as { ids?: unknown };
+  if (!Array.isArray(b.ids) || !b.ids.every((x): x is string => typeof x === "string")) {
+    throw new HttpError(400, "ids must be an array of strings");
+  }
+  await deps.communityPlugins?.writeAtomic(b.ids);
+  return { status: 200, body: { ok: true } };
+}
+
+async function pluginDataWrite(deps: ControlApiDeps, raw: unknown): Promise<JsonResponse> {
+  const b = raw as { id?: unknown; json?: unknown };
+  if (typeof b.id !== "string") throw new HttpError(400, "id is required");
+  if (b.json === undefined) throw new HttpError(400, "json is required");
+  const bytes = new TextEncoder().encode(JSON.stringify(b.json));
+  await deps.engine.writePluginData(b.id, bytes);
+  return { status: 200, body: { ok: true } };
+}
+
+async function pluginDataRead(deps: ControlApiDeps, url: URL): Promise<JsonResponse> {
+  const id = url.searchParams.get("id");
+  if (id === null) throw new HttpError(400, "id query param is required");
+  const bytes = await deps.engine.readPluginData(id);
+  if (bytes === null) return { status: 200, body: { json: null } };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder().decode(bytes)) as unknown;
+  } catch {
+    throw new HttpError(500, `data.json for ${id} is not valid JSON`);
+  }
+  return { status: 200, body: { json: parsed } };
+}
+
+function pluginSettingsSync(deps: ControlApiDeps, raw: unknown): JsonResponse {
+  const b = raw as { id?: unknown; on?: unknown };
+  if (typeof b.id !== "string") throw new HttpError(400, "id is required");
+  if (typeof b.on !== "boolean") throw new HttpError(400, "on is required");
+  deps.engine.setPluginSettingsSync(b.id, b.on);
+  return { status: 200, body: { ok: true } };
+}
+
 async function fsRead(deps: ControlApiDeps, url: URL): Promise<JsonResponse> {
   const p = url.searchParams.get("path");
   if (p === null) throw new HttpError(400, "path query param is required");
@@ -635,6 +744,21 @@ async function dirBytes(dir: string): Promise<number> {
     total += st.size;
   }
   return total;
+}
+
+// ── /engine/* ─────────────────────────────────────────────────────────────────
+
+/**
+ * Clear ALL persisted synced stamps and atomically rewrite the state file so the
+ * cleared state SURVIVES a daemon restart. Callable whether the engine is running
+ * OR stopped (the control API stays up while the engine is stopped). When called
+ * with the engine stopped — the intended test usage — the next `POST /sync/start`
+ * loads from the persisted file and sees no synced stamps, so every live doc is
+ * re-pending and the startup self-heal drains them back to zero over the relay.
+ */
+async function engineClearSyncedStamps(deps: ControlApiDeps): Promise<JsonResponse> {
+  await deps.engineState.clearAllSyncedStamps();
+  return { status: 200, body: { ok: true } };
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

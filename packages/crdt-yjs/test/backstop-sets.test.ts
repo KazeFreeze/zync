@@ -814,6 +814,22 @@ class BlockedSyncedStampState implements EngineStateStore {
   setConfigBase(path: VaultPath, sha256: Sha256): Promise<void> {
     return this.inner.setConfigBase(path, sha256);
   }
+
+  getConfigLocalVersion(path: VaultPath): Promise<number> {
+    return this.inner.getConfigLocalVersion(path);
+  }
+
+  setConfigLocalVersion(path: VaultPath, version: number): Promise<void> {
+    return this.inner.setConfigLocalVersion(path, version);
+  }
+
+  getLocalSuppress(): Promise<string[]> {
+    return this.inner.getLocalSuppress();
+  }
+
+  setLocalSuppress(ids: string[]): Promise<void> {
+    return this.inner.setLocalSuppress(ids);
+  }
 }
 
 /**

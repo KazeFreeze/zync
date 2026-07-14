@@ -15,6 +15,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import type { VaultEvent, VaultPath, VaultPort, Unsubscribe } from "@zync/core";
+import { CONFIG_ZONE_PREFIXES, COMMUNITY_PLUGINS_PATH } from "@zync/core";
 import { TMP_PREFIX, isEnoent, atomicWriteBytes } from "./fs-utils.js";
 
 const ZYNC_INTERNAL_PREFIX = ".obsidian/zync/";
@@ -22,8 +23,8 @@ const ZYNC_INTERNAL_PREFIX = ".obsidian/zync/";
 function isExcluded(rel: string): boolean {
   return (
     rel.startsWith(ZYNC_INTERNAL_PREFIX) ||
-    rel.startsWith(".obsidian/themes/") ||
-    rel.startsWith(".obsidian/snippets/") ||
+    rel === COMMUNITY_PLUGINS_PATH ||
+    CONFIG_ZONE_PREFIXES.some((p) => rel.startsWith(p)) ||
     path.basename(rel).startsWith(TMP_PREFIX)
   );
 }

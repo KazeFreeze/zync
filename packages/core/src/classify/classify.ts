@@ -1,9 +1,12 @@
 import type { VaultPath } from "../ports.js";
+import { isConflictArtifactPath } from "../conflicts/artifact.js";
 
 export type Route = "crdt-prose" | "structured-blob" | "binary-blob" | "config" | "excluded";
 export interface Caps {
   maxProseBytes: number;
   configDir: string;
+  /** Injected platform flag; drives per-device plugin platform-gating. Defaults false (desktop). */
+  isMobile: boolean;
 }
 export interface Classification {
   route: Route;
@@ -32,7 +35,8 @@ export function classify(path: VaultPath, bytes: Uint8Array, caps: Caps): Classi
     path.startsWith(".trash/") ||
     path === `${caps.configDir}/workspace.json` ||
     path === `${caps.configDir}/workspace-mobile.json` ||
-    path.startsWith(`${caps.configDir}/zync/`)
+    path.startsWith(`${caps.configDir}/zync/`) ||
+    isConflictArtifactPath(path)
   ) {
     return { route: "excluded" };
   }

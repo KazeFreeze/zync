@@ -105,6 +105,25 @@ export class IdbEngineState implements EngineStateStore {
     await this.db.put(META_STORE, sha256, `configBase:${path}`);
   }
 
+  async getConfigLocalVersion(path: VaultPath): Promise<number> {
+    const value = await this.db.get(META_STORE, `configLocalVersion:${path}`);
+    return typeof value === "number" ? value : 0;
+  }
+
+  async setConfigLocalVersion(path: VaultPath, version: number): Promise<void> {
+    await this.db.put(META_STORE, version, `configLocalVersion:${path}`);
+  }
+
+  async getLocalSuppress(): Promise<string[]> {
+    const raw = await this.db.get(META_STORE, "localSuppress");
+    if (!Array.isArray(raw)) return [];
+    return (raw as unknown[]).filter((x): x is string => typeof x === "string");
+  }
+
+  async setLocalSuppress(ids: string[]): Promise<void> {
+    await this.db.put(META_STORE, ids, "localSuppress");
+  }
+
   /**
    * Read-modify-write a single record inside ONE readwrite transaction so the
    * two facets (synced stamp, dirty flag) never race with each other. Absent
