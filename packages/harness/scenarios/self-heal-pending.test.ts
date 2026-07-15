@@ -31,7 +31,15 @@
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { device, resetStack, seedAndStart, sleep, treesEqual } from "../src/harness.js";
+import {
+  crashServer,
+  device,
+  resetStack,
+  restartServer,
+  seedAndStart,
+  sleep,
+  treesEqual,
+} from "../src/harness.js";
 
 const a = device("device-a");
 const b = device("device-b");
@@ -50,6 +58,22 @@ async function waitSelfHealDrained(timeoutMs: number): Promise<void> {
       throw new Error(
         `waitSelfHealDrained timed out after ${String(timeoutMs)}ms — ` +
           `A.pendingDocs=${String(pendingDocs)} conn=${conn}`,
+      );
+    }
+    await sleep(1_000);
+  }
+}
+
+/** Poll BOTH devices' `pendingDocs` until each reaches 0 (no flush). Throws a diagnostic on timeout. */
+async function waitBothDrained(timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const [sa, sb] = await Promise.all([a.status(), b.status()]);
+    if (sa.pendingDocs === 0 && sb.pendingDocs === 0) return;
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `waitBothDrained timed out after ${String(timeoutMs)}ms — ` +
+          `A.pending=${String(sa.pendingDocs)} B.pending=${String(sb.pendingDocs)}`,
       );
     }
     await sleep(1_000);
@@ -127,4 +151,45 @@ describe("self-heal-pending", () => {
     const finalB = await b.status();
     expect(finalB.pendingDocs).toBe(0);
   }, 300_000);
+
+  test("mid-session: reconnect re-arms self-heal on BOTH devices → drain to 0, no dup, no loss", async () => {
+    // The MID-SESSION variant of the startup case: device-side synced-stamp loss WITHOUT a restart.
+    // Nothing re-arms the change-driven reconcile loop, so the pending is wedged — a genuine reconnect
+    // must re-arm the bounded self-heal (pending-gated) and drain BOTH devices back to 0 over the real
+    // relay, converging with NO duplicated content (the concurrent-re-seed Yjs double-insert hazard).
+
+    // ── Phase 1: both converged + quiescent ──
+    const [initA, initB] = await Promise.all([a.status(), b.status()]);
+    expect(initA.pendingDocs).toBe(0);
+    expect(initB.pendingDocs).toBe(0);
+    const treeBefore = await a.tree();
+    expect(treesEqual(treeBefore, await b.tree())).toBe(true);
+    const noteCount = Object.keys(treeBefore).length;
+    expect(noteCount).toBeGreaterThan(0);
+
+    // ── Phase 2: mid-session DEVICE-SIDE stamp loss + a genuine reconnect (relay reset) ──
+    // A docker network `partition` does NOT close the client websocket (the socket stays "connected"),
+    // so it cannot model a relay reset — the reconnect handler would never fire. CRASH the relay
+    // (SIGKILL) so both clients see a genuine offline; clear each device's synced-stamp store while
+    // offline (race-free — no acks in flight); then RESTART the relay (it reloads its persisted Yjs
+    // snapshots, so no relay-side data loss) → both clients reconnect (offline→connected), and the
+    // pending-gated reconnect self-heal arms and drains their now-pending docs.
+    await crashServer();
+    await sleep(4_000); // let both devices detect the dropped socket (offline) before clear + restart
+    await a.clearSyncedStamps();
+    await b.clearSyncedStamps();
+    await restartServer();
+
+    // ── Phase 3: both reconnect → the pending-gated reconnect self-heal drains (NO manual flush) ──
+    await waitBothDrained(180_000);
+
+    // ── Phase 4: no dup, no loss, converged ──
+    const [treeAfterA, treeAfterB] = await Promise.all([a.tree(), b.tree()]);
+    expect(treesEqual(treeAfterA, treeAfterB)).toBe(true); // converged
+    expect(treesEqual(treeAfterA, treeBefore)).toBe(true); // no loss, no duplicated content
+    expect(Object.keys(treeAfterA).length).toBe(noteCount); // exact same file set (no dup paths)
+    const [finA, finB] = await Promise.all([a.status(), b.status()]);
+    expect(finA.pendingDocs).toBe(0);
+    expect(finB.pendingDocs).toBe(0);
+  }, 360_000);
 });

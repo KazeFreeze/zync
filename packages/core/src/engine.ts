@@ -67,6 +67,7 @@ import {
 } from "./conflicts/resolve.js";
 import { canonicalizeProse, sha256OfBytes, sha256OfText } from "./hash.js";
 import { diffToEdits, merge3 } from "./bridge/merge.js";
+import { reconnectHealJitterMs } from "./reconnect-jitter.js";
 
 export interface EnginePorts {
   vault: VaultPort;
@@ -147,6 +148,8 @@ export interface EngineConfig {
    * drives per-device plugin platform-gating via `Caps.isMobile`. Defaults `false`.
    */
   isMobile?: boolean;
+  /** Reconnect-heal jitter ceiling (ms). Default {@link DEFAULT_RECONNECT_HEAL_JITTER_MAX_MS}; 0 disables. */
+  reconnectHealJitterMaxMs?: number;
 }
 
 const utf8 = (s: string): Uint8Array => new TextEncoder().encode(s);
@@ -261,6 +264,13 @@ export const SELFHEAL_MAX_NO_PROGRESS = 3;
  * converges in a handful of rounds (cf. {@link SyncEngine.waitConverged}'s 50-round cap).
  */
 export const SELFHEAL_MAX_PASSES = 50;
+
+/**
+ * Reconnect self-heal jitter ceiling (ms). The reconnect-triggered self-heal arm is delayed by a
+ * per-device deterministic offset in [0, this) so a mass reset doesn't stampede all devices' full
+ * catch-ups in lockstep. `0` disables the delay (tests set it to 0 for determinism).
+ */
+export const DEFAULT_RECONNECT_HEAL_JITTER_MAX_MS = 15_000;
 
 /** A pending debounced bump: its settle promise is tracked by {@link SyncEngine.whenIdle}. */
 interface PendingBump {
@@ -632,6 +642,8 @@ export class SyncEngine {
    * whenever pending is observed empty (the episode is over — a later reset re-arms fresh).
    */
   private selfHealStopped = false;
+  /** Reconnect-heal jitter timer; null when not pending. Cleared in stop() and when it fires. */
+  private reconnectHealTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * The single in-flight rename-transaction settle: a tracked, RE-ARMABLE timer (see
    * {@link scheduleRenameSettle}). Re-arming on each suppressed fallout event keeps the
@@ -1063,18 +1075,35 @@ export class SyncEngine {
         // next index-observe scoped pass (the index auto-resyncs on reconnect) or, worst case, the
         // S6c audit — bounded staleness, NOT loss.
         sawOfflineSinceConnected = false;
-        this.track(this.lazyAttach.runCatchUp(new Set()));
-        // F2 AUTO-HEAL (reconnect) — DEFERRED, deliberately NOT wired here. Although runSelfHealPass
-        // is now active-bound-safe (empty openDocIds, so it does NOT false-latch open editors — that
-        // regression is fixed), arming the self-heal on EVERY reconnect changes reconnect semantics
-        // in a way that is not pure gain: the self-heal pass runs structuralReconcile → the ORPHAN
-        // SWEEP, which recovers an LWW-loser orphan (surfacing its conflict artifact) at RECONNECT
-        // rather than at the later quiescence audit. That is arguably better, but it is a behavior
-        // change (it breaks orphan-recovery-observe's "not-recovered-until-the-audit" timing
-        // assertion) and needs its own review — so the reconnect trigger is a SEPARATE follow-up.
-        // The STARTUP auto-trigger (see step 9) covers the primary restart-doesn't-drain case; the
-        // explicit requestSelfHeal() control seam and the harness relay-reset→drain scenario cover
-        // the rest. See requestSelfHeal's doc comment.
+        // F2 AUTO-HEAL (reconnect), pending-gated. After the reconnect catch-up settles, if pending is
+        // STILL non-empty (device-side synced-stamp loss the change-driven loop can't re-trigger), arm
+        // the FLAP-SAFE self-heal. The gate means ordinary reconnects (nothing pending after catch-up)
+        // never arm the self-heal or run the orphan sweep — zero behavior change on the common path.
+        // Uses armSelfHealOnReconnect (NOT requestSelfHeal) so a flapping network can't un-bound a
+        // running episode. The catch-up + pending-gate are tracked; a jitter-DELAYED arm is
+        // FIRE-AND-FORGET (via reconnectHealTimer) so whenIdle()/waitConverged() never block on the
+        // per-device stagger delay — the self-heal's own reconcile work is tracked when the arm fires.
+        this.track(
+          (async () => {
+            await this.lazyAttach.runCatchUp(new Set());
+            if ((await this.durablePendingDocs()).length === 0) return; // pending-gate
+            const jitter = reconnectHealJitterMs(
+              this.ports.identity.deviceId(),
+              this.config.reconnectHealJitterMaxMs ?? DEFAULT_RECONNECT_HEAL_JITTER_MAX_MS,
+            );
+            if (jitter === 0) {
+              this.armSelfHealOnReconnect(); // immediate; the reconcile it schedules is tracked
+              return;
+            }
+            // jitter > 0: schedule the arm fire-and-forget so convergence-waits don't block on the
+            // stagger. Clear any prior pending jitter timer (rapid re-reconnect) so it can't leak.
+            if (this.reconnectHealTimer !== null) clearTimeout(this.reconnectHealTimer);
+            this.reconnectHealTimer = setTimeout(() => {
+              this.reconnectHealTimer = null;
+              this.armSelfHealOnReconnect();
+            }, jitter);
+          })(),
+        );
       }
     });
   }
@@ -1137,6 +1166,10 @@ export class SyncEngine {
 
     // F2: cancel + reset the self-heal so no dangling backoff timer fires after stop().
     this.disarmSelfHeal();
+    if (this.reconnectHealTimer !== null) {
+      clearTimeout(this.reconnectHealTimer);
+      this.reconnectHealTimer = null;
+    }
 
     // M3: clear the live-rename debounce timer so no dangling drain fires after stop() (whenIdle above
     // already force-drained the buffer; this only releases an armed-but-not-yet-fired timer).
@@ -3333,9 +3366,12 @@ export class SyncEngine {
    *
    *   • STARTUP (see {@link start}): if the initial full pass leaves pending non-empty (a device
    *     booting with LOST/MISSING synced stamps — the user's "restart doesn't drain" case).
-   *   • RECONNECT (see start's onStatus handler): a reconnect is where a relay reset / synced-stamp
-   *     loss surfaces. Now safe because the self-heal pass uses EMPTY openDocIds (mirrors the
-   *     reconnect catch-up) and cannot false-latch an active-bound doc's synced stamp.
+   *   • RECONNECT (see start's onStatus handler): PENDING-GATED — after the reconnect catch-up
+   *     settles, if pending is STILL non-empty (device-side synced-stamp loss the change-driven loop
+   *     can't re-trigger), it arms the FLAP-SAFE {@link armSelfHealOnReconnect} (NOT this method, so a
+   *     flapping network can't un-bound a running episode). Safe because the self-heal pass uses EMPTY
+   *     openDocIds (mirrors the reconnect catch-up) and cannot false-latch an active-bound doc's
+   *     synced stamp; the gate means ordinary reconnects never arm the self-heal or the orphan sweep.
    *
    * Also callable as a CONTROL-API HOOK: a production "drop synced stamps" operator action (force
    * re-sync after a migration) would clear the synced stamps behind the EngineState port and then
@@ -3356,6 +3392,26 @@ export class SyncEngine {
     // ACTIVATES the episode so evaluateSelfHeal's arm/progress/stop logic runs on the coming audit.
     this.selfHealActive = true;
     this.selfHealStopped = false;
+    this.selfHealNoProgress = 0;
+    this.selfHealPasses = 0;
+    this.auditRequested = true;
+    this.scheduleReconcile();
+  }
+
+  /**
+   * FLAP-SAFE reconnect variant of {@link requestSelfHeal}. Arms a fresh bounded self-heal episode
+   * ONLY when idle. Unlike {@link requestSelfHeal} (which full-resets the bound on every call — correct
+   * for an explicit/manual trigger), this NO-OPS while an episode is already active, so a flapping
+   * network calling it on every reconnect cannot un-bound a running drain (the bound would never hit).
+   *
+   * When idle it DOES clear `selfHealStopped`: a genuine reconnect is new connectivity = new
+   * information, so a device that previously gave up (bound hit against a half-up relay) deserves a
+   * fresh bounded attempt now. Only ever called from the reconnect `onStatus` path (pending-gated).
+   */
+  armSelfHealOnReconnect(): void {
+    if (this.selfHealActive) return; // an episode is draining — do NOT reset its bound
+    this.selfHealActive = true;
+    this.selfHealStopped = false; // new connectivity → retry even if a prior episode gave up
     this.selfHealNoProgress = 0;
     this.selfHealPasses = 0;
     this.auditRequested = true;

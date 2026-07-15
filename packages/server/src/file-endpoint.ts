@@ -8,12 +8,13 @@
  *                                              | 413 (body exceeds maxBodyBytes)
  *
  * Security:
- *   - Auth (Phase 1): when a token is configured, EVERY verb (HEAD/GET/PUT)
- *     requires `Authorization: Bearer <token>`; a missing/wrong token yields 401
- *     (checked BEFORE sha validation or body read, so an unauthorized PUT never
- *     streams a body). When NO token is configured the endpoint is open (the
- *     pre-auth behavior) — used by the in-memory unit tests. M1 uses one static
- *     token shared with the relay; per-device tokens are M4.
+ *   - Auth: when configured, EVERY verb (HEAD/GET/PUT) requires
+ *     `Authorization: Bearer <token>`; a missing/wrong token yields 401 (checked
+ *     BEFORE sha validation or body read, so an unauthorized PUT never streams a
+ *     body). Auth accepts a `verifyToken` predicate (authoritative — per-device
+ *     tokens, see token-registry.ts) or falls back to a single static token; when
+ *     neither is configured the endpoint is open (the pre-auth behavior) — used by
+ *     the in-memory unit tests.
  *   - sha256 segment is strictly validated: must be exactly 64 lowercase hex chars.
  *   - PUT hash-on-write: sha256(body) is computed and MUST equal the :sha256 path
  *     segment. Rejects mislabeled or poisoned blobs with 400.
@@ -143,6 +144,11 @@ export interface BlobHandlerOptions {
    * The harness sets it via `ZYNC_BLOB_GET_DELAY_MS` to widen + measure the decoupling window.
    */
   getDelayMs?: number;
+  /**
+   * Per-device token predicate. When provided it is authoritative: the Bearer
+   * value is extracted and passed to verifyToken. Overrides the static `token`.
+   */
+  verifyToken?: (token: string) => boolean;
 }
 
 /**
@@ -157,11 +163,12 @@ export function createBlobHandler(
   const maxBodyBytes = opts.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
   const token = opts.token;
   const getDelayMs = opts.getDelayMs ?? 0;
+  const verifyToken = opts.verifyToken;
   // One counter set per handler instance, closed over by every request it serves. Untouched
   // when getDelayMs === 0 (production), so the latch + stats are strictly opt-in.
   const stats: BlobStats = { activeGets: 0, peakGets: 0, getCount: 0 };
   return function blobHandler(req: IncomingMessage, res: ServerResponse): void {
-    void handleBlobRequest(req, res, backend, maxBodyBytes, token, getDelayMs, stats);
+    void handleBlobRequest(req, res, backend, maxBodyBytes, token, getDelayMs, stats, verifyToken);
   };
 }
 
@@ -173,6 +180,7 @@ async function handleBlobRequest(
   token: string | undefined,
   getDelayMs: number,
   stats: BlobStats,
+  verifyToken?: (t: string) => boolean,
 ): Promise<void> {
   try {
     const url = req.url ?? "";
@@ -214,16 +222,23 @@ async function handleBlobRequest(
       return;
     }
 
-    // Auth gate (when a token is configured): every blob verb requires a matching
-    // Bearer. Checked BEFORE sha validation / body read so an unauthorized PUT
-    // never streams a body; drain any sent body so the keep-alive socket stays clean.
-    if (token !== undefined && token !== "") {
-      if (req.headers.authorization !== `Bearer ${token}`) {
-        res.writeHead(401);
-        res.end();
-        req.resume();
-        return;
-      }
+    // Auth gate: verifyToken (per-device) is authoritative when provided; else the
+    // static token; else open (unit-test mode). Checked BEFORE sha validation / body read.
+    const authHeader = req.headers.authorization;
+    let authorized: boolean;
+    if (verifyToken) {
+      const presented = authHeader?.startsWith("Bearer ") ? authHeader.slice("Bearer ".length) : "";
+      authorized = presented !== "" && verifyToken(presented);
+    } else if (token !== undefined && token !== "") {
+      authorized = authHeader === `Bearer ${token}`;
+    } else {
+      authorized = true;
+    }
+    if (!authorized) {
+      res.writeHead(401);
+      res.end();
+      req.resume();
+      return;
     }
 
     const sha = match[1] ?? "";

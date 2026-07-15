@@ -1,27 +1,33 @@
 /**
  * S7 — orphan-recovery-after-observe-collision
  *
- * Proves the S7 invariant: the scoped hot path (observe-driven
- * runObserveScopedReconcile) does NOT run orphan sweep, while a FULL pass
- * (runFullConvergencePass — triggered here by the S6c quiescence audit) DOES.
+ * Proves that after a genuine offline→connected heal, the LWW-loser orphan is
+ * recovered to a deterministic conflict artifact via a FULL pass' orphan sweep
+ * (runFullConvergencePass → runOrphanSweep).
  *
  * Collision setup:
  *   A and B each create the SAME vault path while partitioned (A offline), then
- *   heal. The index tree LWW binds the path to one winner docId; the LOSER docId
- *   remains in the loser device's docStore as an orphan.
+ *   heal via a.transport.goOnline(). The index tree LWW binds the path to one
+ *   winner docId; the LOSER docId remains in the loser device's docStore as an
+ *   orphan.
  *
- * Assertion (a): immediately after the scoped observe path settles (whenIdle,
- *   NOT waitConverged), the loser is NOT yet recovered — no conflict artifact in
- *   the index tree. This proves the scoped hot path skips the orphan sweep.
+ * Recovery path: on reconnect, pending is still non-empty (the loser docId is
+ * still dirty), so the pending-gated reconnect self-heal arms and runs a full
+ * pass (structuralReconcile → runOrphanSweep) — recovering the loser AT/BY the
+ * reconnect. Belt-and-suspenders: the later S6c quiescence audit runs the SAME
+ * orphan sweep, so whichever fires, the outcome holds. This test therefore
+ * asserts OUTCOMES, not the recovery SCHEDULE:
+ *   - at least one conflict artifact surfaces across the two engines;
+ *   - the loser is recovered EXACTLY once per device (no duplicate artifacts);
+ *   - every recovered path is a deterministic "(conflict, …)" artifact;
+ *   - the winning content is intact (no loss).
  *
- * Assertion (b): after a FULL audit fires (fake timers advanced past
- *   AUDIT_QUIESCENCE_MS), the loser IS recovered to a deterministic conflict path.
- *   This proves the full pass (S6c quiescence audit → runFullConvergencePass →
- *   runOrphanSweep) recovers the loser.
+ * The reconnect self-heal jitter is set to 0 (reconnectHealJitterMaxMs) so the
+ * arm fires immediately — required for a clean fake-timer test.
  *
  * Load-bearing: the test fails if runOrphanSweep is removed from the full path
- * entirely (assertion (b) would fail — no conflict artifact appears), confirming
- * the sweep is genuinely load-bearing in full passes.
+ * entirely (the recovered assertion would fail — no conflict artifact appears),
+ * confirming the sweep is genuinely load-bearing in full passes.
  */
 
 import { describe, it, expect, vi, afterEach } from "vitest";
@@ -76,6 +82,9 @@ function makeDevice(bus: InProcessBus, deviceId: string): Device {
     maxProseBytes: 1_000_000,
     substrate: "yjs",
     stampDebounceMs: 0,
+    // Make the pending-gated reconnect self-heal fire immediately (no jitter
+    // setTimeout to advance) so this fake-timer test is deterministic.
+    reconnectHealJitterMaxMs: 0,
   };
   return { engine: new SyncEngine(ports, config), vault, transport };
 }
@@ -101,7 +110,7 @@ describe("S7: orphan-recovery-after-observe-collision", () => {
   });
 
   it(
-    "scoped hot path skips orphan sweep; S6c quiescence audit (full pass) recovers the loser",
+    "reconnect-armed self-heal (full pass → orphan sweep) recovers the collision loser to a conflict artifact — asserts outcomes, not schedule",
     { timeout: 20_000 },
     async () => {
       vi.useFakeTimers();
@@ -130,62 +139,48 @@ describe("S7: orphan-recovery-after-observe-collision", () => {
         await a.engine.whenIdle();
         await b.engine.whenIdle();
 
-        // ── Heal A: let the observe-driven scoped passes settle (no full pass). ──
+        // ── Heal A: genuine offline→connected reconnect. ──
         //
         // goOnline() reconnects transport so index/doc updates flow between engines.
-        // We deliberately use whenIdle() (NOT waitConverged()) so only scoped passes
-        // run — the goal of assertion (a) is that the orphan is NOT recovered yet.
+        // Because the loser docId is still pending after catch-up, the pending-gated
+        // reconnect self-heal arms (jitter=0 → immediate) and runs a full pass
+        // (structuralReconcile → runOrphanSweep), recovering the loser AT/BY the
+        // reconnect.
         a.transport.goOnline();
 
-        // Give the observe loop several rounds to exchange index updates and docs.
-        // Run multiple whenIdle cycles to let cross-device replication settle as
-        // much as possible without triggering a full convergence pass.
+        // ── Settle the engines so the orphan sweep runs to completion. ──
+        //
+        // Belt-and-suspenders: both the reconnect self-heal AND the later S6c
+        // quiescence audit run the SAME orphan sweep — whichever fires, the outcome
+        // holds. Drive several whenIdle rounds (to let the reconnect-armed full pass
+        // and cross-device replication settle), then advance past AUDIT_QUIESCENCE_MS
+        // (fallback: the spec allows "recovered BY the audit, not necessarily AT it"),
+        // then a few more whenIdle rounds to drain the audit iteration.
         for (let i = 0; i < 8; i++) {
           await a.engine.whenIdle();
           await b.engine.whenIdle();
         }
-
-        // ── Assertion (a): scoped pass does NOT recover the orphan. ──
-        //
-        // After the observe path settled (no full pass called), the index should
-        // have EXACTLY ONE live path for DAILY (the LWW winner). No conflict artifact
-        // must appear, proving the scoped hot path correctly skipped runOrphanSweep.
-        // The winner device has the live path; the loser device may still have the
-        // old local binding. Either way, no "(conflict," path should exist yet.
-        const conflictsBeforeAudit = [...conflictPaths(a.engine), ...conflictPaths(b.engine)];
-        expect(conflictsBeforeAudit).toHaveLength(0);
-
-        // ── Trigger S6c quiescence audit → runFullConvergencePass → runOrphanSweep ──
-        //
-        // Advance fake time past AUDIT_QUIESCENCE_MS so the quiescence timer fires
-        // on both engines, scheduling a runFullConvergencePass iteration in each
-        // engine's reconcile loop. vi.advanceTimersByTimeAsync flushes microtasks
-        // between each tick step so the timer callback + loop iteration complete.
         await vi.advanceTimersByTimeAsync(AUDIT_QUIESCENCE_MS + 200);
+        for (let i = 0; i < 4; i++) {
+          await a.engine.whenIdle();
+          await b.engine.whenIdle();
+        }
 
-        // Drain the audit iteration on both engines.
-        await a.engine.whenIdle();
-        await b.engine.whenIdle();
-
-        // ── Assertion (b): full pass DID recover the loser. ──
-        //
-        // After the full pass ran runOrphanSweep, the loser's docId should have been
-        // recovered to a deterministic "(conflict, <createdBy>, <createdTs>)" path.
-        // At least ONE of the two engines must show a conflict artifact (the OWNER of
-        // the losing docStore snapshot is the one that materializes the recovery; the
-        // other device sees the recovery via normal CRDT replication, which may need
-        // an additional full pass to propagate — so we check the owning engine only
-        // needs to show it, and then let both converge for the final check).
+        // The reconnect self-heal (pending-gated, jitter=0) runs the full pass → runOrphanSweep recovers
+        // the LWW-loser orphan. Assert OUTCOMES, not the old schedule: recovered exactly once, a conflict
+        // artifact surfaced, winning content intact (no loss).
         const conflictsA = conflictPaths(a.engine);
         const conflictsB = conflictPaths(b.engine);
-        const totalConflicts = conflictsA.length + conflictsB.length;
-        expect(totalConflicts).toBeGreaterThanOrEqual(1);
-
-        // The recovered path should contain "(conflict," per the orphan-sweep contract.
         const allConflicts = [...conflictsA, ...conflictsB];
-        for (const cp of allConflicts) {
-          expect(cp).toContain("(conflict,");
-        }
+        expect(allConflicts.length).toBeGreaterThanOrEqual(1);
+        // Recovered EXACTLY once: the single LWW-loser must produce exactly ONE DISTINCT conflict path
+        // across both devices (the peer replicates the SAME deterministic "(conflict, createdBy,
+        // createdTs)" path — so a duplicate/re-recovery would surface as a 2nd distinct path here).
+        // (Per-device `Set(conflictsA).size === length` is vacuous — conflictPaths derives from the
+        // path→docId index map, whose keys are unique by construction; the cross-device DISTINCT count
+        // is the meaningful "recovered once" guard.)
+        expect(new Set(allConflicts).size).toBe(1);
+        for (const cp of allConflicts) expect(cp).toContain("(conflict,");
 
         // Both devices still quiescent on the live file — the collision winner's path
         // is still bound (no double-write or loss of the winning content).
@@ -202,9 +197,8 @@ describe("S7: orphan-recovery-after-observe-collision", () => {
         // ── Load-bearing confirmation ──
         //
         // This test would FAIL if runOrphanSweep were removed from runFullConvergencePass
-        // (assertion (b) above: totalConflicts >= 1 would fail because no sweep ever runs
-        // the orphan recovery on a full pass). Only the in-scope scoped path is skipped;
-        // the full path MUST still call it.
+        // (the recovered assertion above: allConflicts.length >= 1 would fail because no
+        // sweep ever runs the orphan recovery on a full pass). The full path MUST call it.
 
         await a.engine.stop();
         await b.engine.stop();

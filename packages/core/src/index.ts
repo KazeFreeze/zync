@@ -17,6 +17,7 @@ export {
 export type { ConfigEntry, ConfigCategory } from "./config/config-entry.js";
 export type { CommunityPluginsPort } from "./config/plugin-enabled-channel.js";
 export { sha256OfBytes, sha256OfText } from "./hash.js";
+export { reconnectHealJitterMs } from "./reconnect-jitter.js";
 export { diffToEdits, merge3, applyEdits } from "./bridge/merge.js";
 export { EchoLedger } from "./bridge/echo.js";
 export { FileAuthority } from "./bridge/fsm.js";

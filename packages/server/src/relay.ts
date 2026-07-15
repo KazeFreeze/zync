@@ -8,7 +8,8 @@
  *
  * Responsibilities:
  *  - Start a Hocuspocus server on the configured port.
- *  - Authenticate via a static shared token (Phase-0 single-device auth).
+ *  - Authenticate via a static shared token (fallback) or per-device
+ *    verifyToken predicate (authoritative when provided).
  *  - Wire snapshot persistence hooks (onLoadDocument / onStoreDocument)
  *    so a server crash/restart doesn't lose in-memory doc state.
  *  - Log doc NAMES (not content) via extension-logger.
@@ -21,16 +22,45 @@ import { SnapshotStore, makeSnapshotHooks } from "./snapshot.js";
 export interface RelayConfig {
   /** WebSocket listen port. */
   port: number;
-  /** Static shared token for Phase-0 auth. */
-  token: string;
   /** Directory for Yjs snapshot persistence. */
   snapshotDir: string;
+  /** Static shared token (fallback when verifyToken is absent — harness/dev). */
+  token?: string;
+  /** Per-device token predicate (authoritative when provided). */
+  verifyToken?: (token: string) => boolean;
+  /** Device label for a token, for logging/attribution. */
+  getDevice?: (token: string) => string | undefined;
 }
 
 export interface RelayHandle {
   hocuspocus: Hocuspocus;
   /** Gracefully shut down the relay (closes WS server + all connections). */
   close(): Promise<void>;
+}
+
+/**
+ * Pure auth decision, extracted so it is unit-testable without Hocuspocus.
+ * Uses verifyToken when provided, else compares against the static token.
+ * Throws Error("unauthorized") on failure; returns the auth context `{ user }`
+ * (Hocuspocus consumes this as the connection context) on success. This helper
+ * has NO Hocuspocus dependency.
+ */
+export function authDecision(
+  presentedToken: string,
+  opts: {
+    verifyToken?: (t: string) => boolean;
+    staticToken?: string;
+    getDevice?: (t: string) => string | undefined;
+  },
+): { user: string } {
+  if (!opts.verifyToken && opts.staticToken === undefined) {
+    throw new Error("relay: no auth configured (need verifyToken or staticToken)");
+  }
+  const ok = opts.verifyToken
+    ? opts.verifyToken(presentedToken)
+    : presentedToken === opts.staticToken;
+  if (!ok) throw new Error("unauthorized");
+  return { user: opts.getDevice?.(presentedToken) ?? "relay" };
 }
 
 export function createRelay(config: RelayConfig): RelayHandle {
@@ -48,12 +78,16 @@ export function createRelay(config: RelayConfig): RelayHandle {
 
     extensions: [new Logger()],
 
-    // Phase-0 auth: static shared token.
-    // Per-device tokens + TLS are Phase 1 (spec §14).
+    // Auth is per-device tokens (see token-registry.ts). Transport encryption is
+    // provided by the deployment (Tailscale/WireGuard); see deploy/.
     async onAuthenticate({ token, documentName }) {
-      if (token !== config.token) throw new Error("unauthorized");
-      console.log(`[zync-relay] authed for doc: ${documentName}`);
-      return { user: "relay" };
+      const ctx = authDecision(token, {
+        ...(config.verifyToken !== undefined ? { verifyToken: config.verifyToken } : {}),
+        ...(config.token !== undefined ? { staticToken: config.token } : {}),
+        ...(config.getDevice !== undefined ? { getDevice: config.getDevice } : {}),
+      });
+      console.log(`[zync-relay] authed ${ctx.user} for doc: ${documentName}`);
+      return ctx;
     },
 
     // Snapshot persistence — content-blind: bytes in, bytes out.

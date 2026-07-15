@@ -1,0 +1,173 @@
+<!-- packages/server/src/admin-ui.html — Zync admin (vanilla JS, no build). -->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Zync Admin</title>
+    <style>
+      body {
+        font:
+          15px/1.5 system-ui,
+          sans-serif;
+        max-width: 720px;
+        margin: 2rem auto;
+        padding: 0 1rem;
+        color: #1a1a1a;
+      }
+      h1 {
+        font-size: 1.4rem;
+      }
+      h2 {
+        font-size: 1.1rem;
+        margin-top: 2rem;
+      }
+      input,
+      button {
+        font: inherit;
+        padding: 0.4rem 0.6rem;
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        margin-top: 0.5rem;
+      }
+      th,
+      td {
+        text-align: left;
+        padding: 0.4rem 0.6rem;
+        border-bottom: 1px solid #ddd;
+      }
+      code {
+        background: #f2f2f2;
+        padding: 0.1rem 0.3rem;
+        border-radius: 3px;
+      }
+      .muted {
+        color: #777;
+      }
+      .err {
+        color: #b00;
+      }
+      .ok {
+        color: #070;
+      }
+      #newtok {
+        background: #fffbe6;
+        border: 1px solid #e6d200;
+        padding: 0.6rem;
+        margin-top: 0.5rem;
+        word-break: break-all;
+      }
+      button {
+        cursor: pointer;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Zync Admin</h1>
+    <div id="login">
+      <p>Paste the admin token to continue.</p>
+      <input id="token" type="password" placeholder="ZYNC_ADMIN_TOKEN" size="48" />
+      <button onclick="login()">Enter</button>
+      <span id="loginerr" class="err"></span>
+    </div>
+
+    <div id="app" hidden>
+      <h2>Status</h2>
+      <div id="status" class="muted">loading…</div>
+
+      <h2>Devices</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Device</th>
+            <th>Token</th>
+            <th>Created</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+
+      <h2>Add device</h2>
+      <input id="device" placeholder="e.g. pc-home" />
+      <button onclick="addDevice()">Generate token</button>
+      <div id="newtok" hidden></div>
+      <p><button onclick="logout()">Log out</button></p>
+    </div>
+
+    <script>
+      let TOKEN = "";
+      const H = () => ({ Authorization: "Bearer " + TOKEN });
+      const $ = (id) => document.getElementById(id);
+
+      async function login() {
+        TOKEN = $("token").value.trim();
+        const res = await fetch("/api/status", { headers: H() });
+        if (res.status !== 200) {
+          $("loginerr").textContent = " invalid token";
+          return;
+        }
+        sessionStorage.setItem("zync_admin", TOKEN);
+        $("login").hidden = true;
+        $("app").hidden = false;
+        refresh();
+      }
+      function logout() {
+        sessionStorage.removeItem("zync_admin");
+        location.reload();
+      }
+
+      async function refresh() {
+        const st = await (await fetch("/api/status", { headers: H() })).json();
+        $("status").innerHTML =
+          `uptime <code>${st.uptimeSec}s</code> · devices <code>${st.deviceCount}</code> · ` +
+          `blob store <span class="${st.blobStoreOk ? "ok" : "err"}">${st.blobStoreOk ? "ok" : "unreachable"}</span> · ` +
+          `snapshots <code>${st.snapshotCount}</code>`;
+        const list = await (await fetch("/api/tokens", { headers: H() })).json();
+        $("rows").innerHTML = list
+          .map(
+            (d) =>
+              `<tr><td>${esc(d.device)}</td><td><code>${esc(d.tokenMasked)}</code></td>` +
+              `<td class="muted">${esc(d.created)}</td>` +
+              `<td><button onclick="revoke('${d.id}')">revoke</button></td></tr>`,
+          )
+          .join("");
+      }
+      function esc(s) {
+        return String(s).replace(
+          /[&<>"']/g,
+          (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c],
+        );
+      }
+
+      async function addDevice() {
+        const device = $("device").value.trim();
+        if (!device) return;
+        const res = await fetch("/api/tokens", {
+          method: "POST",
+          headers: { ...H(), "Content-Type": "application/json" },
+          body: JSON.stringify({ device }),
+        });
+        const d = await res.json();
+        $("device").value = "";
+        const box = $("newtok");
+        box.hidden = false;
+        box.innerHTML = `Token for <b>${esc(d.device)}</b> (copy now — shown once):<br><code>${esc(d.token)}</code>`;
+        refresh();
+      }
+      async function revoke(id) {
+        if (!confirm("Revoke this device token?")) return;
+        await fetch("/api/tokens/" + encodeURIComponent(id), { method: "DELETE", headers: H() });
+        refresh();
+      }
+
+      const saved = sessionStorage.getItem("zync_admin");
+      if (saved) {
+        $("token").value = saved;
+        login();
+      }
+    </script>
+  </body>
+</html>

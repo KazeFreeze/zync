@@ -79,6 +79,7 @@ function makeEngine(
   deviceId: string,
   stateOverride?: MemEngineState,
   durable?: Durable,
+  configOverride?: Partial<EngineConfig>,
 ): Rig {
   const vault = durable?.vault ?? new FakeVault();
   const state = durable?.state ?? stateOverride ?? new MemEngineState();
@@ -99,6 +100,7 @@ function makeEngine(
     maxProseBytes: 1_000_000,
     substrate: "yjs",
     stampDebounceMs: 0, // immediate bumps so index.observe fires synchronously
+    ...configOverride,
   };
   return { engine: new SyncEngine(ports, config), vault, state, docStore, transport };
 }
@@ -379,6 +381,126 @@ describe("F2 self-heal — drains pending after synced-stamp loss", () => {
       } finally {
         vi.useRealTimers();
       }
+    },
+  );
+
+  // ── Test 6: FLAP-SAFETY — armSelfHealOnReconnect() no-ops while an episode is active ──────────
+  //
+  // The reconnect-triggered self-heal arm MUST be flap-safe: a flapping network calling it on every
+  // reconnect must NOT re-arm (reset the bound of) a running episode, or the "bounded" drain would
+  // never terminate. Reuses the bounded-no-spin construction (a stuck state whose setSyncedStamp is
+  // a no-op → the seeded doc can NEVER re-ack). We arm one episode, then simulate ~5 reconnect flaps
+  // (each past the max backoff), and assert the episode still STOPS at its bound: pending stays
+  // non-empty AND stable across a further large timer advance (no infinite re-arm).
+
+  it(
+    "6) armSelfHealOnReconnect: no-ops while an episode is active (a flap does not un-bound the drain)",
+    { timeout: 20_000 },
+    async () => {
+      vi.useFakeTimers();
+      try {
+        const bus = new InProcessBus();
+
+        // A state whose setSyncedStamp is a NO-OP — the seeded doc's stamp mismatch holds forever,
+        // so it can never clear (same construction as the bounded-no-spin test).
+        const stuckState = new MemEngineState();
+        stuckState.setSyncedStamp = (): Promise<void> => Promise.resolve();
+
+        const rig = makeEngine(bus, "dev-a", stuckState);
+        const { engine, vault } = rig;
+
+        await engine.start();
+        await vault.writeAtomic(path("flap/x.md"), utf8("cannot-clear"));
+        await engine.whenIdle();
+        expect((await engine.pendingDocs()).length).toBeGreaterThan(0); // pending non-empty
+
+        // Arm a bounded episode, then FLAP: call the reconnect arm repeatedly, advancing past the
+        // MAX backoff each time. A flap must NOT reset the running episode's bound.
+        const maxBackoff = Math.max(...SELFHEAL_BACKOFF_MS);
+        engine.requestSelfHeal();
+        for (let i = 0; i < 5; i++) {
+          engine.armSelfHealOnReconnect();
+          await vi.advanceTimersByTimeAsync(maxBackoff + 50);
+          await engine.whenIdle();
+        }
+
+        const stuck = (await engine.pendingDocs()).length;
+        expect(stuck).toBeGreaterThan(0); // still pending (bound hit; never silently healed)
+
+        // Burn a LARGE amount of additional time: pending is STABLE — no infinite re-arm. If a flap
+        // had un-bounded the episode, the driver would keep spinning; the count would not be stable.
+        await vi.advanceTimersByTimeAsync(60_000);
+        await engine.whenIdle();
+        expect((await engine.pendingDocs()).length).toBe(stuck);
+
+        await engine.stop();
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  // ── Test 7: RECONNECT re-arms the self-heal (mid-session drain) ────────────────────────────────
+  //
+  // The gap this task fixes: a genuine offline→connected reconnect runs CATCH-UP ONLY — it does NOT
+  // run the full settle chain (settleCleanDocs). So a doc that catch-up itself cannot re-ack while it
+  // stays pending after a device-side synced-stamp loss would stay pending FOREVER on the live session
+  // (the change-driven loop can't re-trigger it, waitConverged is TEST-ONLY). The pending-gated
+  // reconnect trigger arms the FLAP-SAFE self-heal (a full pass, incl. settleCleanDocs) iff pending is
+  // STILL non-empty AFTER catch-up, draining it with NO restart.
+  //
+  // WHY catch-up is NEUTRALIZED here: for a plain byte-unchanged cleared-stamp doc, the reconnect
+  // catch-up's own stamp-mismatch selection re-acks it — so catch-up alone would drain pending and the
+  // reconnect self-heal would (correctly, by the pending-gate) never arm, making the wire un-provable
+  // end-to-end. To isolate the wire we make runCatchUp a no-op (models the class catch-up CANNOT
+  // re-ack — the settleCleanDocs latch, where syncedStamp is stuck at an intermediate hash catch-up's
+  // ack path never re-equalizes). Now catch-up leaves pending non-empty → the pending-gate opens → the
+  // trigger arms the self-heal → settleCleanDocs (in the self-heal full pass) drains it. WITHOUT the
+  // wire, nothing after catch-up drains pending and it stays non-empty forever (the test fails).
+  //
+  // reconnectHealJitterMaxMs: 0 makes the arm immediate (no jitter timer), and the self-heal's FIRST
+  // pass runs promptly via the reconcile loop (before any backoff) — so whenIdle() alone drives the
+  // drain. We deliberately DO NOT advance timers / call driveSelfHeal here: advancing past
+  // AUDIT_QUIESCENCE_MS would fire the S6c quiescence audit (an UNRELATED full pass that also drains
+  // pending), MASKING the wire. With REAL timers and no advance the audit never fires, so the ONLY
+  // thing that can drain pending is the reconnect-armed self-heal — the exact wire under test.
+
+  it(
+    "7) reconnect re-arms the self-heal: cleared stamps drain to 0 on reconnect (no restart)",
+    { timeout: 20_000 },
+    async () => {
+      const bus = new InProcessBus();
+      const rig = makeEngine(bus, "dev-a", undefined, undefined, { reconnectHealJitterMaxMs: 0 });
+      const { engine, vault, state } = rig;
+
+      await engine.start();
+      await vault.writeAtomic(path("heal/a.md"), utf8("alpha"));
+      await engine.waitConverged();
+      expect((await engine.pendingDocs()).length).toBe(0);
+
+      // Take offline and simulate DEVICE-SIDE synced-stamp loss WITHOUT a restart (the mid-session
+      // wedge this task drains) — reuse Test 1's exact mechanism (MemEngineState.clearAllSyncedStamps).
+      rig.transport.goOffline();
+      state.clearAllSyncedStamps();
+      expect((await engine.pendingDocs()).length).toBeGreaterThan(0);
+
+      // Neutralize the reconnect catch-up so it cannot re-ack the cleared-stamp doc (isolates the
+      // wire — models the settleCleanDocs latch catch-up's ack path can't re-equalize; see above).
+      vi.spyOn(engine.lazyAttachManager, "runCatchUp").mockResolvedValue([]);
+
+      // Reconnect: catch-up (now a no-op) leaves pending non-empty → the pending-gated reconnect
+      // trigger arms the FLAP-SAFE self-heal (jitter 0 = immediate). Its first pass runs settleCleanDocs
+      // and re-settles the cleared stamp. whenIdle() drives the tracked reconnect chain + that first
+      // pass to a fixed point with NO timer advance (so the masking quiescence audit never fires).
+      rig.transport.goOnline();
+      for (let i = 0; i < 10; i++) await engine.whenIdle();
+
+      // The reconnect-armed self-heal drained pending to empty mid-session — no restart, no manual
+      // requestSelfHeal(), no waitConverged() (which would mask the wire by force-running a full pass),
+      // and no timer advance (which would mask it by firing the S6c audit).
+      expect(await engine.pendingDocs()).toEqual([]);
+
+      await engine.stop();
     },
   );
 });

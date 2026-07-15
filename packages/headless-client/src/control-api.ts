@@ -195,6 +195,8 @@ async function handle(deps: ControlApiDeps, req: http.IncomingMessage): Promise<
       return metrics(deps);
     case "POST /engine/clear-synced-stamps":
       return engineClearSyncedStamps(deps);
+    case "POST /engine/reflush":
+      return engineReflush(deps);
     default:
       throw new HttpError(404, `no route: ${route}`);
   }
@@ -758,6 +760,18 @@ async function dirBytes(dir: string): Promise<number> {
  */
 async function engineClearSyncedStamps(deps: ControlApiDeps): Promise<JsonResponse> {
   await deps.engineState.clearAllSyncedStamps();
+  return { status: 200, body: { ok: true } };
+}
+
+/**
+ * Arm the bounded self-heal on demand (the manual "reflush" lever). Re-verifies + re-acks any doc
+ * whose synced stamp is missing/mismatched and drains pending — the operator/user recovery hook for a
+ * wedged device. Full-reset semantics via requestSelfHeal (an explicit action always warrants a fresh
+ * attempt). Idempotent + cheap.
+ */
+function engineReflush(deps: ControlApiDeps): JsonResponse {
+  requireStarted(deps);
+  deps.engine.requestSelfHeal();
   return { status: 200, body: { ok: true } };
 }
 

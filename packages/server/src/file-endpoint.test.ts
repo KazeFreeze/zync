@@ -49,12 +49,23 @@ interface FetchOpts {
 
 async function startTestServer(
   backend: BlobBackend,
-  opts: { maxBodyBytes?: number; token?: string; getDelayMs?: number } = {},
+  opts: {
+    maxBodyBytes?: number;
+    token?: string;
+    getDelayMs?: number;
+    verifyToken?: (t: string) => boolean;
+  } = {},
 ): Promise<{ baseUrl: string; close: () => Promise<void> }> {
-  const handlerOpts: { maxBodyBytes?: number; token?: string; getDelayMs?: number } = {};
+  const handlerOpts: {
+    maxBodyBytes?: number;
+    token?: string;
+    getDelayMs?: number;
+    verifyToken?: (t: string) => boolean;
+  } = {};
   if (opts.maxBodyBytes !== undefined) handlerOpts.maxBodyBytes = opts.maxBodyBytes;
   if (opts.token !== undefined) handlerOpts.token = opts.token;
   if (opts.getDelayMs !== undefined) handlerOpts.getDelayMs = opts.getDelayMs;
+  if (opts.verifyToken !== undefined) handlerOpts.verifyToken = opts.verifyToken;
   const handler = createBlobHandler(backend, handlerOpts);
   const server = http.createServer(handler);
 
@@ -512,6 +523,60 @@ describe("file-endpoint blob handler — GET latch + /_blob-stats instrumentatio
       expect(res.status).toBe(404);
     } finally {
       await server.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// verifyToken auth — per-device token predicate, authoritative over static token.
+// ---------------------------------------------------------------------------
+
+describe("blob auth via verifyToken", () => {
+  it("accepts a registered token and rejects an unregistered one", async () => {
+    const backend = makeMemBackend();
+    const bytes = Buffer.from("hello");
+    const sha = sha256(bytes);
+    await backend.put(sha, new Uint8Array(bytes));
+    const srv = await startTestServer(backend, { verifyToken: (t) => t === "good" });
+    try {
+      const ok = await req(`${srv.baseUrl}/blob/${sha}`, {
+        headers: { authorization: "Bearer good" },
+      });
+      expect(ok.status).toBe(200);
+      const bad = await req(`${srv.baseUrl}/blob/${sha}`, {
+        headers: { authorization: "Bearer wrong" },
+      });
+      expect(bad.status).toBe(401);
+      const none = await req(`${srv.baseUrl}/blob/${sha}`);
+      expect(none.status).toBe(401);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it("verifyToken overrides the static token when both are set", async () => {
+    const backend = makeMemBackend();
+    const bytes = Buffer.from("hello");
+    const sha = sha256(bytes);
+    await backend.put(sha, new Uint8Array(bytes));
+    // static token "static" would match, but verifyToken only accepts "good"
+    const srv = await startTestServer(backend, {
+      token: "static",
+      verifyToken: (t) => t === "good",
+    });
+    try {
+      // token the static path WOULD accept is rejected because verifyToken is authoritative
+      const staticRejected = await req(`${srv.baseUrl}/blob/${sha}`, {
+        headers: { authorization: "Bearer static" },
+      });
+      expect(staticRejected.status).toBe(401);
+      // token only verifyToken accepts is authorized
+      const vtOk = await req(`${srv.baseUrl}/blob/${sha}`, {
+        headers: { authorization: "Bearer good" },
+      });
+      expect(vtOk.status).toBe(200);
+    } finally {
+      await srv.close();
     }
   });
 });

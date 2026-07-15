@@ -1,0 +1,54 @@
+# deploy/dokploy-compose.yml — Zync production server (Dokploy Compose, Tailscale-only).
+#
+# Built from origin/main via packages/server/Dockerfile. ALL secrets/config are
+# injected by Dokploy's Environment settings (NOT committed here). The three ports
+# are bound to the host's Tailscale interface IP (TAILSCALE_BIND_IP) so the server
+# is reachable only over the tailnet, never the public internet.
+#
+# See deploy/README.md for the full runbook.
+services:
+  zync-server:
+    build:
+      context: .
+      dockerfile: packages/server/Dockerfile
+    restart: unless-stopped
+    environment:
+      ZYNC_PORT: "1234"
+      ZYNC_BLOB_PORT: "8080"
+      ZYNC_ADMIN_PORT: "9090"
+      ZYNC_SNAPSHOT_DIR: /data/snapshots
+      ZYNC_TOKENS_FILE: /data/config/tokens.json
+      # Injected via Dokploy env (secrets) — do NOT hardcode:
+      ZYNC_ADMIN_TOKEN: ${ZYNC_ADMIN_TOKEN}
+      ZYNC_S3_ENDPOINT: ${ZYNC_S3_ENDPOINT}
+      ZYNC_S3_BUCKET: ${ZYNC_S3_BUCKET}
+      ZYNC_S3_REGION: ${ZYNC_S3_REGION}
+      ZYNC_S3_ACCESS_KEY: ${ZYNC_S3_ACCESS_KEY}
+      ZYNC_S3_SECRET_KEY: ${ZYNC_S3_SECRET_KEY}
+      # Production runs the blob GET latch OFF (harness-only instrumentation).
+      ZYNC_BLOB_GET_DELAY_MS: "0"
+    ports:
+      # Bind to the tailnet interface only (TAILSCALE_BIND_IP, e.g. 100.81.186.62).
+      - "${TAILSCALE_BIND_IP}:1234:1234" # relay (WS)
+      - "${TAILSCALE_BIND_IP}:8080:8080" # blob (HTTP)
+      - "${TAILSCALE_BIND_IP}:9090:9090" # admin (HTTP)
+    volumes:
+      - zync-snapshots:/data/snapshots # bulk, churny CRDT snapshot state
+      - zync-config:/data/config # tiny, precious tokens.json (separate on purpose)
+    healthcheck:
+      # TCP connect to the relay port via node (slim image has no curl/wget).
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "require('net').connect(1234,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+volumes:
+  zync-snapshots:
+  zync-config:

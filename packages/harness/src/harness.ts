@@ -273,6 +273,11 @@ export class Device {
     return this.postOk("/engine/clear-synced-stamps", {});
   }
 
+  /** Arm the bounded self-heal on demand (manual reflush) — re-verify + re-ack + drain pending. */
+  reflush(): Promise<void> {
+    return this.postOk("/engine/reflush", {});
+  }
+
   // -- reads -----------------------------------------------------------------
 
   async read(path: string): Promise<string> {

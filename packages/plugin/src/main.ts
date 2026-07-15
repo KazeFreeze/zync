@@ -167,6 +167,13 @@ export default class ZyncPlugin extends Plugin {
       },
     });
     this.addCommand({
+      id: "zync-reflush",
+      name: "Zync: re-verify sync (reflush)",
+      callback: () => {
+        this.engine?.requestSelfHeal();
+      },
+    });
+    this.addCommand({
       id: "zync-dump-profile",
       name: "Zync: dump bootstrap profile",
       callback: () => {
