@@ -68,13 +68,21 @@ describe("createServer integration — registry-driven auth + admin", () => {
       snapshotDir: path.join(dir, "snap"),
       blobBackend: memBackend(),
       registry,
-      admin: { port: adminPort, adminToken: "admintok", uiHtml: "<html>ADMIN_UI</html>" },
+      admin: {
+        port: adminPort,
+        adminUser: "admin",
+        adminPassword: "s3cret",
+        uiHtml: "<html>ADMIN_UI</html>",
+      },
     });
     const adminBase = `http://127.0.0.1:${adminPort}`;
     const blobBase = `http://127.0.0.1:${blobPort}`;
     try {
-      // Admin serves its UI.
-      const ui = await fetch(`${adminBase}/`);
+      // Admin auth (HTTP Basic): base64("admin:s3cret").
+      const adminAuth = "Basic " + Buffer.from("admin:s3cret").toString("base64");
+
+      // Admin serves its UI (behind Basic auth).
+      const ui = await fetch(`${adminBase}/`, { headers: { Authorization: adminAuth } });
       expect(ui.status).toBe(200);
       expect(await ui.text()).toContain("ADMIN_UI");
 
@@ -82,7 +90,7 @@ describe("createServer integration — registry-driven auth + admin", () => {
       const created = (await (
         await fetch(`${adminBase}/api/tokens`, {
           method: "POST",
-          headers: { Authorization: "Bearer admintok", "Content-Type": "application/json" },
+          headers: { Authorization: adminAuth, "Content-Type": "application/json" },
           body: JSON.stringify({ device: "pc" }),
         })
       ).json()) as { token: string };
@@ -125,11 +133,11 @@ describe("assertAuthConfig", () => {
   it("allows file mode regardless of the static token", () => {
     expect(() => assertAuthConfig("file", undefined, undefined)).not.toThrow();
   });
-  it("rejects an empty admin token", () => {
-    expect(() => assertAuthConfig("file", undefined, "")).toThrow(/ZYNC_ADMIN_TOKEN is empty/);
+  it("rejects an empty admin password", () => {
+    expect(() => assertAuthConfig("file", undefined, "")).toThrow(/ZYNC_ADMIN_PASSWORD is empty/);
   });
-  it("allows an unset or non-empty admin token", () => {
+  it("allows an unset or non-empty admin password", () => {
     expect(() => assertAuthConfig("file", undefined, undefined)).not.toThrow();
-    expect(() => assertAuthConfig("file", undefined, "strongtoken")).not.toThrow();
+    expect(() => assertAuthConfig("file", undefined, "strongpassword")).not.toThrow();
   });
 });

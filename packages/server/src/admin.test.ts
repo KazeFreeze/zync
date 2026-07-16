@@ -18,7 +18,16 @@ afterEach(async () => {
   while ((dir = tmpdirs.pop()) !== undefined) await fsp.rm(dir, { recursive: true, force: true });
 });
 
-async function startAdmin(reg: TokenRegistry, adminToken: string) {
+const USER = "admin";
+const PASS = "s3cret";
+/** Build an HTTP Basic `Authorization` header for the given credentials. */
+const basic = (u: string, p: string) => ({
+  Authorization: "Basic " + Buffer.from(`${u}:${p}`).toString("base64"),
+});
+/** The valid admin credential header used by the happy-path tests. */
+const AUTH = basic(USER, PASS);
+
+async function startAdmin(reg: TokenRegistry, user = USER, password = PASS) {
   const status = async (): Promise<AdminStatus> => ({
     uptimeSec: 42,
     deviceCount: reg.deviceCount,
@@ -27,7 +36,8 @@ async function startAdmin(reg: TokenRegistry, adminToken: string) {
   });
   const handler = createAdminHandler({
     registry: reg,
-    adminToken,
+    adminUser: user,
+    adminPassword: password,
     status,
     uiHtml: "<html>ADMIN_UI</html>",
   });
@@ -38,14 +48,16 @@ async function startAdmin(reg: TokenRegistry, adminToken: string) {
   const base = `http://127.0.0.1:${addr.port}`;
   return { base, close: () => new Promise<void>((r) => server.close(() => r())) };
 }
-const auth = (t: string) => ({ Authorization: `Bearer ${t}` });
 
 describe("admin handler", () => {
-  it("serves the UI unauthenticated at GET /", async () => {
+  it("requires Basic auth for GET / (401 + WWW-Authenticate), serves UI when authed", async () => {
     const reg = TokenRegistry.create({ tokensFile: await tmpFile() });
-    const s = await startAdmin(reg, "admintok");
+    const s = await startAdmin(reg);
     try {
-      const res = await fetch(`${s.base}/`);
+      const noauth = await fetch(`${s.base}/`);
+      expect(noauth.status).toBe(401);
+      expect(noauth.headers.get("www-authenticate")).toContain("Basic");
+      const res = await fetch(`${s.base}/`, { headers: AUTH });
       expect(res.status).toBe(200);
       expect(await res.text()).toContain("ADMIN_UI");
     } finally {
@@ -54,13 +66,18 @@ describe("admin handler", () => {
     }
   });
 
-  it("gates /api/* behind the admin token", async () => {
+  it("gates /api/* behind Basic auth (none, wrong user, wrong pass → 401)", async () => {
     const reg = TokenRegistry.create({ tokensFile: await tmpFile() });
-    const s = await startAdmin(reg, "admintok");
+    const s = await startAdmin(reg);
     try {
       expect((await fetch(`${s.base}/api/tokens`)).status).toBe(401);
-      expect((await fetch(`${s.base}/api/tokens`, { headers: auth("wrong") })).status).toBe(401);
-      expect((await fetch(`${s.base}/api/tokens`, { headers: auth("admintok") })).status).toBe(200);
+      expect(
+        (await fetch(`${s.base}/api/tokens`, { headers: basic("admin", "wrong") })).status,
+      ).toBe(401);
+      expect(
+        (await fetch(`${s.base}/api/tokens`, { headers: basic("wrong", "s3cret") })).status,
+      ).toBe(401);
+      expect((await fetch(`${s.base}/api/tokens`, { headers: AUTH })).status).toBe(200);
     } finally {
       await s.close();
       reg.close();
@@ -69,12 +86,12 @@ describe("admin handler", () => {
 
   it("creates, lists, and revokes device tokens", async () => {
     const reg = TokenRegistry.create({ tokensFile: await tmpFile() });
-    const s = await startAdmin(reg, "admintok");
+    const s = await startAdmin(reg);
     try {
       const created = (await (
         await fetch(`${s.base}/api/tokens`, {
           method: "POST",
-          headers: { ...auth("admintok"), "Content-Type": "application/json" },
+          headers: { ...AUTH, "Content-Type": "application/json" },
           body: JSON.stringify({ device: "phone" }),
         })
       ).json()) as DeviceToken;
@@ -83,7 +100,7 @@ describe("admin handler", () => {
       expect(reg.verify(created.token)).toBe(true);
 
       const list = (await (
-        await fetch(`${s.base}/api/tokens`, { headers: auth("admintok") })
+        await fetch(`${s.base}/api/tokens`, { headers: AUTH })
       ).json()) as DeviceTokenPublic[];
       expect(list).toHaveLength(1);
       const firstItem = list[0];
@@ -92,7 +109,7 @@ describe("admin handler", () => {
 
       const del = await fetch(`${s.base}/api/tokens/${created.id}`, {
         method: "DELETE",
-        headers: auth("admintok"),
+        headers: AUTH,
       });
       expect(del.status).toBe(200);
       expect(reg.verify(created.token)).toBe(false);
@@ -104,9 +121,9 @@ describe("admin handler", () => {
 
   it("returns status", async () => {
     const reg = TokenRegistry.create({ tokensFile: await tmpFile() });
-    const s = await startAdmin(reg, "admintok");
+    const s = await startAdmin(reg);
     try {
-      const st = await (await fetch(`${s.base}/api/status`, { headers: auth("admintok") })).json();
+      const st = await (await fetch(`${s.base}/api/status`, { headers: AUTH })).json();
       expect(st).toEqual({ uptimeSec: 42, deviceCount: 0, blobStoreOk: true, snapshotCount: 3 });
     } finally {
       await s.close();
@@ -116,11 +133,11 @@ describe("admin handler", () => {
 
   it("rejects a malformed JSON body with 400", async () => {
     const reg = TokenRegistry.create({ tokensFile: await tmpFile() });
-    const s = await startAdmin(reg, "admintok");
+    const s = await startAdmin(reg);
     try {
       const res = await fetch(`${s.base}/api/tokens`, {
         method: "POST",
-        headers: { ...auth("admintok"), "Content-Type": "application/json" },
+        headers: { ...AUTH, "Content-Type": "application/json" },
         body: "{not json",
       });
       expect(res.status).toBe(400);
@@ -132,11 +149,11 @@ describe("admin handler", () => {
 
   it("rejects an oversized body with 413", async () => {
     const reg = TokenRegistry.create({ tokensFile: await tmpFile() });
-    const s = await startAdmin(reg, "admintok");
+    const s = await startAdmin(reg);
     try {
       const res = await fetch(`${s.base}/api/tokens`, {
         method: "POST",
-        headers: { ...auth("admintok"), "Content-Type": "application/json" },
+        headers: { ...AUTH, "Content-Type": "application/json" },
         body: JSON.stringify({ device: "x".repeat(70000) }),
       });
       expect(res.status).toBe(413);
@@ -148,11 +165,11 @@ describe("admin handler", () => {
 
   it("rejects POST with missing/empty device with 400", async () => {
     const reg = TokenRegistry.create({ tokensFile: await tmpFile() });
-    const s = await startAdmin(reg, "admintok");
+    const s = await startAdmin(reg);
     try {
       const res = await fetch(`${s.base}/api/tokens`, {
         method: "POST",
-        headers: { ...auth("admintok"), "Content-Type": "application/json" },
+        headers: { ...AUTH, "Content-Type": "application/json" },
         body: JSON.stringify({ device: "" }),
       });
       expect(res.status).toBe(400);
@@ -164,11 +181,11 @@ describe("admin handler", () => {
 
   it("returns 404 { removed: false } when revoking an unknown id", async () => {
     const reg = TokenRegistry.create({ tokensFile: await tmpFile() });
-    const s = await startAdmin(reg, "admintok");
+    const s = await startAdmin(reg);
     try {
       const res = await fetch(`${s.base}/api/tokens/does-not-exist`, {
         method: "DELETE",
-        headers: auth("admintok"),
+        headers: AUTH,
       });
       expect(res.status).toBe(404);
       expect(await res.json()).toEqual({ removed: false });
@@ -182,7 +199,8 @@ describe("admin handler", () => {
     const reg = TokenRegistry.create({ tokensFile: await tmpFile() });
     const handler = createAdminHandler({
       registry: reg,
-      adminToken: "admintok",
+      adminUser: USER,
+      adminPassword: PASS,
       status: async () => {
         throw new Error("boom");
       },
@@ -194,7 +212,7 @@ describe("admin handler", () => {
     if (!addr || typeof addr === "string") throw new Error("no addr");
     const base = `http://127.0.0.1:${addr.port}`;
     try {
-      const res = await fetch(`${base}/api/status`, { headers: auth("admintok") });
+      const res = await fetch(`${base}/api/status`, { headers: AUTH });
       expect(res.status).toBe(500);
     } finally {
       await new Promise<void>((r) => server.close(() => r()));

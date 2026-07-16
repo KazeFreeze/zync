@@ -66,14 +66,7 @@
   </head>
   <body>
     <h1>Zync Admin</h1>
-    <div id="login">
-      <p>Paste the admin token to continue.</p>
-      <input id="token" type="password" placeholder="ZYNC_ADMIN_TOKEN" size="48" />
-      <button onclick="login()">Enter</button>
-      <span id="loginerr" class="err"></span>
-    </div>
-
-    <div id="app" hidden>
+    <div id="app">
       <h2>Status</h2>
       <div id="status" class="muted">loading…</div>
 
@@ -94,38 +87,21 @@
       <input id="device" placeholder="e.g. pc-home" />
       <button onclick="addDevice()">Generate token</button>
       <div id="newtok" hidden></div>
-      <p><button onclick="logout()">Log out</button></p>
     </div>
 
     <script>
-      let TOKEN = "";
-      const H = () => ({ Authorization: "Bearer " + TOKEN });
+      // The whole console is behind HTTP Basic auth — the browser prompts for the
+      // username/password on load and attaches them to every same-origin request,
+      // so no manual Authorization header is needed here.
       const $ = (id) => document.getElementById(id);
 
-      async function login() {
-        TOKEN = $("token").value.trim();
-        const res = await fetch("/api/status", { headers: H() });
-        if (res.status !== 200) {
-          $("loginerr").textContent = " invalid token";
-          return;
-        }
-        sessionStorage.setItem("zync_admin", TOKEN);
-        $("login").hidden = true;
-        $("app").hidden = false;
-        refresh();
-      }
-      function logout() {
-        sessionStorage.removeItem("zync_admin");
-        location.reload();
-      }
-
       async function refresh() {
-        const st = await (await fetch("/api/status", { headers: H() })).json();
+        const st = await (await fetch("/api/status")).json();
         $("status").innerHTML =
           `uptime <code>${st.uptimeSec}s</code> · devices <code>${st.deviceCount}</code> · ` +
           `blob store <span class="${st.blobStoreOk ? "ok" : "err"}">${st.blobStoreOk ? "ok" : "unreachable"}</span> · ` +
           `snapshots <code>${st.snapshotCount}</code>`;
-        const list = await (await fetch("/api/tokens", { headers: H() })).json();
+        const list = await (await fetch("/api/tokens")).json();
         $("rows").innerHTML = list
           .map(
             (d) =>
@@ -147,7 +123,7 @@
         if (!device) return;
         const res = await fetch("/api/tokens", {
           method: "POST",
-          headers: { ...H(), "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ device }),
         });
         const d = await res.json();
@@ -159,15 +135,11 @@
       }
       async function revoke(id) {
         if (!confirm("Revoke this device token?")) return;
-        await fetch("/api/tokens/" + encodeURIComponent(id), { method: "DELETE", headers: H() });
+        await fetch("/api/tokens/" + encodeURIComponent(id), { method: "DELETE" });
         refresh();
       }
 
-      const saved = sessionStorage.getItem("zync_admin");
-      if (saved) {
-        $("token").value = saved;
-        login();
-      }
+      refresh();
     </script>
   </body>
 </html>

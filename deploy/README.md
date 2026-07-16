@@ -25,14 +25,15 @@ On-box state lives in two volumes: `zync-snapshots` → `/data/snapshots` (CRDT 
 | Var | Value | Notes |
 |-----|-------|-------|
 | `TAILSCALE_BIND_IP` | the host's tailnet IP | binds all 3 ports to the tailnet only |
-| `ZYNC_ADMIN_TOKEN` | `openssl rand -hex 32` | strong secret; gates the admin console |
+| `ZYNC_ADMIN_USER` | e.g. `admin` | admin console username (HTTP Basic auth) |
+| `ZYNC_ADMIN_PASSWORD` | `openssl rand -hex 24` | admin console password; gates the console |
 | `ZYNC_S3_ENDPOINT` | `https://s3.<region>.backblazeb2.com` | B2 S3-compatible endpoint |
 | `ZYNC_S3_REGION` | e.g. `us-west-004` | B2 region |
 | `ZYNC_S3_BUCKET` | `zync-blobs` | dedicated bucket |
 | `ZYNC_S3_ACCESS_KEY` | B2 application keyID | scoped to `zync-blobs` |
 | `ZYNC_S3_SECRET_KEY` | B2 application key | |
 
-`ZYNC_PORT`/`ZYNC_BLOB_PORT`/`ZYNC_ADMIN_PORT`/`ZYNC_SNAPSHOT_DIR`/`ZYNC_TOKENS_FILE` are set in the compose. **Do not set `ZYNC_TOKEN`** in production — with `ZYNC_TOKENS_FILE` present the server runs in per-device **file mode** and ignores it. (Startup is fail-closed: an empty `ZYNC_ADMIN_TOKEN`, or single-token mode with an empty/missing `ZYNC_TOKEN`, aborts with a clear error rather than running open.)
+`ZYNC_PORT`/`ZYNC_BLOB_PORT`/`ZYNC_ADMIN_PORT`/`ZYNC_SNAPSHOT_DIR`/`ZYNC_TOKENS_FILE` are set in the compose. **Do not set `ZYNC_TOKEN`** in production — with `ZYNC_TOKENS_FILE` present the server runs in per-device **file mode** and ignores it. (Startup is fail-closed: an empty `ZYNC_ADMIN_PASSWORD`, or single-token mode with an empty/missing `ZYNC_TOKEN`, aborts with a clear error rather than running open.)
 
 ## Runbook
 
@@ -50,7 +51,7 @@ Stop + delete the existing `my-obsidian-livesync` CouchDB Dokploy compose (keep 
 ### 4. Verify the deploy (from a device on the tailnet)
 - Relay up: `nc -vz <tailnet-ip> 1234`
 - Blob auth on: `curl -s -o /dev/null -w "%{http_code}\n" http://<tailnet-ip>:8080/blob/$(printf '0%.0s' {1..64})` → **401**
-- Admin loads: open `http://<tailnet-ip>:9090` → the Zync Admin page appears; pasting `ZYNC_ADMIN_TOKEN` shows the (empty) device list + status.
+- Admin loads: open `http://<tailnet-ip>:9090` → the browser prompts for the admin username/password; after logging in the (empty) device list + status appear.
 
 ### 5. Tailscale Serve — HTTPS for mobile (run on the host)
 Obsidian Mobile rejects plain HTTP/WS, so wrap the two client-facing services in HTTPS on the `.ts.net` name (real Let's Encrypt cert). Requires MagicDNS + HTTPS certs enabled on the tailnet (already on from LiveSync).

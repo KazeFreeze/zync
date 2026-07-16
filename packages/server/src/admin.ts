@@ -2,21 +2,22 @@
  * admin.ts — minimal, buildless admin HTTP service for @zync/server.
  *
  * Serves a static admin page (GET /) and a token-management + status JSON API
- * (/api/*) gated behind a single ZYNC_ADMIN_TOKEN. Backed by the same
- * TokenRegistry the relay + blob endpoint read, so add/revoke take effect via
- * the registry's hot-reload. Bound to the tailnet interface by the compose;
+ * (/api/*) gated behind HTTP Basic auth (username + password). Backed by the
+ * same TokenRegistry the relay + blob endpoint read, so add/revoke take effect
+ * via the registry's hot-reload. Bound to the tailnet interface by the compose;
  * never exposed publicly. No CORS (same-origin page).
  *
  * Architecture overview
  * ─────────────────────
- *   GET /                    → unauthenticated static UI (no secrets in page)
+ *   GET /                    → static UI (behind Basic auth, like every route)
  *   GET  /api/status         → { uptimeSec, deviceCount, blobStoreOk, snapshotCount }
  *   GET  /api/tokens         → DeviceTokenPublic[] (tokenMasked, no raw token)
  *   POST /api/tokens         → { device: string } → DeviceToken (returns raw token once)
  *   DELETE /api/tokens/:id   → { removed: boolean }
  *
- * All /api/* routes require `Authorization: Bearer <adminToken>` matched with
- * timingSafeEqual to prevent timing-based token guessing.
+ * EVERY request (incl. GET /) requires HTTP Basic auth — ZYNC_ADMIN_USER /
+ * ZYNC_ADMIN_PASSWORD, compared with timingSafeEqual. Missing/wrong creds → 401
+ * + `WWW-Authenticate: Basic` so the browser prompts for login.
  *
  * buildStatusProvider() wires the live runtime pieces (registry + blob backend +
  * snapshot dir) into an AdminStatusProvider callable that createAdminHandler
@@ -56,8 +57,10 @@ export type AdminStatusProvider = () => Promise<AdminStatus>;
 export interface AdminHandlerOptions {
   /** Live TokenRegistry shared with the relay and blob handlers. */
   registry: TokenRegistry;
-  /** Secret that callers must present as `Authorization: Bearer <token>`. */
-  adminToken: string;
+  /** Admin username for HTTP Basic auth. */
+  adminUser: string;
+  /** Admin password for HTTP Basic auth. */
+  adminPassword: string;
   /** Status supplier wired to live runtime pieces in production. */
   status: AdminStatusProvider;
   /**
@@ -89,6 +92,26 @@ function safeEqual(a: string, b: string): boolean {
     return false;
   }
   return timingSafeEqual(ab, bb);
+}
+
+/**
+ * Validate an HTTP Basic `Authorization` header against the admin credentials.
+ * Both user and password are evaluated (no early return) so neither leaks via
+ * comparison timing.
+ */
+function checkBasicAuth(authHeader: string | undefined, user: string, password: string): boolean {
+  if (!authHeader?.startsWith("Basic ")) return false;
+  let decoded: string;
+  try {
+    decoded = Buffer.from(authHeader.slice("Basic ".length), "base64").toString("utf8");
+  } catch {
+    return false;
+  }
+  const idx = decoded.indexOf(":");
+  if (idx < 0) return false;
+  const okUser = safeEqual(decoded.slice(0, idx), user);
+  const okPass = safeEqual(decoded.slice(idx + 1), password);
+  return okUser && okPass;
 }
 
 /** Serialise `body` as JSON and end the response. */
@@ -136,7 +159,7 @@ async function readJsonBody(req: IncomingMessage, maxBytes = 64 * 1024): Promise
 export function createAdminHandler(
   opts: AdminHandlerOptions,
 ): (req: IncomingMessage, res: ServerResponse) => void {
-  const { registry, adminToken, status, uiHtml } = opts;
+  const { registry, adminUser, adminPassword, status, uiHtml } = opts;
 
   return function adminHandler(req: IncomingMessage, res: ServerResponse): void {
     void handle(req, res).catch((err: unknown) => {
@@ -152,7 +175,14 @@ export function createAdminHandler(
     const url = req.url ?? "/";
     const method = req.method ?? "GET";
 
-    // ── Static UI (unauthenticated — no secrets rendered into the page) ──────
+    // ── HTTP Basic auth gate — covers EVERY route, including GET / ───────────
+    if (!checkBasicAuth(req.headers.authorization, adminUser, adminPassword)) {
+      res.writeHead(401, { "WWW-Authenticate": 'Basic realm="Zync Admin", charset="UTF-8"' });
+      res.end();
+      return;
+    }
+
+    // ── Static UI ────────────────────────────────────────────────────────────
     if (method === "GET" && (url === "/" || url === "/index.html")) {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(uiHtml);
@@ -162,15 +192,6 @@ export function createAdminHandler(
     // ── Everything else must be under /api/ ──────────────────────────────────
     if (!url.startsWith("/api/")) {
       res.writeHead(404);
-      res.end();
-      return;
-    }
-
-    // ── Auth gate for all /api/* routes ─────────────────────────────────────
-    const authHeader = req.headers.authorization ?? "";
-    const presented = authHeader.startsWith("Bearer ") ? authHeader.slice("Bearer ".length) : "";
-    if (!presented || !safeEqual(presented, adminToken)) {
-      res.writeHead(401);
       res.end();
       return;
     }

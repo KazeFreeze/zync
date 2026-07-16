@@ -19,7 +19,8 @@ services:
       ZYNC_SNAPSHOT_DIR: /data/snapshots
       ZYNC_TOKENS_FILE: /data/config/tokens.json
       # Injected via Dokploy env (secrets) — do NOT hardcode:
-      ZYNC_ADMIN_TOKEN: ${ZYNC_ADMIN_TOKEN}
+      ZYNC_ADMIN_USER: ${ZYNC_ADMIN_USER:-admin}
+      ZYNC_ADMIN_PASSWORD: ${ZYNC_ADMIN_PASSWORD}
       ZYNC_S3_ENDPOINT: ${ZYNC_S3_ENDPOINT}
       ZYNC_S3_BUCKET: ${ZYNC_S3_BUCKET}
       ZYNC_S3_REGION: ${ZYNC_S3_REGION}

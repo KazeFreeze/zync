@@ -4,11 +4,12 @@
  * Composes three services:
  *   1. Hocuspocus WebSocket relay (content-opaque CRDT relay + snapshot persistence).
  *   2. Blob HTTP endpoint (GET/PUT /blob/:sha256, content-addressed storage).
- *   3. Admin HTTP server (optional; own port, ZYNC_ADMIN_TOKEN).
+ *   3. Admin HTTP server (optional; own port, HTTP Basic auth).
  *
  * Auth: per-device tokens via a file-backed `TokenRegistry` (`verifyToken`), with a
  * `ZYNC_TOKEN` single-token fallback for the harness/dev. The admin server (own port,
- * `ZYNC_ADMIN_TOKEN`) manages device tokens at runtime.
+ * HTTP Basic auth via `ZYNC_ADMIN_USER` / `ZYNC_ADMIN_PASSWORD`) manages device tokens
+ * at runtime.
  *
  * Exports `createServer(config)` for in-process use (transport-conformance tests).
  * The `main()` function reads config from env and is the Docker entrypoint.
@@ -48,7 +49,7 @@ export interface ServerConfig {
   /** Per-device token registry. When present it is the authoritative auth source. */
   registry?: TokenRegistry;
   /** Admin service config. Requires `registry`. Omit to disable the admin server. */
-  admin?: { port: number; adminToken: string; uiHtml: string };
+  admin?: { port: number; adminUser: string; adminPassword: string; uiHtml: string };
 }
 
 export interface ServerHandle {
@@ -104,7 +105,8 @@ export async function createServer(config: ServerConfig): Promise<ServerHandle> 
       });
       const adminHandler = createAdminHandler({
         registry,
-        adminToken: config.admin.adminToken,
+        adminUser: config.admin.adminUser,
+        adminPassword: config.admin.adminPassword,
         status,
         uiHtml: config.admin.uiHtml,
       });
@@ -172,23 +174,23 @@ function parsePort(value: string | undefined, fallback: number, name: string): n
 /**
  * Fail-closed startup guard. In single-token mode a missing/empty ZYNC_TOKEN
  * would otherwise yield an open relay ("" === "") or a useless always-reject
- * server; an empty ZYNC_ADMIN_TOKEN would start an admin server that locks
- * itself out. Production runs file mode (ZYNC_TOKENS_FILE), so these only bite
- * a misconfiguration — and now they bite loudly at startup instead of silently.
+ * server; an empty ZYNC_ADMIN_PASSWORD would start an admin server with a blank
+ * password. Production runs file mode (ZYNC_TOKENS_FILE), so these only bite a
+ * misconfiguration — and now they bite loudly at startup instead of silently.
  */
 export function assertAuthConfig(
   mode: "file" | "single",
   staticToken: string | undefined,
-  adminToken: string | undefined,
+  adminPassword: string | undefined,
 ): void {
   if (mode === "single" && (staticToken === undefined || staticToken === "")) {
     throw new Error(
       "[zync] no auth configured: set ZYNC_TOKENS_FILE (per-device tokens, recommended) or a non-empty ZYNC_TOKEN",
     );
   }
-  if (adminToken === "") {
+  if (adminPassword === "") {
     throw new Error(
-      "[zync] ZYNC_ADMIN_TOKEN is empty: unset it to disable the admin server, or set a strong token",
+      "[zync] ZYNC_ADMIN_PASSWORD is empty: unset it to disable the admin server, or set a strong password",
     );
   }
 }
@@ -199,7 +201,8 @@ async function main(): Promise<void> {
   const adminPort = parsePort(process.env.ZYNC_ADMIN_PORT, 9090, "ZYNC_ADMIN_PORT");
   const staticToken = process.env.ZYNC_TOKEN;
   const tokensFile = process.env.ZYNC_TOKENS_FILE;
-  const adminToken = process.env.ZYNC_ADMIN_TOKEN;
+  const adminUser = process.env.ZYNC_ADMIN_USER ?? "admin";
+  const adminPassword = process.env.ZYNC_ADMIN_PASSWORD;
   const snapshotDir = process.env.ZYNC_SNAPSHOT_DIR ?? "/data/snapshots";
   // HARNESS-ONLY: 0 in production (no latch, no /_blob-stats). The blob-scale gate sets it.
   const blobGetDelayMs = Number(process.env.ZYNC_BLOB_GET_DELAY_MS ?? 0);
@@ -212,12 +215,13 @@ async function main(): Promise<void> {
   console.log(`[zync] token registry: ${registry.mode} mode (${registry.deviceCount} devices)`);
 
   // Fail loud on a misconfigured auth setup before we bind any sockets.
-  assertAuthConfig(registry.mode, staticToken, adminToken);
+  assertAuthConfig(registry.mode, staticToken, adminPassword);
 
-  let admin: { port: number; adminToken: string; uiHtml: string } | undefined;
-  if (adminToken !== undefined) {
+  // Admin server is enabled when a password is set (username defaults to "admin").
+  let admin: { port: number; adminUser: string; adminPassword: string; uiHtml: string } | undefined;
+  if (adminPassword !== undefined) {
     const uiHtml = readFileSync(new URL("./admin-ui.html", import.meta.url), "utf8");
-    admin = { port: adminPort, adminToken, uiHtml };
+    admin = { port: adminPort, adminUser, adminPassword, uiHtml };
   }
 
   const s3Endpoint = process.env.ZYNC_S3_ENDPOINT ?? "http://localhost:9000";
