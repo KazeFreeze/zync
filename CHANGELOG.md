@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/KazeFreeze/zync/compare/zync-v0.2.0...zync-v0.3.0) (2026-07-18)
+
+
+### Features
+
+* **plugin:** redesign synced-plugins settings row (single Sync toggle + chevron-expand) ([3bbb3b8](https://github.com/KazeFreeze/zync/commit/3bbb3b8326b745a9edb52d59005484418a46c6f5))
+
 ## [0.2.0](https://github.com/KazeFreeze/zync/compare/zync-v0.1.0...zync-v0.2.0) (2026-07-16)
 
 
