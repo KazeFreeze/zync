@@ -1,6 +1,6 @@
 # Zync server — production deployment runbook
 
-Deploys the Zync sync server (`@zync/server`: Hocuspocus relay + blob HTTP endpoint + admin console) to a single-node **Dokploy** host, **Tailscale-only**, with blobs on **Backblaze B2**. Design spec: `docs/superpowers/specs/2026-07-15-zync-prod-deployment-design.md`.
+Deploys the Zync sync server (`@zync/server`: Hocuspocus relay + blob HTTP endpoint + admin console) to a single-node **Dokploy** host, **Tailscale-only**, with blobs on **Backblaze B2**.
 
 ## What gets deployed
 

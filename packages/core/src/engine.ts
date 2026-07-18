@@ -337,7 +337,7 @@ export class SyncEngine {
    *
    * WHY NEEDED (S4+): under scoping, "next pass" may not visit the diverged docId. This set
    * forces it into the next structural pass so the two-consecutive-pass stability gate can
-   * complete. (Risk #3 in CURSOR-GPT-KEYSCOPED-RECONCILE-FINDINGS.md.)
+   * complete.
    */
   private readonly pendingDivergenceDocIds = new Set<DocId>();
   readonly base: BaseStore;

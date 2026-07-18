@@ -7,8 +7,7 @@ build/
 # git worktrees for isolated feature builds (subagent-driven dev)
 .worktrees/
 
-# local Obsidian dev-loop scratch (server snapshots, headless peer vault) — see
-# docs/superpowers/notes/2026-06-17-zync-m1-dev-loop-runbook.md
+# local Obsidian dev-loop scratch (server snapshots, headless peer vault)
 .zync-dev/
 
 # brainstorming visual-companion mockups (transient HTML/state; local-only scratch)

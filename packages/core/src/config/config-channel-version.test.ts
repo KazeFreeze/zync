@@ -1,8 +1,6 @@
 /**
  * Version assignment on publish (plugin-data version-aware convergence — LEAN).
  *
- * Design: docs/superpowers/specs/2026-07-11-zync-plugin-data-version-tiebreak-design.md
- *
  * A plain publish of a plugin-data (data.json) path is a NEW local edit, so ConfigChannel.publish
  * bumps the per-path numeric edit-version (localVersion+1), writes it onto the ConfigEntry as
  * `dataVersion`, and persists the new version via the engine-state seam. Two devices editing off the
