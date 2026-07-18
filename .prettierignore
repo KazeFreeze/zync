@@ -6,6 +6,8 @@ docs/
 *.md
 .github/workflows/*.yml
 .github/*.yml
+# release-please-managed manifest — bot-generated compact JSON, not ours to format
+.github/.release-please-manifest.json
 
 # Per-run harness artifacts (see packages/harness/scripts/run.ts) — generated, not source.
 packages/harness/results.json

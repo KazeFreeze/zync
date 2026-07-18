@@ -1,8 +1,6 @@
 /**
  * Plugin-data first-sync: silent-adopt + loser-bytes backup + reload-on-resolve.
  *
- * Design: docs/superpowers/specs/2026-07-11-zync-plugin-data-first-sync-adopt-design.md
- *
  * CHANGE 1 (onConfigDivergence): a plugin-data file with NO recorded config base is a first
  * cross-device convergence (independently-created data.json, no common ancestor). Accept the
  * remote silently (return false, no inbox entry) instead of raising a false conflict on both
@@ -165,7 +163,6 @@ async function waitFor(cond: () => boolean, maxTicks = 300): Promise<void> {
 }
 
 // ── Version-aware plugin-data convergence (LEAN) ───────────────────────────────
-// Design: docs/superpowers/specs/2026-07-11-zync-plugin-data-version-tiebreak-design.md
 // Ordering is by a per-edit numeric version (recency) first, canonical-sha only for true
 // (equal-version) ties, and ONLY the equal-version loser is backed up.
 

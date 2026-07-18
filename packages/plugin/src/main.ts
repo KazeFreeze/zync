@@ -36,8 +36,7 @@ import { PortProfiler } from "./profiling.js";
  * sync conflicts. Engine lifecycle is gated on `workspace.onLayoutReady` (the startup-create trap) and torn
  * down on unload.
  *
- * Real on-device behavior (editing, undo/IME, convergence, .obsidian/zync access) is the manual gate — see
- * docs/superpowers/notes/2026-06-17-zync-m1-dev-loop-runbook.md.
+ * Real on-device behavior (editing, undo/IME, convergence, .obsidian/zync access) is the manual gate.
  */
 
 interface ZyncSettings {

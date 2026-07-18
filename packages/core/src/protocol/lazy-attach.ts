@@ -209,7 +209,6 @@ export class LazyAttachManager {
    * WHY NEEDED (S4+): a doc can converge via a remote note-doc update with NO index-key
    * change. A scoped settle (S6) would never re-select it → false-pending latch. This set
    * gives settle a trigger so it visits every remote-updated doc regardless of index delta.
-   * (Risk #1 in CURSOR-GPT-KEYSCOPED-RECONCILE-FINDINGS.md.)
    *
    * ACTIVE-BOUND CARVE-OUT (S6a): `engine.bindOutbound` enqueues here ONLY for docs that are
    * NOT active-bound (it calls {@link noteRemoteUpdate} AFTER its active-bound guard). An
@@ -232,7 +231,7 @@ export class LazyAttachManager {
    *
    * WHY NEEDED (S4+): under scoping, a doc whose ack-gated catch-up did not complete
    * would be stranded until an unrelated index change re-selects it. This set forces it
-   * back into the workset. (Risk #2 in CURSOR-GPT-KEYSCOPED-RECONCILE-FINDINGS.md.)
+   * back into the workset.
    */
   private readonly needsCatchUp = new Set<DocId>();
 
