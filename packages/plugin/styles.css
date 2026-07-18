@@ -132,20 +132,6 @@
   text-decoration: underline;
 }
 
-/* Settings — per-plugin toggle captions ("Synced plugins" section).
-   Renders a short muted label before each of the three toggles so the row
-   reads: Sync plugin [•]  Don't run here [•]  Sync settings [•]. */
-.zync-toggle-label {
-  font-size: var(--font-ui-smaller);
-  color: var(--text-muted);
-  margin-left: 14px;
-  margin-right: 5px;
-  white-space: nowrap;
-}
-.zync-toggle-label:first-child {
-  margin-left: 0;
-}
-
 /* Empty state */
 .zync-empty {
   display: flex;
@@ -171,4 +157,62 @@
 .zync-empty-sub {
   margin: 0;
   font-size: var(--font-ui-small);
+}
+
+/* --- Synced-plugins settings section (ZyncSettingTab.renderSyncedPlugins) --- */
+
+/* Category master off: dim + lock the whole list (the notice/button sit ABOVE
+   the list, so they stay interactive). */
+.zync-plugin-list.zync-disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+.zync-section-notice {
+  border-left: 3px solid var(--interactive-accent);
+  padding-left: 10px;
+}
+
+/* Deviation chips in a row's description line. */
+.zync-override-chip {
+  display: inline-block;
+  font-size: var(--font-smaller);
+  line-height: 1.5;
+  padding: 0 8px;
+  margin-right: 6px;
+  border-radius: 10px;
+  color: var(--text-accent);
+  background: var(--background-modifier-hover);
+  border: 1px solid var(--background-modifier-border);
+}
+/* Muted "Desktop only" note. */
+.zync-note {
+  font-size: var(--font-smaller);
+  color: var(--text-muted);
+}
+
+/* Chevron disclosure control. */
+.zync-chevron {
+  cursor: pointer;
+}
+.zync-chevron.zync-hidden {
+  visibility: hidden;
+}
+.zync-chevron.zync-deviated {
+  color: var(--interactive-accent);
+}
+.zync-clickable .setting-item-name {
+  cursor: pointer;
+}
+
+/* Indented sub-panel with a tree-line, showing the master → dependent relation. */
+.zync-subpanel {
+  margin-left: 18px;
+  padding-left: 12px;
+  border-left: 2px solid var(--background-modifier-border);
+}
+
+/* Mobile: guarantee a comfortable tap target on the chevron. */
+.is-mobile .zync-chevron {
+  min-width: 40px;
+  min-height: 40px;
 }

@@ -27,6 +27,7 @@ import {
 } from "@zync/vault-obsidian";
 import type { PluginRuntimePort } from "@zync/core";
 import { PortProfiler } from "./profiling.js";
+import { overrideState } from "./plugin-override-state.js";
 
 /**
  * Zync plugin — M1 desktop walking skeleton (M1-T5 wiring).
@@ -36,7 +37,8 @@ import { PortProfiler } from "./profiling.js";
  * sync conflicts. Engine lifecycle is gated on `workspace.onLayoutReady` (the startup-create trap) and torn
  * down on unload.
  *
- * Real on-device behavior (editing, undo/IME, convergence, .obsidian/zync access) is the manual gate.
+ * Real on-device behavior (editing, undo/IME, convergence, .obsidian/zync access) is the manual gate — see
+ * docs/superpowers/notes/2026-06-17-zync-m1-dev-loop-runbook.md.
  */
 
 interface ZyncSettings {
@@ -641,6 +643,13 @@ function installedCommunityPlugins(app: App): InstalledPlugin[] {
 
 class ZyncSettingTab extends PluginSettingTab {
   private readonly plugin: ZyncPlugin;
+  /**
+   * Ids of plugin rows currently expanded. Held on the tab instance — OUTSIDE
+   * display() — because we call this.display() after every change (opt-in,
+   * override, expand). Without external state an open row would collapse the
+   * instant you flip an override.
+   */
+  private readonly expandedPluginIds = new Set<string>();
 
   constructor(app: App, plugin: ZyncPlugin) {
     super(app, plugin);
@@ -740,74 +749,7 @@ class ZyncSettingTab extends PluginSettingTab {
         }),
       );
 
-    containerEl.createEl("h3", { text: "Synced plugins" });
-    const optedIn = new Set(
-      this.plugin
-        .listPluginOptIn()
-        .filter((p) => p.optIn)
-        .map((p) => p.id),
-    );
-    // Task 9: seed suppress + enabled state once per display() call.
-    const suppressed = new Set(this.plugin.listPluginSuppress());
-    const settingsOff = new Set(this.plugin.listPluginSettingsSyncOff());
-    const enabledIds = new Set(
-      this.plugin
-        .listPluginEnabled()
-        .filter((p) => p.enabled)
-        .map((p) => p.id),
-    );
-    for (const p of installedCommunityPlugins(this.app)) {
-      const isEnabled = enabledIds.has(p.id);
-      const isSuppressed = suppressed.has(p.id);
-      const baseDesc = p.isDesktopOnly
-        ? "Desktop-only — excluded from mobile devices."
-        : `Plugin id: ${p.id}`;
-      // Reflect enabled state: " · active" only when shared-enabled AND not locally suppressed
-      // (a suppressed plugin is not running here); "active on other devices" when enabled-but-suppressed.
-      const suffix = isEnabled ? (isSuppressed ? " · active on other devices" : " · active") : "";
-      const desc = `${baseDesc}${suffix}`;
-      // Each toggle carries a short caption in the control row so the three
-      // switches are self-explanatory (previously they were bare + tooltip-only).
-      const caption = (s: Setting, text: string): Setting => {
-        s.controlEl.createSpan({ text, cls: "zync-toggle-label" });
-        return s;
-      };
-      new Setting(containerEl)
-        .setName(p.name)
-        .setDesc(desc)
-        // First toggle: opt-in to sync this plugin's code (same as 2a).
-        .then((s) => caption(s, "Sync plugin"))
-        .addToggle((t) =>
-          t
-            .setValue(optedIn.has(p.id))
-            .setTooltip("Sync this plugin (its code) across your devices")
-            .onChange(async (v) => {
-              await this.plugin.setPluginOptIn(p.id, v);
-            }),
-        )
-        // Task 9: second toggle — "Don't run on this device" (device-local suppress).
-        .then((s) => caption(s, "Don't run here"))
-        .addToggle((t) =>
-          t
-            .setValue(suppressed.has(p.id))
-            .setTooltip("Keep synced, but keep this plugin disabled on this device")
-            .onChange(async (v) => {
-              await this.plugin.setPluginSuppressed(p.id, v);
-            }),
-        )
-        // Slice 3b: third toggle — sync this plugin's data.json (settings).
-        .then((s) => caption(s, "Sync settings"))
-        .addToggle((t) =>
-          t
-            .setValue(!settingsOff.has(p.id)) // default ON (absent = sync); OFF only if explicitly excluded
-            .setTooltip(
-              "Sync this plugin's settings (data.json). Only effective while opted-in above.",
-            )
-            .onChange(async (v) => {
-              await this.plugin.setPluginSettingsSync(p.id, v);
-            }),
-        );
-    }
+    this.renderSyncedPlugins(containerEl);
 
     new Setting(containerEl)
       .setName("Apply + restart sync")
@@ -821,5 +763,154 @@ class ZyncSettingTab extends PluginSettingTab {
             new Notice("Zync: restarting…");
           }),
       );
+  }
+
+  /** The "Synced plugins" section: heading, helper, category master-gate, list. */
+  private renderSyncedPlugins(containerEl: HTMLElement): void {
+    containerEl.createEl("h3", { text: "Synced plugins" });
+    containerEl.createEl("p", {
+      cls: "setting-item-description",
+      text:
+        "Turn on Sync to keep a plugin's code in step on every device. " +
+        "Expand a synced plugin for per-device options.",
+    });
+
+    const disabled = !this.plugin.settings.syncConfig.plugins;
+
+    // Section master-gate: the "Sync plugins" category toggle governs this whole
+    // section, mirroring how a row's Sync toggle governs its overrides.
+    if (disabled) {
+      const notice = new Setting(containerEl)
+        .setName("Plugin sync is off")
+        .setDesc("Turn it on to sync any of these plugins.");
+      notice.settingEl.addClass("zync-section-notice");
+      notice.addButton((b) =>
+        b
+          .setButtonText("Turn on plugin sync")
+          .setCta()
+          .onClick(async () => {
+            this.plugin.settings.syncConfig.plugins = true;
+            await this.plugin.saveSettings();
+            this.display();
+          }),
+      );
+    }
+
+    const optedIn = new Set(
+      this.plugin
+        .listPluginOptIn()
+        .filter((p) => p.optIn)
+        .map((p) => p.id),
+    );
+    const suppressed = new Set(this.plugin.listPluginSuppress());
+    const settingsOff = new Set(this.plugin.listPluginSettingsSyncOff());
+
+    const list = containerEl.createDiv({ cls: "zync-plugin-list" });
+    if (disabled) list.addClass("zync-disabled");
+    for (const p of installedCommunityPlugins(this.app)) {
+      this.renderPluginRow(list, p, optedIn, suppressed, settingsOff, disabled);
+    }
+  }
+
+  /** One plugin's row: a single Sync toggle + chevron-expand of its overrides. */
+  private renderPluginRow(
+    containerEl: HTMLElement,
+    p: InstalledPlugin,
+    optedIn: ReadonlySet<string>,
+    suppressed: ReadonlySet<string>,
+    settingsOff: ReadonlySet<string>,
+    disabled: boolean,
+  ): void {
+    const synced = optedIn.has(p.id);
+    const state = overrideState(p.id, suppressed, settingsOff);
+    const expanded = this.expandedPluginIds.has(p.id);
+
+    const toggleExpand = (): void => {
+      if (disabled || !synced) return;
+      if (this.expandedPluginIds.has(p.id)) this.expandedPluginIds.delete(p.id);
+      else this.expandedPluginIds.add(p.id);
+      this.display();
+    };
+
+    const row = new Setting(containerEl).setName(p.name);
+
+    // Description line: deviation chips + optional desktop-only note; empty when
+    // synced at defaults (the calm common case).
+    // Only surface deviation chips for actually-synced plugins — an opted-out
+    // plugin isn't managed by Zync, and its chip would be unreachable (chevron
+    // hidden, sub-panel not rendered), promising state the row can't clear.
+    if (synced && state.suppressed)
+      row.descEl.createSpan({ cls: "zync-override-chip", text: "off here" });
+    if (synced && state.settingsLocal)
+      row.descEl.createSpan({ cls: "zync-override-chip", text: "local settings" });
+    if (p.isDesktopOnly) row.descEl.createSpan({ cls: "zync-note", text: "Desktop only" });
+
+    // Chevron (left of the toggle): reveals per-device options. Hidden until
+    // synced (kept in the layout to avoid a column shift); tinted when deviated.
+    row.addExtraButton((b) => {
+      b.setIcon(expanded ? "chevron-down" : "chevron-right")
+        .setTooltip("Per-device options")
+        .onClick(toggleExpand);
+      b.extraSettingsEl.addClass("zync-chevron");
+      if (!synced) b.extraSettingsEl.addClass("zync-hidden");
+      if (state.deviated) b.extraSettingsEl.addClass("zync-deviated");
+    });
+
+    // Primary Sync toggle — the opt-in / master gate for this plugin.
+    row.addToggle((t) =>
+      t
+        .setValue(synced)
+        .setTooltip("Sync this plugin across devices")
+        .setDisabled(disabled)
+        .onChange(async (v) => {
+          await this.plugin.setPluginOptIn(p.id, v);
+          this.display();
+        }),
+    );
+
+    // The name/description area is also a tap target for expand (synced only),
+    // excluding the controls so flipping the toggle never expands the row.
+    if (synced && !disabled) {
+      row.infoEl.addClass("zync-clickable");
+      row.infoEl.addEventListener("click", toggleExpand);
+    }
+
+    // Expanded sub-panel: the two overrides + a conditional reset.
+    if (synced && expanded && !disabled) {
+      const panel = containerEl.createDiv({ cls: "zync-subpanel" });
+
+      new Setting(panel)
+        .setName("Run on this device")
+        .setDesc(
+          "Keep this plugin synced everywhere, but turned off on this device. " +
+            "Your other devices aren't affected.",
+        )
+        .addToggle((t) =>
+          t.setValue(!state.suppressed).onChange(async (v) => {
+            await this.plugin.setPluginSuppressed(p.id, !v);
+            this.display();
+          }),
+        );
+
+      new Setting(panel)
+        .setName("Sync settings")
+        .setDesc("Also sync this plugin's settings. Turn off to let each device keep its own.")
+        .addToggle((t) =>
+          t.setValue(!state.settingsLocal).onChange(async (v) => {
+            await this.plugin.setPluginSettingsSync(p.id, v);
+            this.display();
+          }),
+        );
+
+      if (state.deviated) {
+        new Setting(panel).addButton((b) =>
+          b.setButtonText("Reset to defaults").onClick(async () => {
+            await this.plugin.setPluginSuppressed(p.id, false);
+            await this.plugin.setPluginSettingsSync(p.id, true);
+            this.display();
+          }),
+        );
+      }
+    }
   }
 }
