@@ -28,6 +28,7 @@ import {
 import type { PluginRuntimePort } from "@zync/core";
 import { PortProfiler } from "./profiling.js";
 import { overrideState } from "./plugin-override-state.js";
+import { ConnectionAlert, type AlertCommand } from "./connection-alert.js";
 
 /**
  * Zync plugin — M1 desktop walking skeleton (M1-T5 wiring).
@@ -116,6 +117,10 @@ export default class ZyncPlugin extends Plugin {
   private engineReady = false;
   /** Per-session port timing (recreated each startEngine); dumped by "Zync: dump bootstrap profile". */
   private profiler: PortProfiler | null = null;
+  /** Mobile-only connection-alert state machine + its single sticky Notice + debounce timer. */
+  private alert: ConnectionAlert | null = null;
+  private stickyNotice: Notice | null = null;
+  private alertTimer: number | null = null;
 
   override async onload(): Promise<void> {
     await this.loadSettings();
@@ -184,6 +189,19 @@ export default class ZyncPlugin extends Plugin {
         new Notice("Zync: bootstrap profile dumped to the developer console (Ctrl+Shift+I).");
       },
     });
+
+    this.addCommand({
+      id: "zync-show-status",
+      name: "Zync: show status",
+      callback: () => {
+        new Notice(this.currentStatusText(), 4000);
+      },
+    });
+
+    // Mobile edit-while-disconnected bypass: feed editor changes to the connection alert.
+    if (Platform.isMobile) {
+      this.registerEvent(this.app.workspace.on("editor-change", () => this.alert?.onEdit()));
+    }
 
     // Gate engine start on layout-ready so Obsidian's startup file inventory doesn't flood ingest as
     // user creates (and so the editor binding doesn't bind before the engine exists).
@@ -285,9 +303,17 @@ export default class ZyncPlugin extends Plugin {
       );
       this.engine = engine;
 
+      if (Platform.isMobile) {
+        this.alert = new ConnectionAlert({
+          now: () => Date.now(),
+          emit: (cmd) => this.execAlert(cmd),
+          pending: () => this.lastPending,
+        });
+      }
       this.unsubs.push(
         transport.onStatus((s) => {
           this.connText = s;
+          this.alert?.onConn(s === "connected");
           void this.refreshStatus();
         }),
       );
@@ -365,6 +391,13 @@ export default class ZyncPlugin extends Plugin {
 
   private async stopEngine(): Promise<void> {
     this.engineReady = false; // stop reading blobProgress()/inbox during + after teardown
+    if (this.alertTimer !== null) {
+      window.clearTimeout(this.alertTimer);
+      this.alertTimer = null;
+    }
+    this.stickyNotice?.hide();
+    this.stickyNotice = null;
+    this.alert = null;
     if (this.statusTimer !== null) {
       window.clearInterval(this.statusTimer);
       this.statusTimer = null;
@@ -471,9 +504,63 @@ export default class ZyncPlugin extends Plugin {
     // Task 8: append ⟳ N when there are staged plugin-code updates waiting to be applied.
     const nUpdates = engine ? engine.pendingPluginUpdates().length : 0;
     const updates = nUpdates > 0 ? ` · ⟳ ${String(nUpdates)}` : "";
-    this.statusBar?.setText(
-      `Zync: ${this.connText}${pending > 0 ? ` · ${String(pending)} pending` : ""}${files}${conf}${updates}`,
-    );
+    this.statusBar?.setText(this.statusText(pending, files, conf, updates));
+  }
+
+  /** Compose the status line (shared by the desktop status bar and the "Zync: show status" command). */
+  private statusText(pending: number, files: string, conf: string, updates: string): string {
+    return `Zync: ${this.connText}${pending > 0 ? ` · ${String(pending)} pending` : ""}${files}${conf}${updates}`;
+  }
+
+  /** Full current status line from live state — for the on-demand "Zync: show status" command. */
+  private currentStatusText(): string {
+    const engine = this.engineReady ? this.engine : null;
+    const b = engine?.blobProgress();
+    const files =
+      b && b.total > 0 && b.materialized < b.total
+        ? ` · Files ${String(Math.min(b.materialized, b.total))}/${String(b.total)}` +
+          (b.failed > 0 ? ` (${String(b.failed)} failed)` : "")
+        : "";
+    const nConf = engine ? engine.inbox.list().filter(isActionableConflict).length : 0;
+    const conf = nConf > 0 ? ` · ⚠ ${String(nConf)}` : "";
+    const nUpdates = engine ? engine.pendingPluginUpdates().length : 0;
+    const updates = nUpdates > 0 ? ` · ⟳ ${String(nUpdates)}` : "";
+    return this.statusText(this.lastPending, files, conf, updates);
+  }
+
+  /** Execute a ConnectionAlert command as Obsidian Notices/timers (mobile only). */
+  private execAlert(cmd: AlertCommand): void {
+    switch (cmd.kind) {
+      case "showSticky":
+        this.stickyNotice?.hide();
+        this.stickyNotice = new Notice(cmd.message, 0);
+        this.stickyNotice.noticeEl.addEventListener("click", () => {
+          this.stickyNotice?.hide();
+          this.stickyNotice = null;
+          this.alert?.onDismiss();
+        });
+        break;
+      case "hideSticky":
+        this.stickyNotice?.hide();
+        this.stickyNotice = null;
+        break;
+      case "toast":
+        new Notice(cmd.message, cmd.durationMs);
+        break;
+      case "setTimer":
+        if (this.alertTimer !== null) {
+          window.clearTimeout(this.alertTimer);
+          this.alertTimer = null;
+        }
+        if (cmd.atMs !== null) {
+          const delay = Math.max(0, cmd.atMs - Date.now());
+          this.alertTimer = window.setTimeout(() => {
+            this.alertTimer = null;
+            this.alert?.onTimer();
+          }, delay);
+        }
+        break;
+    }
   }
 
   private refreshConflictNotice(): void {

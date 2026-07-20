@@ -34,7 +34,7 @@ jobs:
       - run: pnpm build:plugin
       - env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ needs.release-please.outputs.tag_name }}" packages/plugin/main.js packages/plugin/manifest.json packages/plugin/versions.json --clobber
+        run: gh release upload "${{ needs.release-please.outputs.tag_name }}" packages/plugin/main.js packages/plugin/manifest.json packages/plugin/styles.css packages/plugin/versions.json --clobber
   docker:
     needs: release-please
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
