@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/KazeFreeze/zync/compare/zync-v0.3.0...zync-v0.4.0) (2026-07-20)
+
+
+### Features
+
+* **plugin:** mobile sync-status surface ([d21c737](https://github.com/KazeFreeze/zync/commit/d21c73741edb8d971ce0d6464b9aca0569ccdb52))
+
 ## [0.3.0](https://github.com/KazeFreeze/zync/compare/zync-v0.2.0...zync-v0.3.0) (2026-07-18)
 
 
