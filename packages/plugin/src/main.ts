@@ -2,6 +2,7 @@ import { Plugin, Platform, PluginSettingTab, Setting, Notice, type App } from "o
 import {
   SyncEngine,
   isActionableConflict,
+  ClosedError,
   type ClockPort,
   type DeviceId,
   type IdentityPort,
@@ -38,8 +39,7 @@ import { ConnectionAlert, type AlertCommand } from "./connection-alert.js";
  * sync conflicts. Engine lifecycle is gated on `workspace.onLayoutReady` (the startup-create trap) and torn
  * down on unload.
  *
- * Real on-device behavior (editing, undo/IME, convergence, .obsidian/zync access) is the manual gate — see
- * docs/superpowers/notes/2026-06-17-zync-m1-dev-loop-runbook.md.
+ * Real on-device behavior (editing, undo/IME, convergence, .obsidian/zync access) is the manual gate.
  */
 
 interface ZyncSettings {
@@ -121,6 +121,8 @@ export default class ZyncPlugin extends Plugin {
   private alert: ConnectionAlert | null = null;
   private stickyNotice: Notice | null = null;
   private alertTimer: number | null = null;
+  /** Bumped on every start AND every stop; a start whose gen is stale was superseded (cancelled). */
+  private startGen = 0;
 
   override async onload(): Promise<void> {
     await this.loadSettings();
@@ -203,6 +205,16 @@ export default class ZyncPlugin extends Plugin {
       this.registerEvent(this.app.workspace.on("editor-change", () => this.alert?.onEdit()));
     }
 
+    // Mobile: Android throttling drops the socket on background; force an immediate reconnect
+    // when the app returns to the foreground or the network comes back, instead of waiting out
+    // the backoff. kick() is null-safe before the transport exists.
+    if (Platform.isMobile) {
+      this.registerDomEvent(document, "visibilitychange", () => {
+        if (document.visibilityState === "visible") this.transport?.kick();
+      });
+      this.registerDomEvent(window, "online", () => this.transport?.kick());
+    }
+
     // Gate engine start on layout-ready so Obsidian's startup file inventory doesn't flood ingest as
     // user creates (and so the editor binding doesn't bind before the engine exists).
     this.app.workspace.onLayoutReady(() => {
@@ -217,6 +229,7 @@ export default class ZyncPlugin extends Plugin {
   // ── engine lifecycle ───────────────────────────────────────────────────────
 
   private async startEngine(): Promise<void> {
+    const gen = ++this.startGen;
     if (this.engine !== null) return;
     if (this.settings.serverWs === "") {
       this.connText = "not configured";
@@ -239,6 +252,7 @@ export default class ZyncPlugin extends Plugin {
       const transport = new HocuspocusTransport({
         url: this.settings.serverWs,
         ...(this.settings.token !== "" ? { token: this.settings.token } : {}),
+        ...(Platform.isMobile ? { maxDelay: 4000 } : {}),
         connect: true,
       });
       this.transport = transport; // plugin owns it — engine.stop() does NOT close it (see stopEngine)
@@ -381,15 +395,28 @@ export default class ZyncPlugin extends Plugin {
       void this.refreshStatus();
       console.log("[zync] engine started");
     } catch (err) {
+      // A stop/restart that superseded this start, or a ClosedError from the transport being
+      // closed out from under a pending start, is a CANCELLATION — not a user-facing failure.
+      // Don't show "failed to start" and don't recursively tear down (a stop already ran/is running).
+      if (gen !== this.startGen || err instanceof ClosedError) {
+        console.log("[zync] startEngine cancelled (superseded or shutdown):", err);
+        return;
+      }
       console.error("[zync] failed to start engine:", err);
       this.connText = "error";
       this.renderStatus(0);
-      new Notice(`Zync: failed to start. ${err instanceof Error ? err.message : String(err)}`);
+      const msg = `Zync: failed to start. ${err instanceof Error ? err.message : String(err)} — tap to retry.`;
+      const notice = new Notice(msg, 0);
+      notice.noticeEl.addEventListener("click", () => {
+        notice.hide();
+        void this.startEngine();
+      });
       await this.stopEngine();
     }
   }
 
   private async stopEngine(): Promise<void> {
+    this.startGen++; // supersede any in-flight startEngine so its catch treats failure as cancellation
     this.engineReady = false; // stop reading blobProgress()/inbox during + after teardown
     if (this.alertTimer !== null) {
       window.clearTimeout(this.alertTimer);

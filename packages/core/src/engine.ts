@@ -68,6 +68,7 @@ import {
 import { canonicalizeProse, sha256OfBytes, sha256OfText } from "./hash.js";
 import { diffToEdits, merge3 } from "./bridge/merge.js";
 import { reconnectHealJitterMs } from "./reconnect-jitter.js";
+import { awaitWithinBudget } from "./await-budget.js";
 
 export interface EnginePorts {
   vault: VaultPort;
@@ -150,6 +151,12 @@ export interface EngineConfig {
   isMobile?: boolean;
   /** Reconnect-heal jitter ceiling (ms). Default {@link DEFAULT_RECONNECT_HEAL_JITTER_MAX_MS}; 0 disables. */
   reconnectHealJitterMaxMs?: number;
+  /**
+   * Max ms to wait for the FIRST index sync during start() before degrading to the offline
+   * bootstrap rail (then converge on reconnect). Prevents a flaky mobile link from hanging
+   * startup. Default {@link DEFAULT_INDEX_SYNC_START_BUDGET_MS}. Tests inject a small value.
+   */
+  indexSyncStartBudgetMs?: number;
 }
 
 const utf8 = (s: string): Uint8Array => new TextEncoder().encode(s);
@@ -271,6 +278,8 @@ export const SELFHEAL_MAX_PASSES = 50;
  * catch-ups in lockstep. `0` disables the delay (tests set it to 0 for determinism).
  */
 export const DEFAULT_RECONNECT_HEAL_JITTER_MAX_MS = 15_000;
+/** Default {@link EngineConfig.indexSyncStartBudgetMs} — long enough a healthy link always wins. */
+export const DEFAULT_INDEX_SYNC_START_BUDGET_MS = 10_000;
 
 /** A pending debounced bump: its settle promise is tracked by {@link SyncEngine.whenIdle}. */
 interface PendingBump {
@@ -733,7 +742,14 @@ export class SyncEngine {
     // drives convergence without a re-attach.
     const conn = transport.status();
     if (conn === "connected" || conn === "connecting") {
-      await this.indexAttached.synced();
+      // BOUNDED await: a flaky mobile link can leave synced() pending far longer than the
+      // connection survives. Wait up to indexSyncStartBudgetMs, then degrade to the SAME
+      // offline rail as the offline branch (bootstrap locally; index-observe + the reconnect
+      // backstop converge when sync lands). A rejection (ClosedError from a teardown racing
+      // start) still propagates out of awaitWithinBudget and aborts start(), as before.
+      const budget = this.config.indexSyncStartBudgetMs ?? DEFAULT_INDEX_SYNC_START_BUDGET_MS;
+      const synced = await awaitWithinBudget(this.indexAttached.synced(), budget);
+      if (!synced) this.swallowOfflineSynced(this.indexAttached);
     } else {
       // OFFLINE/UNAUTHORIZED: we deliberately do NOT await synced() (it stays PENDING
       // during a partition). Reconnect auto-resyncs via index-observe.

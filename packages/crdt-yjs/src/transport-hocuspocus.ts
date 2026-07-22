@@ -24,6 +24,12 @@ export interface HocuspocusTransportConfig {
    * adapter can be exercised offline (the live convergence run is deferred to 0b-3).
    */
   connect?: boolean;
+  /**
+   * Cap (ms) for the reconnect backoff. `@hocuspocus/provider` defaults to 30000, which on a
+   * flapping mobile link idles through entire viable connection windows. The plugin sets ~4000
+   * on mobile so an attempt is always in flight. Omit for the desktop default.
+   */
+  maxDelay?: number;
 }
 
 /** Map a Hocuspocus {@link WebSocketStatus} to the engine's {@link ConnStatus}. */
@@ -111,6 +117,7 @@ export class HocuspocusTransport implements TransportPort {
     this.socket = new HocuspocusProviderWebsocket({
       url: config.url,
       connect: false,
+      ...(config.maxDelay !== undefined ? { maxDelay: config.maxDelay } : {}),
       onStatus: ({ status }) => {
         // Any departure from Disconnected means the socket's connection lifecycle is now
         // owned (by our lazy connect OR an external `socket.connect()` test seam). Latch
@@ -127,6 +134,16 @@ export class HocuspocusTransport implements TransportPort {
     // Never throws: read the shared socket's status, defaulting to offline once closed.
     if (this.closed) return "offline";
     return toConnStatus(this.socket.status);
+  }
+
+  /**
+   * Force an immediate reconnect attempt, cancelling the current backoff wait (the provider's
+   * `connect()` resets `shouldConnect`). No-op before the first attach (nothing to reconnect)
+   * or after close. Used by the plugin on app-resume/network-online to beat Android's
+   * post-throttle stale connection instead of waiting out the backoff.
+   */
+  kick(): void {
+    if (!this.closed && this.connectInitiated) void this.socket.connect();
   }
 
   onStatus(cb: (s: ConnStatus) => void): Unsubscribe {
