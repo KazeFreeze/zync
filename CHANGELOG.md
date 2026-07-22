@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/KazeFreeze/zync/compare/zync-v0.4.0...zync-v0.4.1) (2026-07-22)
+
+
+### Bug Fixes
+
+* **plugin:** mobile connection resilience — bounded index-sync wait + resume reconnect ([26f2f51](https://github.com/KazeFreeze/zync/commit/26f2f514401e7821f7f7403776f6ae20046deb2a))
+
 ## [0.4.0](https://github.com/KazeFreeze/zync/compare/zync-v0.3.0...zync-v0.4.0) (2026-07-20)
 
 
