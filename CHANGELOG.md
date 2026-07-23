@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.2](https://github.com/KazeFreeze/zync/compare/zync-v0.4.1...zync-v0.4.2) (2026-07-23)
+
+
+### Bug Fixes
+
+* **plugin:** config-sync usability + H1/H2 ([2f7c9a4](https://github.com/KazeFreeze/zync/commit/2f7c9a43c3bef42a758f5f9e73d2293637ccc234))
+
 ## [0.4.1](https://github.com/KazeFreeze/zync/compare/zync-v0.4.0...zync-v0.4.1) (2026-07-22)
 
 
