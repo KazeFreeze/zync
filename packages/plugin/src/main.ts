@@ -29,6 +29,8 @@ import {
 import type { PluginRuntimePort } from "@zync/core";
 import { PortProfiler } from "./profiling.js";
 import { overrideState } from "./plugin-override-state.js";
+import { configDirty, type SyncConfigFlags } from "./config-dirty.js";
+import { PluginReconciler } from "./plugin-reconciler.js";
 import { ConnectionAlert, type AlertCommand } from "./connection-alert.js";
 
 /**
@@ -93,6 +95,11 @@ export default class ZyncPlugin extends Plugin {
   private runtime: PluginRuntimePort | null = null;
   /** Slice 2b: unsubscribe fn for the onPluginsChanged reconciler subscription. */
   private reconcileUnsub: (() => void) | null = null;
+  /** Config-sync categories captured at the last engine start (for the restart-required banner).
+   *  NON-private: the settings tab reads it via this.plugin. */
+  startedSyncConfig: SyncConfigFlags | null = null;
+  /** Serialized live-apply reconciler (fixes the fire-and-forget race). */
+  private reconciler: PluginReconciler | null = null;
   /** Task 8: unsubscribe fn for onPendingUpdates (status-bar refresh). */
   private pendingUpdatesUnsub: (() => void) | null = null;
   /** Task 8: unsubscribe fn for onPluginCodeMaterialized (first-time activation retry / real-update staging). */
@@ -282,6 +289,7 @@ export default class ZyncPlugin extends Plugin {
       const runtime = new ObsidianPluginRuntime(this.app);
       this.runtime = runtime;
 
+      this.startedSyncConfig = { ...this.settings.syncConfig };
       // Slice 2b: construct the community-plugins.json port only when the plugins toggle is on.
       // Gated the same way as configPort (registers a "raw" watcher; no cost when not needed).
       let communityPluginsPort: ObsidianCommunityPlugins | undefined;
@@ -340,6 +348,13 @@ export default class ZyncPlugin extends Plugin {
       // community-plugins.json projection (floor) is already wired inside the engine via the
       // PluginEnabledChannel; this is the fast-path live apply on top of it.
       if (this.settings.syncConfig.plugins) {
+        this.reconciler = new PluginReconciler({
+          desired: () => new Set(engine.desiredActivePlugins()),
+          running: () => new Set(this.runtime?.enabledIds() ?? []),
+          isManaged: (id) => engine.isManaged(id),
+          enable: (id) => this.runtime?.enable(id) ?? Promise.resolve(),
+          disable: (id) => this.runtime?.disable(id) ?? Promise.resolve(),
+        });
         this.reconcileUnsub = engine.onPluginsChanged(() => {
           this.reconcilePlugins();
         });
@@ -441,6 +456,8 @@ export default class ZyncPlugin extends Plugin {
     // runtime — no more app.plugins calls after teardown.
     this.reconcileUnsub?.();
     this.reconcileUnsub = null;
+    this.reconciler = null;
+    this.startedSyncConfig = null;
     // Task 8: unsubscribe the pending-updates + code-materialized listeners before engine.stop()
     // clears their callback sets.
     this.pendingUpdatesUnsub?.();
@@ -649,15 +666,7 @@ export default class ZyncPlugin extends Plugin {
    * ensures the plugin activates after the next Obsidian restart.
    */
   private reconcilePlugins(): void {
-    if (!this.engineReady || this.engine === null || this.runtime === null) return;
-    const desired = new Set(this.engine.desiredActivePlugins());
-    const running = new Set(this.runtime.enabledIds());
-    for (const id of desired) {
-      if (!running.has(id)) void this.runtime.enable(id);
-    }
-    for (const id of running) {
-      if (!desired.has(id) && this.engine.isManaged(id)) void this.runtime.disable(id);
-    }
+    this.reconciler?.reconcile();
   }
 
   // ── settings ───────────────────────────────────────────────────────────────
@@ -725,7 +734,7 @@ export default class ZyncPlugin extends Plugin {
 
   /** Enable/disable data.json sync for a specific plugin. No-op when engine is not yet started. */
   async setPluginSettingsSync(id: string, on: boolean): Promise<void> {
-    this.engine?.setPluginSettingsSync(id, on);
+    await this.engine?.setPluginSettingsSync(id, on);
   }
 }
 
@@ -773,6 +782,25 @@ class ZyncSettingTab extends PluginSettingTab {
   override display(): void {
     const { containerEl } = this;
     containerEl.empty();
+
+    if (
+      this.plugin.startedSyncConfig !== null &&
+      configDirty(this.plugin.startedSyncConfig, this.plugin.settings.syncConfig)
+    ) {
+      const banner = new Setting(containerEl)
+        .setName("⚠ Sync settings changed")
+        .setDesc("Restart sync to apply your changes.");
+      banner.settingEl.addClass("zync-restart-banner");
+      banner.addButton((b) =>
+        b
+          .setButtonText("Restart now")
+          .setCta()
+          .onClick(() => {
+            void this.plugin.restart();
+            new Notice("Zync: restarting…");
+          }),
+      );
+    }
 
     new Setting(containerEl)
       .setName("Relay URL (WebSocket)")

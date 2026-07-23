@@ -542,7 +542,7 @@ function pluginSettingsSync(deps: ControlApiDeps, raw: unknown): JsonResponse {
   const b = raw as { id?: unknown; on?: unknown };
   if (typeof b.id !== "string") throw new HttpError(400, "id is required");
   if (typeof b.on !== "boolean") throw new HttpError(400, "on is required");
-  deps.engine.setPluginSettingsSync(b.id, b.on);
+  void deps.engine.setPluginSettingsSync(b.id, b.on);
   return { status: 200, body: { ok: true } };
 }
 

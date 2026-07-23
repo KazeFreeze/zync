@@ -1502,6 +1502,22 @@ export class SyncEngine {
    * still replicate regardless, so a peer with `plugins` enabled materializes the bundle
    * once its bytes exist (a peer's RoutedManifest re-checks readiness on the opt-in change).
    */
+  /**
+   * Publish a plugin's current data.json (settings) so peers get it on opt-in / settings-sync-on
+   * (H1: the bundle publish never included data.json, so peers got code but not current settings).
+   * No-op when there's no config port/channel, or when this plugin's settings-sync is explicitly
+   * OFF. The ConfigChannel additionally gates publish by the plugin-data category, so this is a
+   * further no-op when that category is disabled on this device.
+   */
+  private async publishPluginData(id: string): Promise<void> {
+    const cfg = this.ports.config;
+    if (cfg === undefined || this.configChannel === undefined) return;
+    if (this.pluginsSettingsSync?.get(id) === false) return; // settings-sync explicitly off for id
+    const dataPath = `.obsidian/plugins/${id}/data.json` as VaultPath;
+    const bytes = await cfg.read(dataPath);
+    if (bytes !== null) await this.configChannel.publish(dataPath, bytes);
+  }
+
   async setPluginOptIn(id: string, optIn: boolean): Promise<void> {
     // Spec D4: `id === "zync"` must never enter pluginsOptIn/pluginsMeta.
     // The zone allow-list already blocks any zync path, but honor the invariant explicitly.
@@ -1553,6 +1569,9 @@ export class SyncEngine {
         if (bytes !== null) await this.configChannel.publish(filePath, bytes);
       }
     }
+    // H1: also publish the plugin's current settings so a peer gets them on opt-in, not only
+    // after the plugin happens to rewrite data.json.
+    await this.publishPluginData(id);
   }
 
   /**
@@ -1584,10 +1603,12 @@ export class SyncEngine {
    * Set whether settings-sync is enabled for a plugin (shared CRDT state).
    * Mirrors `setPluginEnabled` exactly; guards on `pluginsSettingsSync` being non-null.
    */
-  setPluginSettingsSync(id: string, on: boolean): void {
+  async setPluginSettingsSync(id: string, on: boolean): Promise<void> {
     const map = this.pluginsSettingsSync;
     if (map === null) throw new Error("setPluginSettingsSync: engine not started");
     map.set(id, on);
+    // H1: when settings-sync is (re-)enabled for a plugin, publish its current data.json now.
+    if (on) await this.publishPluginData(id);
   }
 
   /** Plugin ids whose settings-sync is explicitly OFF (default is ON = absent from the map). */
