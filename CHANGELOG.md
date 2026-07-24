@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.3](https://github.com/KazeFreeze/zync/compare/zync-v0.4.2...zync-v0.4.3) (2026-07-24)
+
+
+### Bug Fixes
+
+* **plugin:** content-based config-sync echo-gate + loop-breaker ([544e137](https://github.com/KazeFreeze/zync/commit/544e137c90fc762eca046bc2b487189122bd0dc7))
+
 ## [0.4.2](https://github.com/KazeFreeze/zync/compare/zync-v0.4.1...zync-v0.4.2) (2026-07-23)
 
 
