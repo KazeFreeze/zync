@@ -1,7 +1,7 @@
 {
   "id": "zync",
   "name": "Zync",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "minAppVersion": "1.8.8",
   "description": "Self-hosted real-time sync for your vault — CRDT prose + content-addressed blobs against your own server.",
   "author": "KazeFreeze",
