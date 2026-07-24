@@ -111,6 +111,14 @@
   background: rgba(var(--color-green-rgb), 0.15);
   color: var(--color-green);
 }
+.zync-chip[data-kind="plugin-update"] {
+  background: rgba(var(--color-purple-rgb), 0.15);
+  color: var(--color-purple);
+}
+.zync-chip[data-kind="config-file"] {
+  background: rgba(var(--color-cyan-rgb), 0.15);
+  color: var(--color-cyan);
+}
 
 /* Compact buttons */
 .zync-btn {
@@ -215,4 +223,105 @@
 .is-mobile .zync-chevron {
   min-width: 40px;
   min-height: 40px;
+}
+
+/* ── Standardized Notice (covers "Why isn't this file syncing?" and all shared alerts) ── */
+/* Word-first verdict: a Lucide icon + the one-word status, then a detail line,
+   then an optional one-tap fix link. Rendered inside a standard Obsidian Notice. */
+.zync-notice-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: var(--font-semibold);
+}
+.zync-notice-icon {
+  display: inline-flex;
+  align-items: center;
+}
+.zync-notice-icon svg {
+  width: 16px;
+  height: 16px;
+}
+.zync-notice-detail {
+  margin-top: 4px;
+  color: var(--text-muted);
+}
+.zync-notice-action {
+  display: inline-block;
+  margin-top: 8px;
+  cursor: pointer;
+  color: var(--text-accent);
+}
+
+/* Kind accent: color the ICON only (the word stays the primary signal). */
+.zync-notice--success .zync-notice-icon {
+  color: var(--text-success);
+}
+.zync-notice--warning .zync-notice-icon {
+  color: var(--text-warning);
+}
+.zync-notice--error .zync-notice-icon {
+  color: var(--text-error);
+}
+.zync-notice--info .zync-notice-icon {
+  color: var(--text-muted);
+}
+/* Mobile: a comfortable tap target for the action link (matches the .zync-chevron precedent). */
+.is-mobile .zync-notice-action {
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+}
+
+/* Status bar: Lucide icon segments (replaces the emoji glyphs). */
+.zync-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.zync-status-seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.zync-status-seg .svg-icon {
+  width: 14px;
+  height: 14px;
+}
+.zync-status--muted {
+  color: var(--text-muted);
+}
+.zync-status--error {
+  color: var(--text-error);
+}
+/* Restart-required settings banner: a warning left-border accent (matches .zync-section-notice). */
+.zync-restart-banner {
+  border-left: 3px solid var(--text-warning);
+  padding-left: 10px;
+}
+.zync-restart-icon {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 6px;
+  color: var(--text-warning);
+}
+.zync-restart-icon .svg-icon {
+  width: 15px;
+  height: 15px;
+}
+
+/* Compact icon variant of an inline link (per-row Open actions in the inbox). */
+.zync-icon-link {
+  display: inline-flex;
+  align-items: center;
+  vertical-align: middle;
+}
+.zync-icon-link .svg-icon {
+  width: 15px;
+  height: 15px;
+}
+.is-mobile .zync-icon-link {
+  min-width: 40px;
+  min-height: 40px;
+  justify-content: center;
 }

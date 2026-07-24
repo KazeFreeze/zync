@@ -13,10 +13,10 @@ export interface Classification {
   notice?: string;
 }
 
-const PROSE_EXT = new Set(["md", "markdown", "txt"]);
+export const PROSE_EXT = new Set(["md", "markdown", "txt"]);
 const STRUCTURED_EXT = new Set(["canvas", "base", "json"]);
 
-function ext(path: string): string {
+export function ext(path: string): string {
   const i = path.lastIndexOf(".");
   return i < 0 ? "" : path.slice(i + 1).toLowerCase();
 }

@@ -14,13 +14,13 @@ export const DEBOUNCE_MS = 4000;
 export const FLAP_WINDOW_MS = 5 * 60_000;
 export const FLAP_THRESHOLD = 3;
 export const STABILITY_MS = 60_000;
-export const MSG_OFFLINE = "Zync offline — will sync when reconnected.";
-export const MSG_UNSTABLE = "Zync: connection unstable";
+
+export type AlertVariant = "offline" | "unstable";
 
 export type AlertCommand =
-  | { kind: "showSticky"; message: string }
+  | { kind: "showSticky"; variant: AlertVariant }
   | { kind: "hideSticky" }
-  | { kind: "toast"; message: string; durationMs: number }
+  | { kind: "toast"; pending: number }
   | { kind: "setTimer"; atMs: number | null };
 
 export interface AlertDeps {
@@ -81,10 +81,7 @@ export class ConnectionAlert {
       this.stickyUp = false;
     }
     if (this.outageVisible && !this.unstable) {
-      const n = this.d.pending();
-      const message =
-        n > 0 ? `Zync reconnected · flushing ${String(n)} pending` : "Zync reconnected";
-      this.d.emit({ kind: "toast", message, durationMs: 2500 });
+      this.d.emit({ kind: "toast", pending: this.d.pending() });
     }
     this.outageVisible = false;
     this.dismissed = false;
@@ -100,6 +97,6 @@ export class ConnectionAlert {
     this.stickyUp = true;
     this.outageVisible = true;
     this.d.emit({ kind: "setTimer", atMs: null }); // we're showing now; drop the debounce
-    this.d.emit({ kind: "showSticky", message: this.unstable ? MSG_UNSTABLE : MSG_OFFLINE });
+    this.d.emit({ kind: "showSticky", variant: this.unstable ? "unstable" : "offline" });
   }
 }

@@ -13,6 +13,7 @@ import type {
   DeviceId,
   DocId,
   Sha256,
+  Stamp,
   Unsubscribe,
   VaultEvent,
   VaultPath,
@@ -57,6 +58,7 @@ import { applyBootstrap } from "./protocol/bootstrap.js";
 import { supervisedImport } from "./conflicts/supervised-import.js";
 import { orphanSweep, orphanRecoveryPath, type OrphanMeta } from "./protocol/orphan-sweep.js";
 import { makeStamp, stampHash, stampsEqual } from "./protocol/stamp.js";
+import { isDocStampPending } from "./protocol/doc-pending.js";
 import { BlobEngine, type BlobFetchPolicy, type BlobManifestEntry } from "./blobs/blob-engine.js";
 import { Inbox } from "./conflicts/inbox.js";
 import { withConflictSuffix, writeConflictArtifact } from "./conflicts/artifact.js";
@@ -69,6 +71,12 @@ import { canonicalizeProse, sha256OfBytes, sha256OfText } from "./hash.js";
 import { diffToEdits, merge3 } from "./bridge/merge.js";
 import { reconnectHealJitterMs } from "./reconnect-jitter.js";
 import { awaitWithinBudget } from "./await-budget.js";
+import {
+  explainSync,
+  resolveLiveState,
+  isProseExtension,
+  type SyncExplanation,
+} from "./classify/explain-sync.js";
 
 export interface EnginePorts {
   vault: VaultPort;
@@ -1920,6 +1928,63 @@ export class SyncEngine {
     return true;
   }
 
+  /** A live entry's current on-disk content hash (null if the file is absent). */
+  private async diskStampOf(path: VaultPath): Promise<Stamp | null> {
+    const bytes = await this.ports.vault.read(path);
+    return bytes === null
+      ? null
+      : makeStamp(await sha256OfBytes(bytes), this.ports.identity.deviceId());
+  }
+
+  /** Per-live-entry pending check shared with pendingDocs(): stamp != synced OR disk != stamp. */
+  private async isDocPending(path: VaultPath, entry: TreeEntry): Promise<boolean> {
+    const synced = await this.ports.engineState.getSyncedStamp(entry.docId);
+    return isDocStampPending(entry.stamp, synced, await this.diskStampOf(path));
+  }
+
+  /**
+   * O(1)-per-path pending check for the sync-status explainer (NOT the O(n) pendingDocs scan).
+   * false for an untracked/tombstoned path (those are answered by the explainer's other arms).
+   * NOTE (accepted): does not consult the sub-second rename txn/buffer windows — a file mid-rename may
+   * briefly read "synced"; the disk state is genuinely fine and pendingDocs() still gates convergence.
+   */
+  async isPathPending(path: VaultPath): Promise<boolean> {
+    const entry = this.index.get(path);
+    if (entry === undefined || entry.deleted === true) return false;
+    if (await this.isDocPending(path, entry)) return true;
+    return (await this.ports.engineState.listDirty()).includes(entry.docId);
+  }
+
+  /**
+   * Explain the sync status of a single path for the active-file transparency command. READ-ONLY,
+   * O(1)-per-path. Resolves per-plane live status (prose via the index; blobs via the blob manifest)
+   * and defers ALL decision/copy to the pure resolveLiveState() + explainSync().
+   */
+  async explain(path: VaultPath): Promise<SyncExplanation> {
+    const conn = this.ports.transport.status();
+    const entry = this.index.get(path);
+    const hasLiveIndexEntry = entry !== undefined && entry.deleted !== true;
+    const indexPending = hasLiveIndexEntry ? await this.isPathPending(path) : false;
+    const blobEntry = hasLiveIndexEntry ? undefined : this.blobEngine.manifestEntry(path);
+    const hasBlobEntry = blobEntry !== undefined;
+    const blobOnDisk = hasBlobEntry ? (await this.ports.vault.read(path)) !== null : false;
+    const { plane, live, demotedProse } = resolveLiveState({
+      hasLiveIndexEntry,
+      indexPending,
+      hasBlobEntry,
+      blobOnDisk,
+      isProseExt: isProseExtension(path),
+    });
+    return explainSync(path, {
+      zyncStorePrefix: this.caps.configDir,
+      obsidianConfigPrefix: ".obsidian/",
+      plane,
+      live,
+      demotedProse,
+      conn,
+    });
+  }
+
   /**
    * Docs whose tree stamp ≠ synced stamp, unioned with the dirty set, unioned with
    * UNAPPLIED DELETES (0b-2 Task 1): a tombstoned entry whose path STILL has a local
@@ -1929,22 +1994,10 @@ export class SyncEngine {
   async pendingDocs(): Promise<DocId[]> {
     const pending = new Set<DocId>();
     for (const [path, entry] of this.index.liveEntries()) {
-      const synced = await this.ports.engineState.getSyncedStamp(entry.docId);
-      if (!stampsEqual(entry.stamp, synced)) pending.add(entry.docId);
-      // UNMATERIALIZED CONTENT (0b-2 Task 2, C3): a LIVE entry whose ON-DISK content
-      // hash ≠ the entry's stamp hash has not reached disk yet. This catches the
-      // resurrection-RECEIVER race: a device with no local file gets the now-live
-      // index entry and the resurrected note-doc content as TWO independent CRDT
-      // docs; if the note update is applied while the index is still tombstoned,
-      // outbound skips the write — without this check the device would falsely
-      // report quiescence with an EMPTY/STALE file. Pending here keeps
-      // `waitConverged` looping until structural reconcile materializes the content.
-      const bytes = await this.ports.vault.read(path);
-      const diskHash =
-        bytes === null
-          ? null
-          : makeStamp(await sha256OfBytes(bytes), this.ports.identity.deviceId());
-      if (!stampsEqual(entry.stamp, diskHash)) pending.add(entry.docId);
+      // Pending iff the stamp differs from the synced stamp (not yet acked) OR from the on-disk
+      // content hash (UNMATERIALIZED CONTENT, 0b-2 Task 2 C3: a live entry whose on-disk hash ≠ its
+      // stamp hasn't reached disk yet — keeps waitConverged looping until reconcile materializes it).
+      if (await this.isDocPending(path, entry)) pending.add(entry.docId);
     }
     for (const dirty of await this.ports.engineState.listDirty()) pending.add(dirty);
     for (const [path, entry] of this.index.entries()) {

@@ -175,6 +175,11 @@ export class BlobEngine {
     return this.#deps.manifest.entries().map(([k, v]) => [k as VaultPath, v]);
   }
 
+  /** Read-only per-path manifest lookup (for the sync-status explainer). Never mutates. */
+  manifestEntry(path: VaultPath): BlobManifestEntry | undefined {
+    return this.#deps.manifest.get(path);
+  }
+
   /**
    * Observe the manifest and DRIVE the bounded {@link BlobFetchQueue} for eager
    * fetches. Returns the unsubscribe (which also stops the queue).

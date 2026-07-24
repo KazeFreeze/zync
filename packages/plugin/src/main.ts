@@ -1,4 +1,4 @@
-import { Plugin, Platform, PluginSettingTab, Setting, Notice, type App } from "obsidian";
+import { Plugin, Platform, PluginSettingTab, Setting, Notice, setIcon, type App } from "obsidian";
 import {
   SyncEngine,
   isActionableConflict,
@@ -6,6 +6,8 @@ import {
   type ClockPort,
   type DeviceId,
   type IdentityPort,
+  type VaultPath,
+  type SyncExplanation,
 } from "@zync/core";
 import { ConflictInboxModal } from "./conflict-inbox-modal.js";
 import { PendingUpdatesModal } from "./pending-updates-modal.js";
@@ -32,6 +34,8 @@ import { overrideState } from "./plugin-override-state.js";
 import { configDirty, type SyncConfigFlags } from "./config-dirty.js";
 import { PluginReconciler } from "./plugin-reconciler.js";
 import { ConnectionAlert, type AlertCommand } from "./connection-alert.js";
+import { notify, notifyInfo, notifyWarning, notifyError } from "./notify.js";
+import { explainNotifyProps, type NotifyAction } from "./notify-model.js";
 
 /**
  * Zync plugin — M1 desktop walking skeleton (M1-T5 wiring).
@@ -83,6 +87,11 @@ const MAX_PROSE_BYTES = 1_000_000;
  */
 const STATUS_POLL_INTERVAL_MS = 8_000;
 
+/** The standard "Restarting" toast, fired by every restart trigger. */
+function notifyRestarting(): void {
+  notify({ kind: "info", icon: "refresh-cw", title: "Restarting", durationMs: 4000 });
+}
+
 export default class ZyncPlugin extends Plugin {
   override settings: ZyncSettings = { ...DEFAULT_SETTINGS };
 
@@ -118,6 +127,9 @@ export default class ZyncPlugin extends Plugin {
   /** Last computed pending count — rendered immediately on a connText push so a status change is
    *  reflected without waiting for the next (coarse, possibly skipped) expensive scan. */
   private lastPending = 0;
+  /** Render memo key for the status bar — prevents redundant DOM rebuilds (renderStatus runs 2x per
+   *  8s poll + on every connection push). Null forces the first render. */
+  private lastStatusKey: string | null = null;
   private readonly unsubs: (() => void)[] = [];
   private connText = "offline";
   private lastConflictCount = 0;
@@ -130,6 +142,10 @@ export default class ZyncPlugin extends Plugin {
   private alert: ConnectionAlert | null = null;
   private stickyNotice: Notice | null = null;
   private alertTimer: number | null = null;
+  /** Single replace-in-place sticky for the "items need attention" warning (no stacking). */
+  private conflictNotice: Notice | null = null;
+  /** Single replace-in-place sticky for the loop-breaker "paused" warning. */
+  private loopNotice: Notice | null = null;
   /** Bumped on every start AND every stop; a start whose gen is stale was superseded (cancelled). */
   private startGen = 0;
 
@@ -197,7 +213,7 @@ export default class ZyncPlugin extends Plugin {
         const report = this.profiler?.report() ?? "Zync: profiler inactive (engine not started).";
         // eslint-disable-next-line no-console
         console.log(report);
-        new Notice("Zync: bootstrap profile dumped to the developer console (Ctrl+Shift+I).");
+        notifyInfo("Dumped", "Bootstrap profile written to the developer console (Ctrl+Shift+I).");
       },
     });
 
@@ -205,7 +221,21 @@ export default class ZyncPlugin extends Plugin {
       id: "zync-show-status",
       name: "Zync: show status",
       callback: () => {
-        new Notice(this.currentStatusText(), 4000);
+        notify({
+          kind: "info",
+          icon: "info",
+          title: "Zync status",
+          detail: this.currentStatusText(),
+          durationMs: 4000,
+        });
+      },
+    });
+
+    this.addCommand({
+      id: "zync-explain-sync", // STABLE id — never change (breaks saved hotkeys)
+      name: "Zync: why isn't this file syncing?",
+      callback: () => {
+        void this.explainActiveFile();
       },
     });
 
@@ -243,7 +273,13 @@ export default class ZyncPlugin extends Plugin {
     if (this.settings.serverWs === "") {
       this.connText = "not configured";
       this.renderStatus(0);
-      new Notice("Zync: set the relay URL in Settings → Zync to start syncing.");
+      notify({
+        kind: "info",
+        title: "Setup needed",
+        detail: "Set the relay URL in Settings → Zync to start syncing.",
+        durationMs: 0,
+        action: { label: "Open settings", run: () => this.openZyncSettings() },
+      });
       return;
     }
 
@@ -372,9 +408,11 @@ export default class ZyncPlugin extends Plugin {
           else this.reconcilePlugins();
         });
         this.configLoopUnsub = engine.onConfigLoopDetected((path) => {
-          new Notice(
-            `Zync paused syncing "${path}" — a rapid update loop was detected. Consider excluding it (Settings → Synced plugins).`,
-            10000,
+          this.loopNotice?.hide();
+          this.loopNotice = notifyWarning(
+            "Paused",
+            `Zync paused syncing "${path}". A rapid update loop was detected.`,
+            { label: "Open settings", run: () => this.openZyncSettings() },
           );
         });
         this.pluginDataMatUnsub = engine.onPluginDataMaterialized((id) => {
@@ -428,11 +466,9 @@ export default class ZyncPlugin extends Plugin {
       console.error("[zync] failed to start engine:", err);
       this.connText = "error";
       this.renderStatus(0);
-      const msg = `Zync: failed to start. ${err instanceof Error ? err.message : String(err)} — tap to retry.`;
-      const notice = new Notice(msg, 0);
-      notice.noticeEl.addEventListener("click", () => {
-        notice.hide();
-        void this.startEngine();
+      notifyError("Failed to start", err instanceof Error ? err.message : String(err), {
+        label: "Retry",
+        run: () => void this.startEngine(),
       });
       await this.stopEngine();
     }
@@ -476,6 +512,10 @@ export default class ZyncPlugin extends Plugin {
     this.pluginDataMatUnsub = null;
     this.configLoopUnsub?.();
     this.configLoopUnsub = null;
+    this.loopNotice?.hide();
+    this.loopNotice = null;
+    this.conflictNotice?.hide();
+    this.conflictNotice = null;
     this.runtime = null;
     if (this.engine !== null) {
       try {
@@ -544,26 +584,101 @@ export default class ZyncPlugin extends Plugin {
   }
 
   private renderStatus(pending: number): void {
-    // blobProgress() and inbox are only valid once start() completes; onStatus can drive
-    // renderStatus mid-start, so gate both reads on engineReady (else they throw on undefined).
+    const el = this.statusBar;
+    if (el === null) return;
     const engine = this.engineReady ? this.engine : null;
     const b = engine?.blobProgress();
     const files =
       b && b.total > 0 && b.materialized < b.total
-        ? ` · Files ${String(Math.min(b.materialized, b.total))}/${String(b.total)}` +
-          (b.failed > 0 ? ` (${String(b.failed)} failed)` : "")
-        : "";
+        ? { done: Math.min(b.materialized, b.total), total: b.total, failed: b.failed }
+        : null;
     const nConf = engine ? engine.inbox.list().filter(isActionableConflict).length : 0;
-    const conf = nConf > 0 ? ` · ⚠ ${String(nConf)}` : "";
-    // Task 8: append ⟳ N when there are staged plugin-code updates waiting to be applied.
     const nUpdates = engine ? engine.pendingPluginUpdates().length : 0;
-    const updates = nUpdates > 0 ? ` · ⟳ ${String(nUpdates)}` : "";
-    this.statusBar?.setText(this.statusText(pending, files, conf, updates));
+
+    // Render memo: renderStatus runs 2x per 8s poll + on every connection push. Skip the DOM
+    // rebuild when the rendered state is unchanged (kills ~95% of the churn / any flicker).
+    const key = [
+      this.connText,
+      pending,
+      files ? `${String(files.done)}/${String(files.total)}/${String(files.failed)}` : "",
+      nConf,
+      nUpdates,
+    ].join("|");
+    if (key === this.lastStatusKey) return;
+    this.lastStatusKey = key;
+
+    el.empty();
+    el.addClass("zync-status");
+    const seg = (icon: string, text: string, modifier?: string): void => {
+      const s = el.createSpan({
+        cls: modifier ? ["zync-status-seg", modifier] : "zync-status-seg",
+      });
+      setIcon(s, icon);
+      s.createSpan({ text });
+    };
+
+    if (this.connText === "connected") seg("check-circle", "connected");
+    else if (this.connText === "connecting") seg("refresh-cw", "connecting", "zync-status--muted");
+    else if (this.connText === "error") seg("x-circle", "error", "zync-status--error");
+    else seg("wifi-off", this.connText, "zync-status--muted"); // offline / not configured / other
+    if (pending > 0) seg("clock", `${String(pending)} pending`);
+    if (files !== null)
+      seg(
+        "download",
+        `Files ${String(files.done)}/${String(files.total)}` +
+          (files.failed > 0 ? ` (${String(files.failed)} failed)` : ""),
+      );
+    if (nConf > 0) seg("alert-triangle", String(nConf), "zync-status--error");
+    if (nUpdates > 0) seg("refresh-cw", String(nUpdates));
   }
 
   /** Compose the status line (shared by the desktop status bar and the "Zync: show status" command). */
   private statusText(pending: number, files: string, conf: string, updates: string): string {
     return `Zync: ${this.connText}${pending > 0 ? ` · ${String(pending)} pending` : ""}${files}${conf}${updates}`;
+  }
+
+  private async explainActiveFile(): Promise<void> {
+    const file = this.app.workspace.getActiveFile();
+    if (file === null) {
+      notifyInfo("Open a file", "Open a file first, then run this.");
+      return;
+    }
+    if (!this.engineReady || this.engine === null) {
+      notify({
+        kind: "info",
+        title: "Not running",
+        detail: "Set a relay URL in Settings → Zync.",
+        durationMs: 0,
+        action: { label: "Open settings", run: () => this.openZyncSettings() },
+      });
+      return;
+    }
+    this.showExplanation(await this.engine.explain(file.path as VaultPath));
+  }
+
+  /**
+   * Render a sync-status verdict as a rich Notice: a Lucide icon + the one-word status (the primary
+   * signal), a detail line, and — when the verdict offers one — a one-tap fix link. The happy-path
+   * "Synced" auto-dismisses (~4s); problem verdicts are sticky (tap to close) so they stay readable,
+   * notably on mobile where a transient toast is easily missed while the keyboard is up.
+   */
+  private showExplanation(ex: SyncExplanation): void {
+    const { kind, icon, durationMs } = explainNotifyProps(ex.status);
+    const action: NotifyAction | undefined =
+      ex.action === "reverify"
+        ? {
+            label: "Re-verify sync",
+            run: () => this.runCommand("zync-reflush"),
+          }
+        : undefined;
+    notify({
+      kind,
+      icon,
+      durationMs,
+      title: ex.title,
+      detail: ex.detail,
+      ...(action !== undefined && { action }),
+    });
   }
 
   /** Full current status line from live state — for the on-demand "Zync: show status" command. */
@@ -576,30 +691,52 @@ export default class ZyncPlugin extends Plugin {
           (b.failed > 0 ? ` (${String(b.failed)} failed)` : "")
         : "";
     const nConf = engine ? engine.inbox.list().filter(isActionableConflict).length : 0;
-    const conf = nConf > 0 ? ` · ⚠ ${String(nConf)}` : "";
+    const conf = nConf > 0 ? ` · ${String(nConf)} conflict${nConf === 1 ? "" : "s"}` : "";
     const nUpdates = engine ? engine.pendingPluginUpdates().length : 0;
-    const updates = nUpdates > 0 ? ` · ⟳ ${String(nUpdates)}` : "";
+    const updates = nUpdates > 0 ? ` · ${String(nUpdates)} update${nUpdates === 1 ? "" : "s"}` : "";
     return this.statusText(this.lastPending, files, conf, updates);
   }
 
   /** Execute a ConnectionAlert command as Obsidian Notices/timers (mobile only). */
   private execAlert(cmd: AlertCommand): void {
     switch (cmd.kind) {
-      case "showSticky":
+      case "showSticky": {
         this.stickyNotice?.hide();
-        this.stickyNotice = new Notice(cmd.message, 0);
-        this.stickyNotice.noticeEl.addEventListener("click", () => {
+        const n =
+          cmd.variant === "unstable"
+            ? notify({
+                kind: "warning",
+                icon: "alert-triangle",
+                title: "Unstable",
+                detail: "Connection is unstable.",
+              })
+            : notify({
+                kind: "warning",
+                icon: "wifi-off",
+                title: "Offline",
+                detail: "Zync will sync when reconnected.",
+              });
+        // Preserve the body-tap dismiss: a tap anywhere on the sticky must inform ConnectionAlert,
+        // else stickyUp/dismissed desync from the screen.
+        n.noticeEl.addEventListener("click", () => {
           this.stickyNotice?.hide();
           this.stickyNotice = null;
           this.alert?.onDismiss();
         });
+        this.stickyNotice = n;
         break;
+      }
       case "hideSticky":
         this.stickyNotice?.hide();
         this.stickyNotice = null;
         break;
       case "toast":
-        new Notice(cmd.message, cmd.durationMs);
+        notify({
+          kind: "success",
+          title: "Reconnected",
+          ...(cmd.pending > 0 && { detail: `Flushing ${String(cmd.pending)} pending.` }),
+          durationMs: 2500,
+        });
         break;
       case "setTimer":
         if (this.alertTimer !== null) {
@@ -618,18 +755,42 @@ export default class ZyncPlugin extends Plugin {
   }
 
   private refreshConflictNotice(): void {
-    // Notice ONLY when the actionable count GROWS, so churn/FYIs don't spam escalating popups.
     const n = this.engine?.inbox.list().filter(isActionableConflict).length ?? 0;
     if (n > this.lastConflictCount) {
-      new Notice(`Zync: ${String(n)} item(s) need attention. Click the status bar.`);
+      this.conflictNotice?.hide();
+      this.conflictNotice = notifyWarning(
+        "Needs attention",
+        `${String(n)} item${n === 1 ? " needs" : "s need"} attention.`,
+        { label: "Open inbox", run: () => this.openInbox() },
+      );
+    }
+    if (n === 0 && this.conflictNotice !== null) {
+      this.conflictNotice.hide();
+      this.conflictNotice = null;
     }
     this.lastConflictCount = n;
-    this.renderStatus(this.lastPending); // push the badge without waiting for the coarse poll
+    this.renderStatus(this.lastPending);
+  }
+
+  /** Run an Obsidian command by id (the command bus is untyped in the public API). */
+  private runCommand(id: string): void {
+    (
+      this.app as unknown as { commands: { executeCommandById: (id: string) => void } }
+    ).commands.executeCommandById(id);
+  }
+
+  /** Open this plugin's settings tab. */
+  private openZyncSettings(): void {
+    const s = (
+      this.app as unknown as { setting: { open: () => void; openTabById: (id: string) => void } }
+    ).setting;
+    s.open();
+    s.openTabById(this.manifest.id);
   }
 
   private openInbox(): void {
     if (this.engine === null) {
-      new Notice("Zync: sync not started.");
+      notifyInfo("Not started", "Sync hasn't started yet.");
       return;
     }
     new ConflictInboxModal(this.app, this.engine).open();
@@ -640,7 +801,7 @@ export default class ZyncPlugin extends Plugin {
     const engine = this.engine;
     const runtime = this.runtime;
     if (engine === null) {
-      new Notice("Zync: sync not started.");
+      notifyInfo("Not started", "Sync hasn't started yet.");
       return;
     }
     new PendingUpdatesModal(this.app, engine, (id) => {
@@ -648,7 +809,14 @@ export default class ZyncPlugin extends Plugin {
         // No live runtime — the staged bytes are already on disk, so a restart applies them.
         // ALWAYS clear the marker so the entry never sticks forever, then nudge the user to reload.
         engine.clearPluginUpdate(id);
-        new Notice(`Zync: could not live-reload ${id}. Restart Obsidian to apply the update.`);
+        notifyError(
+          "Reload needed",
+          `Could not live-reload ${id}. Restart Obsidian to apply the update.`,
+          {
+            label: "Reload Obsidian",
+            run: () => this.runCommand("app:reload"),
+          },
+        );
         return;
       }
       // Disable then re-enable to live-reload the plugin with its newly-materialized code.
@@ -659,7 +827,14 @@ export default class ZyncPlugin extends Plugin {
         .catch(() => {
           // Degrade gracefully — the staged bytes are already on disk, so a full restart works.
           engine.clearPluginUpdate(id);
-          new Notice(`Zync: could not live-reload ${id}. Restart Obsidian to apply the update.`);
+          notifyError(
+            "Reload needed",
+            `Could not live-reload ${id}. Restart Obsidian to apply the update.`,
+            {
+              label: "Reload Obsidian",
+              run: () => this.runCommand("app:reload"),
+            },
+          );
         });
     }).open();
   }
@@ -798,16 +973,19 @@ class ZyncSettingTab extends PluginSettingTab {
       configDirty(this.plugin.startedSyncConfig, this.plugin.settings.syncConfig)
     ) {
       const banner = new Setting(containerEl)
-        .setName("⚠ Sync settings changed")
+        .setName("Restart needed")
         .setDesc("Restart sync to apply your changes.");
       banner.settingEl.addClass("zync-restart-banner");
+      const bIcon = createSpan({ cls: "zync-restart-icon" });
+      setIcon(bIcon, "alert-triangle");
+      banner.nameEl.prepend(bIcon);
       banner.addButton((b) =>
         b
           .setButtonText("Restart now")
           .setCta()
           .onClick(() => {
             void this.plugin.restart();
-            new Notice("Zync: restarting…");
+            notifyRestarting();
           }),
       );
     }
@@ -912,7 +1090,7 @@ class ZyncSettingTab extends PluginSettingTab {
           .setCta()
           .onClick(() => {
             void this.plugin.restart();
-            new Notice("Zync: restarting…");
+            notifyRestarting();
           }),
       );
   }

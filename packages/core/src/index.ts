@@ -8,6 +8,18 @@ export {
 } from "./errors.js";
 export { classify } from "./classify/classify.js";
 export type { Route, Caps, Classification } from "./classify/classify.js";
+export { explainSync, resolveLiveState, isProseExtension } from "./classify/explain-sync.js";
+export type {
+  SyncExplanation,
+  SyncStatus,
+  ExcludeReason,
+  ExplainAction,
+  ExplainFacts,
+  LiveInputs,
+  LivePlane,
+  LiveState,
+  ConnState,
+} from "./classify/explain-sync.js";
 export {
   CONFIG_ZONE_PREFIXES,
   COMMUNITY_PLUGINS_PATH,

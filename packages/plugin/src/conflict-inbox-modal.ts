@@ -1,4 +1,5 @@
-import { Modal, Notice, TFile, setIcon, type App } from "obsidian";
+import { Modal, TFile, setIcon, setTooltip, type App } from "obsidian";
+import { notify, notifySuccess, notifyInfo, notifyError } from "./notify.js";
 import {
   SyncEngine,
   describeInboxEntry,
@@ -157,9 +158,8 @@ export class ConflictInboxModal extends Modal {
       this.button(act, f.keepCurrent, "keep-current", entry, { cta: true });
       this.button(act, f.keepBackup, "keep-backup", entry, {});
       sub.createSpan({ text: `${f.sub} ` });
-      this.link(sub, f.openCurrent, "open-current", entry);
-      sub.createSpan({ cls: "zync-dot", text: "·" });
-      this.link(sub, f.openBackup, "open-backup", entry);
+      this.iconLink(sub, "cloud", f.openCurrent, "open-current", entry);
+      this.iconLink(sub, "hard-drive", f.openBackup, "open-backup", entry);
       sub.createSpan({ cls: "zync-dot", text: "·" });
       this.link(sub, "Leave for now", "acknowledge", entry);
       return;
@@ -169,8 +169,8 @@ export class ConflictInboxModal extends Modal {
     sub.createSpan({ text: `${view.title} ` });
     for (const spec of view.actions) {
       if (spec.action === "open-current" || spec.action === "open-backup") {
-        this.link(sub, spec.label, spec.action, entry);
-        sub.createSpan({ cls: "zync-dot", text: "·" });
+        const icon = spec.action === "open-current" ? "cloud" : "hard-drive";
+        this.iconLink(sub, icon, spec.label, spec.action, entry);
       } else {
         this.button(act, spec.label, spec.action, entry, {
           cta: spec.primary === true,
@@ -202,6 +202,24 @@ export class ConflictInboxModal extends Modal {
     };
   }
 
+  /** A compact icon variant of {@link link} — the label becomes the tooltip + aria-label. */
+  private iconLink(
+    parent: HTMLElement,
+    iconName: string,
+    tooltip: string,
+    action: EntryAction,
+    entry: InboxEntry,
+  ): void {
+    const a = parent.createEl("a", { cls: "zync-inline-link zync-icon-link", href: "#" });
+    setIcon(a, iconName);
+    setTooltip(a, tooltip);
+    a.setAttribute("aria-label", tooltip);
+    a.onclick = (e) => {
+      e.preventDefault();
+      void this.act(action, entry.id, entry.path, entry.artifactPath);
+    };
+  }
+
   private async bulkKeepSynced(ids: string[]): Promise<void> {
     let ok = 0;
     for (const id of ids) {
@@ -212,14 +230,18 @@ export class ConflictInboxModal extends Modal {
         // skip an entry that raced away / lost its artifact; the count reflects what applied.
       }
     }
-    new Notice(`Zync: kept the synced copy for ${String(ok)} conflict${ok === 1 ? "" : "s"}.`);
+    notifySuccess(
+      "Kept synced",
+      `Kept the synced copy for ${String(ok)} conflict${ok === 1 ? "" : "s"}.`,
+    );
     this.render();
   }
 
   private bulkDismiss(ids: string[]): void {
     for (const id of ids) this.engine.inbox.resolve(id);
-    new Notice(
-      `Zync: cleared ${String(ids.length)} item${ids.length === 1 ? "" : "s"} from the inbox.`,
+    notifySuccess(
+      "Cleared",
+      `Cleared ${String(ids.length)} item${ids.length === 1 ? "" : "s"} from the inbox.`,
     );
     this.render();
   }
@@ -269,11 +291,16 @@ export class ConflictInboxModal extends Modal {
       this.render(); // observe() also fires, but re-render immediately for responsiveness.
     } catch (err) {
       if (err instanceof ArtifactNotLocalError) {
-        new Notice("Zync: that backup lives on another device. Open it there to choose.");
+        notify({
+          kind: "info",
+          title: "On another device",
+          detail: "That backup lives on another device. Open it there to choose.",
+          durationMs: 0,
+        });
         this.render();
         return;
       }
-      new Notice(`Zync: could not resolve. ${err instanceof Error ? err.message : String(err)}`);
+      notifyError("Could not resolve", err instanceof Error ? err.message : String(err));
     }
   }
 
@@ -284,11 +311,11 @@ export class ConflictInboxModal extends Modal {
         .getLeaf(false)
         .openFile(f)
         .catch(() => {
-          new Notice(`Zync: could not open ${path}.`);
+          notifyError("Could not open", `Could not open ${path}.`);
         });
       this.close();
     } else {
-      new Notice(`Zync: ${path} is not on this device.`);
+      notifyInfo("Not here", `${path} is not on this device.`);
     }
   }
 }

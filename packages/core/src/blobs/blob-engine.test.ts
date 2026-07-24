@@ -506,6 +506,17 @@ describe("BlobEngine.materialize — injected identitySha (canonical plugin-data
   });
 });
 
+describe("BlobEngine.manifestEntry (per-path manifest lookup)", () => {
+  it("manifestEntry(path) returns the entry for a present path, undefined otherwise", async () => {
+    const h = makeEngine("lazy");
+    const sha = await sha256OfBytes(PNG);
+    h.manifest.set("img/a.png", { sha256: sha, size: PNG.length, deviceId: DEV_A });
+
+    expect(h.engine.manifestEntry("img/a.png" as VaultPath)?.sha256).toBeDefined();
+    expect(h.engine.manifestEntry("img/missing.png" as VaultPath)).toBeUndefined();
+  });
+});
+
 describe("BlobEngine.start (observe → drive eager fetches)", () => {
   it("eager engine auto-materializes when a manifest entry is observed", async () => {
     const h = makeEngine("eager");

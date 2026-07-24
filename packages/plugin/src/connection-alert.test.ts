@@ -3,8 +3,6 @@ import {
   ConnectionAlert,
   DEBOUNCE_MS,
   STABILITY_MS,
-  MSG_OFFLINE,
-  MSG_UNSTABLE,
   type AlertCommand,
 } from "./connection-alert.js";
 
@@ -41,7 +39,7 @@ describe("ConnectionAlert", () => {
     expect(h.kinds()).toEqual(["setTimer"]);
     h.advance(DEBOUNCE_MS);
     h.alert.onTimer();
-    expect(h.cmds).toContainEqual({ kind: "showSticky", message: MSG_OFFLINE });
+    expect(h.cmds).toContainEqual({ kind: "showSticky", variant: "offline" });
   });
 
   it("reconnect before the debounce shows nothing", () => {
@@ -56,7 +54,7 @@ describe("ConnectionAlert", () => {
   it("edit while disconnected bypasses the debounce and shows immediately", () => {
     h.alert.onConn(false);
     h.alert.onEdit();
-    expect(h.cmds).toContainEqual({ kind: "showSticky", message: MSG_OFFLINE });
+    expect(h.cmds).toContainEqual({ kind: "showSticky", variant: "offline" });
   });
 
   it("only one sticky per outage", () => {
@@ -83,7 +81,7 @@ describe("ConnectionAlert", () => {
     h.alert.onConn(false);
     h.alert.onEdit();
     h.alert.onConn(true);
-    expect(h.cmds).toContainEqual({ kind: "toast", message: "Zync reconnected", durationMs: 2500 });
+    expect(h.cmds).toContainEqual({ kind: "toast", pending: 0 });
     // outage WITHOUT sticky (reconnect before debounce)
     const h2 = harness();
     h2.alert.onConn(false);
@@ -96,11 +94,7 @@ describe("ConnectionAlert", () => {
     hp.alert.onConn(false);
     hp.alert.onEdit();
     hp.alert.onConn(true);
-    expect(hp.cmds).toContainEqual({
-      kind: "toast",
-      message: "Zync reconnected · flushing 3 pending",
-      durationMs: 2500,
-    });
+    expect(hp.cmds).toContainEqual({ kind: "toast", pending: 3 });
   });
 
   it("flap storm flips to unstable and suppresses the recovery toast", () => {
@@ -110,7 +104,7 @@ describe("ConnectionAlert", () => {
       h.alert.onConn(true);
     }
     const lastSticky = h.cmds.filter((c) => c.kind === "showSticky").at(-1);
-    expect(lastSticky).toEqual({ kind: "showSticky", message: MSG_UNSTABLE });
+    expect(lastSticky).toEqual({ kind: "showSticky", variant: "unstable" });
     // the 3rd (unstable) reconnect suppresses the toast
     const toasts = h.cmds.filter((c) => c.kind === "toast");
     expect(toasts).toHaveLength(2); // only the first two recoveries toasted
@@ -128,7 +122,7 @@ describe("ConnectionAlert", () => {
     h.alert.onConn(false);
     h.alert.onEdit();
     const lastSticky = h.cmds.filter((c) => c.kind === "showSticky").at(-1);
-    expect(lastSticky).toEqual({ kind: "showSticky", message: MSG_OFFLINE });
+    expect(lastSticky).toEqual({ kind: "showSticky", variant: "offline" });
   });
 
   it("is inert on redundant same-state calls", () => {
