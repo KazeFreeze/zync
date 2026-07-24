@@ -12,6 +12,7 @@ export class MemEngineState implements EngineStateStore {
   private readonly lastLive = new Map<DocId, VaultPath>();
   private readonly deleted = new Set<DocId>();
   private readonly configBases = new Map<VaultPath, Sha256>();
+  private readonly configNormalizedShas = new Map<VaultPath, Sha256>();
   private readonly configLocalVersions = new Map<VaultPath, number>();
   private localSuppressArr: string[] = [];
 
@@ -98,6 +99,17 @@ export class MemEngineState implements EngineStateStore {
 
   setConfigBase(path: VaultPath, sha256: Sha256): Promise<void> {
     this.configBases.set(path, sha256);
+    this.configNormalizedShas.delete(path);
+    return Promise.resolve();
+  }
+
+  getConfigNormalizedSha(path: VaultPath): Promise<Sha256 | null> {
+    return Promise.resolve(this.configNormalizedShas.get(path) ?? null);
+  }
+
+  setConfigNormalizedSha(path: VaultPath, sha256: Sha256 | null): Promise<void> {
+    if (sha256 === null) this.configNormalizedShas.delete(path);
+    else this.configNormalizedShas.set(path, sha256);
     return Promise.resolve();
   }
 

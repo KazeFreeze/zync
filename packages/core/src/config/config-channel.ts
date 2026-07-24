@@ -3,6 +3,7 @@ import type {
   CrdtMap,
   ConfigPort,
   IdentityPort,
+  Sha256,
   Unsubscribe,
   VaultPath,
 } from "../ports.js";
@@ -10,6 +11,13 @@ import type { EchoLedger } from "../bridge/echo.js";
 import { sha256OfBytes } from "../hash.js";
 import { canonicalJsonBytes, configIdentitySha } from "./canonical.js";
 import { configCategoryOf, pluginIdOf, type ConfigEntry } from "./config-entry.js";
+import {
+  classifyPluginDataChange,
+  tryParseJson,
+  NOISY_DATA_KEYS,
+  type EchoDecision,
+} from "./plugin-data-classify.js";
+import { ConfigLoopBreaker } from "./loop-breaker.js";
 
 export interface ConfigChannelDeps {
   config: CrdtMap<ConfigEntry>;
@@ -25,6 +33,8 @@ export interface ConfigChannelDeps {
   engineState?: {
     getConfigLocalVersion(path: VaultPath): Promise<number>;
     setConfigLocalVersion(path: VaultPath, version: number): Promise<void>;
+    getConfigNormalizedSha(path: VaultPath): Promise<Sha256 | null>;
+    setConfigNormalizedSha(path: VaultPath, sha256: Sha256 | null): Promise<void>;
   };
   /** Which config categories this device syncs. Absent category = not published or materialized. */
   enabledCategories: {
@@ -35,7 +45,9 @@ export interface ConfigChannelDeps {
   };
   /** Optional gate consulted for every config path; transparent for non-plugin paths. */
   gate?: { allows(path: VaultPath): boolean };
-  /** Monotonic clock for quiescence tracking. */
+  /** Called (once) when the loop-breaker trips for a config path — a runaway republish loop. */
+  onLoopDetected?(path: VaultPath): void;
+  /** Monotonic clock for the loop-breaker. */
   now(): number;
 }
 
@@ -46,15 +58,9 @@ export interface ConfigChannelDeps {
  * shared BlobEngine (via RoutedManifest + RoutedVault), not here.
  */
 export class ConfigChannel {
-  private static readonly QUIESCENCE_MS = 1500;
-  private readonly recentlyMaterialized = new Map<string, number>();
+  private readonly loopBreaker = new ConfigLoopBreaker({ now: () => this.d.now() });
 
   constructor(private readonly d: ConfigChannelDeps) {}
-
-  /** Called by the engine right after it materializes a plugin-data file. */
-  noteMaterialized(path: VaultPath, at: number): void {
-    if (configCategoryOf(path) === "plugin-data") this.recentlyMaterialized.set(path, at);
-  }
 
   /** Returns true when this device syncs files in the given path's category. */
   private categoryEnabled(path: VaultPath): boolean {
@@ -86,6 +92,7 @@ export class ConfigChannel {
     if (!this.gateAllows(path)) return;
     const category = configCategoryOf(path);
     if (category === undefined) return;
+    if (!this.loopBreaker.allow(path)) return; // circuit-breaker tripped — suppress to stop a runaway loop
     const isData = category === "plugin-data";
     const content = isData ? canonicalJsonBytes(bytes) : bytes;
     const sha256 = await sha256OfBytes(content);
@@ -113,6 +120,7 @@ export class ConfigChannel {
     if (isData && newDataVersion !== undefined && this.d.engineState !== undefined) {
       await this.d.engineState.setConfigLocalVersion(path, newDataVersion);
     }
+    if (this.loopBreaker.record(path)) this.d.onLoopDetected?.(path);
   }
 
   /** Subscribe to local config-file changes AND remote config-map tombstones. */
@@ -149,15 +157,31 @@ export class ConfigChannel {
       this.d.config.set(path, { ...prev, deleted: true, deviceId: this.d.identity.deviceId() });
       return;
     }
-    if (configCategoryOf(path) === "plugin-data") {
-      const mAt = this.recentlyMaterialized.get(path);
-      if (mAt !== undefined && this.d.now() - mAt < ConfigChannel.QUIESCENCE_MS) {
-        this.recentlyMaterialized.delete(path); // consume once; adopt this re-save silently
-        return;
-      }
-    }
     const sha256 = await configIdentitySha(path, bytes);
-    if (this.d.echo.isEcho(path, sha256)) return; // our own materialize wrote this file
+    if (this.d.echo.isEcho(path, sha256)) return; // our own materialize wrote this file (check FIRST)
+    if (configCategoryOf(path) === "plugin-data") {
+      const m = this.d.config.get(path)?.sha256 ?? null;
+      const r = this.d.engineState ? await this.d.engineState.getConfigNormalizedSha(path) : null;
+      const materialized =
+        m !== null && (await this.d.blobStore.has(m))
+          ? tryParseJson(await this.d.blobStore.get(m))
+          : undefined;
+      const local = tryParseJson(bytes);
+      const decision: EchoDecision = classifyPluginDataChange({
+        s: sha256,
+        m,
+        r,
+        materialized,
+        local,
+        noisyKeys: NOISY_DATA_KEYS,
+      });
+      if (decision === "suppress") return;
+      if (decision === "adopt-normalized") {
+        if (this.d.engineState) await this.d.engineState.setConfigNormalizedSha(path, sha256);
+        return; // a normalization (added defaults) — learn R, never republish
+      }
+      if (this.d.engineState) await this.d.engineState.setConfigNormalizedSha(path, null); // real user edit
+    }
     await this.publish(path, bytes);
   }
 

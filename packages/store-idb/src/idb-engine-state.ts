@@ -103,6 +103,17 @@ export class IdbEngineState implements EngineStateStore {
 
   async setConfigBase(path: VaultPath, sha256: Sha256): Promise<void> {
     await this.db.put(META_STORE, sha256, `configBase:${path}`);
+    await this.db.delete(META_STORE, `configNormalizedSha:${path}`);
+  }
+
+  async getConfigNormalizedSha(path: VaultPath): Promise<Sha256 | null> {
+    const value = await this.db.get(META_STORE, `configNormalizedSha:${path}`);
+    return (value as Sha256 | undefined) ?? null;
+  }
+
+  async setConfigNormalizedSha(path: VaultPath, sha256: Sha256 | null): Promise<void> {
+    if (sha256 === null) await this.db.delete(META_STORE, `configNormalizedSha:${path}`);
+    else await this.db.put(META_STORE, sha256, `configNormalizedSha:${path}`);
   }
 
   async getConfigLocalVersion(path: VaultPath): Promise<number> {

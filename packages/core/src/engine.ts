@@ -390,6 +390,8 @@ export class SyncEngine {
   private readonly pluginMatCbs = new Set<(id: string) => void>();
   /** Slice 3b: callbacks notified (with the plugin id) when a desired-active plugin's data.json materializes. */
   private readonly pluginDataMatCbs = new Set<(id: string) => void>();
+  /** H3-v2: callbacks notified (with the path) when ConfigChannel's loop-breaker trips. */
+  private readonly configLoopCbs = new Set<(path: VaultPath) => void>();
 
   // ── subscriptions to unwind on stop() ───────────────────────────────────
   private vaultUnsub: Unsubscribe | null = null;
@@ -818,6 +820,9 @@ export class SyncEngine {
         gate: pluginGate,
         engineState: this.ports.engineState,
         now: () => this.ports.clock.now(),
+        onLoopDetected: (path) => {
+          for (const cb of this.configLoopCbs) cb(path);
+        },
       });
       this.configUnsub = this.configChannel.start();
       await this.configChannel.bootstrap();
@@ -881,7 +886,6 @@ export class SyncEngine {
                 // its edit-version as our local version. Absent (versionless peer) ⇒ 0.
                 const remoteVersion = configMap.get(path)?.dataVersion ?? 0;
                 void this.ports.engineState.setConfigLocalVersion(path, remoteVersion);
-                this.configChannel?.noteMaterialized(path, this.ports.clock.now());
                 this.firePluginDataReload(path);
               }
               // Task 8: when a bundle file materializes for a desired-active plugin, fire the
@@ -1794,6 +1798,12 @@ export class SyncEngine {
   onPluginDataMaterialized(cb: (id: string) => void): Unsubscribe {
     this.pluginDataMatCbs.add(cb);
     return () => this.pluginDataMatCbs.delete(cb);
+  }
+
+  /** Subscribe to config loop-breaker trips (a runaway republish loop was detected + paused). */
+  onConfigLoopDetected(cb: (path: VaultPath) => void): Unsubscribe {
+    this.configLoopCbs.add(cb);
+    return () => this.configLoopCbs.delete(cb);
   }
 
   /**
@@ -4862,6 +4872,14 @@ export class SyncEngine {
       const content = configStoredBytes(path, localBytes);
       const localCanonicalSha = await sha256OfBytes(content);
       if (localCanonicalSha === info.expectedSha) return false; // canonical no-op -> accept remote (also stops self-echo of an assert)
+      const normalizedSha = await this.ports.engineState.getConfigNormalizedSha(path);
+      if (localCanonicalSha === normalizedSha) {
+        // H3: disk holds a known hook-owned normalization (R). If the map still agrees with `base`, the
+        // reconcile drift-scan is just re-checking it — keep disk, write NOTHING (no re-materialize, no
+        // hook refire). Otherwise the remote genuinely moved on -> adopt it cleanly (R is stale noise).
+        if (info.expectedSha === base) return true;
+        return false;
+      }
       const indexDoc = this.indexDoc;
       if (indexDoc === null) return false;
       const configMap = indexDoc.getMap<ConfigEntry>("config");
@@ -4911,7 +4929,12 @@ export class SyncEngine {
         return assertLocal(); // LOCAL wins the tie -> keep local; loser peer backs up on its side
       }
       // recency: remote is a strictly newer edit -> adopt it (materialize records base+localVersion).
-      // NO backup (lean): this is not a simultaneous conflict, it is a sequential edit.
+      // NO backup (lean): this is a SEQUENTIAL edit, not a simultaneous conflict. An H3 loser-backup was
+      // tried here but removed — `base` tracks the last PEER value adopted, never the device's own
+      // publishes, so a device's own freshly-published value has disk≠base and would be spuriously backed
+      // up on every normal sequential supersede (harness config-plugin-data proved it). The echo-gate
+      // already prevents the hook-rewrite clobber-loop at source, so this backup is unneeded. Genuine
+      // simultaneous (equal-version) conflicts are still recovered by the tie-break backup above.
       if (remoteVersion > localVersion) return false;
       // authority: local is a strictly newer edit -> assert it. NO backup (we keep local).
       return assertLocal();

@@ -106,6 +106,8 @@ export default class ZyncPlugin extends Plugin {
   private pluginMatUnsub: (() => void) | null = null;
   /** Slice 3b: unsubscribe fn for onPluginDataMaterialized (live-apply or stage settings updates). */
   private pluginDataMatUnsub: (() => void) | null = null;
+  /** H3-v2: unsubscribe fn for onConfigLoopDetected (loop-breaker Notice). */
+  private configLoopUnsub: (() => void) | null = null;
   private transport: HocuspocusTransport | null = null;
   private db: ZyncDb | null = null;
   private dbName: string | null = null;
@@ -369,6 +371,12 @@ export default class ZyncPlugin extends Plugin {
           if (running.has(id)) engine.addPendingUpdate(id);
           else this.reconcilePlugins();
         });
+        this.configLoopUnsub = engine.onConfigLoopDetected((path) => {
+          new Notice(
+            `Zync paused syncing "${path}" — a rapid update loop was detected. Consider excluding it (Settings → Synced plugins).`,
+            10000,
+          );
+        });
         this.pluginDataMatUnsub = engine.onPluginDataMaterialized((id) => {
           if (id === this.manifest.id) return; // never reload ourselves mid-flight (self-reload guard)
           const running = new Set(this.runtime?.enabledIds() ?? []);
@@ -466,6 +474,8 @@ export default class ZyncPlugin extends Plugin {
     this.pluginMatUnsub = null;
     this.pluginDataMatUnsub?.();
     this.pluginDataMatUnsub = null;
+    this.configLoopUnsub?.();
+    this.configLoopUnsub = null;
     this.runtime = null;
     if (this.engine !== null) {
       try {

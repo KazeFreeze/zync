@@ -27,6 +27,9 @@ interface StateFile {
   deleted?: string[];
   // Config base: last sha materialized from remote per config path. Optional for back-compat.
   configBases?: Record<string, string>;
+  // H3 normalized sha: hook-owned plugin-data rewrite accepted as equivalent to the agreed base.
+  // Optional for back-compat (pre-H3 state files have no key).
+  configNormalizedShas?: Record<string, string>;
   // plugin-data version-aware convergence: numeric edit-version of the on-disk value per config path.
   // Optional for back-compat (pre-tiebreak state files have no key → every path reads as version 0).
   configLocalVersions?: Record<string, number>;
@@ -41,6 +44,7 @@ export class FsEngineStateStore implements EngineStateStore {
   private lastLive: Map<DocId, VaultPath>;
   private deletedDocs: Set<DocId>;
   private configBasesMap: Map<VaultPath, Sha256>;
+  private configNormalizedShasMap: Map<VaultPath, Sha256>;
   private configLocalVersionsMap: Map<VaultPath, number>;
   private localSuppressArr: string[];
 
@@ -51,6 +55,7 @@ export class FsEngineStateStore implements EngineStateStore {
     lastLive: Map<DocId, VaultPath>,
     deletedDocs: Set<DocId>,
     configBasesMap: Map<VaultPath, Sha256>,
+    configNormalizedShasMap: Map<VaultPath, Sha256>,
     configLocalVersionsMap: Map<VaultPath, number>,
     localSuppressArr: string[],
   ) {
@@ -60,6 +65,7 @@ export class FsEngineStateStore implements EngineStateStore {
     this.lastLive = lastLive;
     this.deletedDocs = deletedDocs;
     this.configBasesMap = configBasesMap;
+    this.configNormalizedShasMap = configNormalizedShasMap;
     this.configLocalVersionsMap = configLocalVersionsMap;
     this.localSuppressArr = localSuppressArr;
   }
@@ -72,6 +78,7 @@ export class FsEngineStateStore implements EngineStateStore {
     const lastLive = new Map<DocId, VaultPath>();
     const deletedDocs = new Set<DocId>();
     const configBasesMap = new Map<VaultPath, Sha256>();
+    const configNormalizedShasMap = new Map<VaultPath, Sha256>();
     const configLocalVersionsMap = new Map<VaultPath, number>();
     const localSuppressArr: string[] = [];
     try {
@@ -94,6 +101,10 @@ export class FsEngineStateStore implements EngineStateStore {
       for (const [k, v] of Object.entries(data.configBases ?? {})) {
         configBasesMap.set(k as VaultPath, v as Sha256);
       }
+      // Back-compat: pre-H3 state files have no configNormalizedShas field.
+      for (const [k, v] of Object.entries(data.configNormalizedShas ?? {})) {
+        configNormalizedShasMap.set(k as VaultPath, v as Sha256);
+      }
       // Back-compat: pre-tiebreak state files have no configLocalVersions field.
       for (const [k, v] of Object.entries(data.configLocalVersions ?? {})) {
         configLocalVersionsMap.set(k as VaultPath, v);
@@ -111,6 +122,7 @@ export class FsEngineStateStore implements EngineStateStore {
       lastLive,
       deletedDocs,
       configBasesMap,
+      configNormalizedShasMap,
       configLocalVersionsMap,
       localSuppressArr,
     );
@@ -185,6 +197,17 @@ export class FsEngineStateStore implements EngineStateStore {
 
   async setConfigBase(path: VaultPath, sha256: Sha256): Promise<void> {
     this.configBasesMap.set(path, sha256);
+    this.configNormalizedShasMap.delete(path);
+    await this.persist();
+  }
+
+  getConfigNormalizedSha(path: VaultPath): Promise<Sha256 | null> {
+    return Promise.resolve(this.configNormalizedShasMap.get(path) ?? null);
+  }
+
+  async setConfigNormalizedSha(path: VaultPath, sha256: Sha256 | null): Promise<void> {
+    if (sha256 === null) this.configNormalizedShasMap.delete(path);
+    else this.configNormalizedShasMap.set(path, sha256);
     await this.persist();
   }
 
@@ -240,6 +263,7 @@ export class FsEngineStateStore implements EngineStateStore {
       lastLivePaths: Object.fromEntries(this.lastLive),
       deleted: [...this.deletedDocs],
       configBases: Object.fromEntries(this.configBasesMap),
+      configNormalizedShas: Object.fromEntries(this.configNormalizedShasMap),
       configLocalVersions: Object.fromEntries(this.configLocalVersionsMap),
       localSuppress: [...this.localSuppressArr],
     };

@@ -83,10 +83,18 @@ function makeChannel(): {
     close: () => undefined,
   };
   const versions = new Map<string, number>();
+  const normalizedShas = new Map<string, string>();
   const engineState: NonNullable<ConfigChannelDeps["engineState"]> = {
     getConfigLocalVersion: (p) => Promise.resolve(versions.get(p) ?? 0),
     setConfigLocalVersion: (p, v) => {
       versions.set(p, v);
+      return Promise.resolve();
+    },
+    getConfigNormalizedSha: (p) =>
+      Promise.resolve((normalizedShas.get(p) ?? null) as import("../ports.js").Sha256 | null),
+    setConfigNormalizedSha: (p, sha256) => {
+      if (sha256 === null) normalizedShas.delete(p);
+      else normalizedShas.set(p, sha256);
       return Promise.resolve();
     },
   };

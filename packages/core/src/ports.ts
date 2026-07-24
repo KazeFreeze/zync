@@ -183,6 +183,10 @@ export interface EngineStateStore {
    */
   getConfigBase(path: VaultPath): Promise<Sha256 | null>;
   setConfigBase(path: VaultPath, sha256: Sha256): Promise<void>;
+  /** Durable per-path sha of a hook-owned plugin-data rewrite accepted as equivalent to the agreed
+   *  base (H3). `null` clears it. Cleared automatically by setConfigBase. */
+  getConfigNormalizedSha(path: VaultPath): Promise<Sha256 | null>;
+  setConfigNormalizedSha(path: VaultPath, sha256: Sha256 | null): Promise<void>;
   /**
    * plugin-data version-aware convergence: the numeric edit-version of the value currently on this
    * device's disk at a config path. Durable — survives restart. Set on materialize (→ the remote

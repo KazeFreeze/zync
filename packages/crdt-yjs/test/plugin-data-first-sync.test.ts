@@ -196,7 +196,7 @@ describe("onConfigDivergence — plugin-data version-aware convergence", () => {
     engine = undefined;
   });
 
-  it("(1) sequential edit (remoteVersion>localVersion) → false, NO inbox, NO backup — the on-device regression", async () => {
+  it("(1) sequential edit (remoteVersion>localVersion) → false, NO inbox, NO backup (lean recency adopt)", async () => {
     const setup = makeSetup();
     engine = setup.engine;
     await engine.start();
@@ -221,7 +221,7 @@ describe("onConfigDivergence — plugin-data version-aware convergence", () => {
 
     expect(result).toBe(false); // adopt the newer remote (recency)
     expect(configFileCount(engine)).toBe(before); // NO inbox
-    expect((await setup.vault.list(vp("_conflicts/"))).length).toBe(0); // NO backup (lean)
+    expect((await setup.vault.list(vp("_conflicts/"))).length).toBe(0); // NO backup: lean sequential recency adopt (base tracks last-adopted, not own publishes)
   });
 
   it("(1b) sequential edit where local sha > remote sha still adopts remote when remoteVersion>localVersion (recency beats hash)", async () => {
@@ -241,7 +241,7 @@ describe("onConfigDivergence — plugin-data version-aware convergence", () => {
     });
 
     expect(result).toBe(false); // remoteVersion(2) > localVersion(1) → adopt, even though localSha > expectedSha
-    expect((await setup.vault.list(vp("_conflicts/"))).length).toBe(0);
+    expect((await setup.vault.list(vp("_conflicts/"))).length).toBe(0); // NO backup: lean sequential recency adopt
   });
 
   it("(2) equal version, REMOTE wins hash tie-break (localSha < expectedSha) → false + backup, NO inbox", async () => {
@@ -638,7 +638,7 @@ describe("reconcileConfigDrift — config reconcile backstop for observe-only dr
     ).toBe(new TextDecoder().decode(high));
     // localVersion adopted the remote edit-version (materialize's onMaterialized records it).
     expect(await setup.engineState.getConfigLocalVersion(PLUGIN_DATA_PATH)).toBe(2);
-    // No inbox raised; no clobber-backup on a sequential (non-tie) adopt.
+    // No inbox raised; NO backup — a lean sequential recency adopt (drift-scan resolving observe-only drift).
     expect(configFileCount(engine)).toBe(0);
     expect((await setup.vault.list(vp("_conflicts/"))).length).toBe(0);
   });
