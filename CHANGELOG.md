@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/KazeFreeze/zync/compare/zync-v0.4.3...zync-v0.5.0) (2026-07-24)
+
+
+### Features
+
+* **plugin:** sync-status explainer + full UI design-standard sweep ([b56fcf8](https://github.com/KazeFreeze/zync/commit/b56fcf8de431e8dfb4c437ace2a779226bc9b53b))
+
 ## [0.4.3](https://github.com/KazeFreeze/zync/compare/zync-v0.4.2...zync-v0.4.3) (2026-07-24)
 
 
