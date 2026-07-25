@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/KazeFreeze/zync/compare/zync-v0.5.0...zync-v0.5.1) (2026-07-25)
+
+
+### Bug Fixes
+
+* **core:** idempotent blob publish to stop bootstrap index churn ([24a97d1](https://github.com/KazeFreeze/zync/commit/24a97d184efafd6328d09e6868ec52237eb2f694))
+
 ## [0.5.0](https://github.com/KazeFreeze/zync/compare/zync-v0.4.3...zync-v0.5.0) (2026-07-24)
 
 
