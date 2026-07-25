@@ -92,6 +92,49 @@ describe("BlobEngine.onLocalBlobWrite (content-address → manifest + store)", (
     expect(await h.blobStore.has(sha1)).toBe(true);
     expect(await h.blobStore.has(sha2)).toBe(true);
   });
+
+  it("idempotent: re-publishing byte-identical bytes does NOT re-write the manifest", async () => {
+    // REGRESSION (real LifeOS vault, 2026-07-25): bootstrap re-publishes every on-disk blob on
+    // EVERY start. `Y.Map.set` emits a relayed "local-bridge" update even for an identical value,
+    // so an unconditional re-set floods the relay with __zync_index__ churn (hundreds of blobs →
+    // never reaches quiescence → "Not running"). The publish must be a no-op when the path already
+    // advertises the same sha.
+    const h = makeEngine("eager");
+    let emits = 0;
+    h.manifest.observe(() => {
+      emits += 1;
+    });
+
+    await h.engine.onLocalBlobWrite(path("img.png"), PNG); // first publish: 1 manifest write
+    expect(emits).toBe(1);
+
+    // Bootstrap re-publish of the SAME bytes: no manifest write, no relayed update.
+    await h.engine.onLocalBlobWrite(path("img.png"), PNG);
+    await h.engine.onLocalBlobWrite(path("img.png"), PNG);
+    expect(emits).toBe(1);
+
+    // Sanity: the entry is still present and correct.
+    const sha = await sha256OfBytes(PNG);
+    expect(h.manifest.get("img.png")?.sha256).toBe(sha);
+
+    // A GENUINELY changed blob (new sha) still publishes.
+    await h.engine.onLocalBlobWrite(path("img.png"), new Uint8Array([9, 9, 9]));
+    expect(emits).toBe(2);
+  });
+
+  it("robustness preserved: re-puts the bytes when the store lost the object, even if the manifest already advertises that sha", async () => {
+    const h = makeEngine("eager");
+    const sha = await sha256OfBytes(PNG);
+    // Manifest already advertises this sha (e.g. learned from a peer) but the local store lost the
+    // object (transient S3/MinIO outage). The idempotency short-circuit must NOT skip the re-put.
+    h.manifest.set("img.png", { sha256: sha, size: PNG.length, deviceId: DEV_A });
+    expect(await h.blobStore.has(sha)).toBe(false);
+
+    await h.engine.onLocalBlobWrite(path("img.png"), PNG);
+
+    expect(await h.blobStore.has(sha)).toBe(true);
+    expect(await h.blobStore.get(sha)).toEqual(PNG);
+  });
 });
 
 describe("BlobEngine.materialize (hash-verify-on-read)", () => {

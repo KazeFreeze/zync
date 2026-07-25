@@ -107,6 +107,14 @@ export class BlobEngine {
     if (!(await d.blobStore.has(sha))) {
       await d.blobStore.put(sha, bytes);
     }
+    // IDEMPOTENCY: skip the manifest write when this path already advertises this exact sha.
+    // `YjsCrdtMap.set` wraps every set in a RELAYED "local-bridge" transaction, and `Y.Map.set`
+    // emits a doc update even for a byte-identical value — so an unconditional re-set re-publishes
+    // the entry over the wire. bootstrap() calls this for EVERY on-disk blob on every start; on a
+    // large vault that floods the relay with hundreds of __zync_index__ updates and delays
+    // quiescence (observed on the real LifeOS vault as a runaway `blobs`-map churn). The
+    // blobStore.has/put above still runs FIRST, so a lost store object heals even when we skip here.
+    if (d.manifest.get(path)?.sha256 === sha) return;
     d.manifest.set(path, {
       sha256: sha,
       size: bytes.length,
