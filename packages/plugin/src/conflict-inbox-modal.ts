@@ -1,5 +1,6 @@
 import { Modal, TFile, setIcon, setTooltip, type App } from "obsidian";
 import { notify, notifySuccess, notifyInfo, notifyError } from "./notify.js";
+import { stuckCopy, TAG_NEVER_ARRIVED } from "./stuck-copy.js";
 import {
   SyncEngine,
   describeInboxEntry,
@@ -151,57 +152,97 @@ export class ConflictInboxModal extends Modal {
   /**
    * The STUCK section: a REPORT, not a chooser. A conflict row promises a decision with two safe
    * buttons; these items may have NO available action, so they get no primary button (a fake CTA
-   * teaches users that buttons are decorative). Every stuck path is listed (the set is small by
-   * construction, bounded by the self-heal latch) rather than sampled, since this is the detail
-   * surface. "Open" appears only for a path that actually exists on disk.
+   * teaches users that buttons are decorative).
+   *
+   * The heading is the FILE NAME for a single item (matching every other row in this modal) and an
+   * aggregate count only when there are several, which is also what keeps it consistent with the
+   * status bar's doc count. Copy branches per class via {@link stuckCopy}: generic wording is
+   * factually wrong for the never-arrived case and would send the user to reconnect for nothing.
    */
   private renderStuckSection(
     parent: HTMLElement,
     stuck: { docId: string; path: string | null }[],
   ): void {
+    const items = stuck.map((s) => ({
+      ...s,
+      onDisk: s.path !== null && this.app.vault.getAbstractFileByPath(s.path) instanceof TFile,
+    }));
+    const copy = stuckCopy(items.map((i) => ({ path: i.path, onDisk: i.onDisk })));
+
     const list = parent.createDiv({ cls: "zync-list" });
-    const row = list.createDiv({ cls: "zync-row" });
+    const row = list.createDiv({ cls: "zync-row zync-stuck-row" });
 
     const main = row.createDiv({ cls: "zync-row-main" });
     const label = main.createDiv({ cls: "zync-row-label" });
     const chip = label.createSpan({ cls: "zync-chip", text: "stuck" });
     chip.dataset.kind = "stuck";
-    // Repeat the DOC count here: the status bar counts docs, so a single row must not read as "1".
-    label.createSpan({
-      cls: "zync-row-name",
-      text: stuck.length === 1 ? "1 item stuck" : `${String(stuck.length)} items stuck`,
-    });
 
-    const sub = row.createDiv({ cls: "zync-row-sub" });
-    sub.createSpan({
-      text: "Stopped syncing after repeated attempts. Reconnecting may clear this. ",
-    });
+    const [only] = items;
+    if (items.length === 1 && only !== undefined) {
+      // Single item: the name IS the heading. No separate list line, which would be a third
+      // repetition of the same fact (chip + heading + tag) and is what made the row read as noise.
+      this.stuckName(label, only);
+      if (only.onDisk && only.path !== null) this.stuckOpenLink(label, only.path);
+    } else {
+      // "N items", not "N items stuck": the chip already says stuck. Matches the topbar's noun.
+      label.createSpan({ cls: "zync-row-name", text: `${String(items.length)} items` });
+    }
 
-    const SHOWN = 10;
-    for (const s of stuck.slice(0, SHOWN)) {
-      const line = sub.createDiv({ cls: "zync-row-sub" });
-      if (s.path === null) {
-        // No index entry: an untracked leftover. Never render a blank name.
-        line.createSpan({ text: `Untracked entry (${s.docId.slice(0, 8)})` });
-        continue;
+    row.createDiv({ cls: "zync-row-sub", text: copy.sub });
+
+    // Multi only. SIBLING of the sub-line, never nested: `.zync-row-sub` uses a RELATIVE font-size,
+    // so nesting it compounds the shrink and the text turns unreadable.
+    if (items.length > 1) {
+      const listEl = row.createDiv({ cls: "zync-stuck-items" });
+      const SHOWN = 10;
+      for (const s of items.slice(0, SHOWN)) {
+        const line = listEl.createDiv({ cls: "zync-stuck-item" });
+        this.stuckName(line, s);
+        if (s.onDisk && s.path !== null) this.stuckOpenLink(line, s.path);
+        else if (s.path !== null) {
+          // A classifier, not a sentence: the fix line quotes this tag verbatim to scope itself.
+          line.createSpan({ cls: "zync-stuck-why", text: ` ${TAG_NEVER_ARRIVED}` });
+        }
       }
-      line.createSpan({ text: `${baseName(s.path)} ` });
-      const onDisk = this.app.vault.getAbstractFileByPath(s.path) instanceof TFile;
-      if (onDisk) {
-        const path = s.path;
-        const a = line.createEl("a", { cls: "zync-inline-link", text: "Open", href: "#" });
-        a.onclick = (e): void => {
-          e.preventDefault();
-          void this.app.workspace.openLinkText(path, "", false);
-        };
-      } else {
-        // The defining symptom of the common class: the entry exists but its content never arrived.
-        line.createSpan({ cls: "zync-row-sub", text: "waiting for content that never arrived" });
+      if (items.length > SHOWN) {
+        listEl.createDiv({
+          cls: "zync-stuck-item zync-stuck-why",
+          text: `+${String(items.length - SHOWN)} more`,
+        });
       }
     }
-    if (stuck.length > SHOWN) {
-      sub.createDiv({ cls: "zync-row-sub", text: `+${String(stuck.length - SHOWN)} more` });
+
+    if (copy.fix !== null) row.createDiv({ cls: "zync-stuck-fix", text: copy.fix });
+  }
+
+  /**
+   * The stuck item's name. Shows the FOLDER PREFIX as well as the basename: the manual fix depends
+   * on the exact path, and a hover title is useless on mobile (which has no hover at all).
+   */
+  private stuckName(parent: HTMLElement, s: { docId: string; path: string | null }): void {
+    if (s.path === null) {
+      // No index entry: a leftover with no note. Never render a blank name.
+      parent.createSpan({
+        cls: "zync-stuck-name",
+        text: `Untracked entry (${s.docId.slice(0, 8)})`,
+      });
+      return;
     }
+    const slash = s.path.lastIndexOf("/");
+    if (slash !== -1) {
+      parent.createSpan({ cls: "zync-stuck-dir", text: s.path.slice(0, slash + 1) });
+    }
+    parent.createSpan({ cls: "zync-stuck-name", text: baseName(s.path) });
+  }
+
+  /** "Open" is the row's only interactive element, and only when the file is really on disk. */
+  private stuckOpenLink(parent: HTMLElement, path: string): void {
+    parent.createSpan({ text: " " });
+    const a = parent.createEl("a", { cls: "zync-inline-link", text: "Open", href: "#" });
+    a.onclick = (e): void => {
+      e.preventDefault();
+      void this.app.workspace.openLinkText(path, "", false);
+    };
   }
 
   private renderRow(parent: HTMLElement, entry: InboxEntry, view: EntryView): void {

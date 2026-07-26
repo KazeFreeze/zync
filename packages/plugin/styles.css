@@ -124,6 +124,45 @@
   background: rgba(var(--color-yellow-rgb), 0.15);
   color: var(--color-yellow);
 }
+/* Stuck row. Sizes use ABSOLUTE --font-ui-* tokens, never the relative --font-smaller the compact
+   conflict rows use: this row is rare and carries a problem the user has to actually read, and a
+   relative size compounds (and shrinks further) once nested. */
+.zync-stuck-row .zync-row-sub {
+  font-size: var(--font-ui-medium);
+}
+/* A SIBLING of .zync-row-sub, never nested inside it, so nothing can stack. */
+.zync-stuck-items {
+  margin-top: 6px;
+}
+.zync-stuck-item {
+  font-size: var(--font-ui-medium);
+  line-height: 1.6;
+}
+.zync-stuck-item + .zync-stuck-item {
+  margin-top: 2px;
+}
+/* The file name is the key information in the row, so it reads at full strength. */
+.zync-stuck-name {
+  color: var(--text-normal);
+  font-weight: var(--font-semibold);
+}
+/* Folder prefix, search-result style: the manual fix depends on the EXACT path, and a hover title
+   is useless on mobile, so the path has to be visible rather than tucked into a tooltip. */
+.zync-stuck-dir {
+  color: var(--text-faint);
+}
+.zync-stuck-why {
+  color: var(--text-muted);
+}
+/* Guidance, not a control. Set apart so it does not read as part of the status sentence. */
+.zync-stuck-fix {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--background-modifier-border);
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  line-height: 1.6;
+}
 
 /* Compact buttons */
 .zync-btn {
