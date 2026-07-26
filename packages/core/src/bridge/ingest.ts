@@ -49,6 +49,16 @@ export interface IngestDeps {
   persistDocSnapshot?: (docId: DocId, doc: CrdtDoc) => Promise<void>;
   /** Engine debounces the index stamp bump (Task 13). */
   bumpStamp: (path: VaultPath, docId: DocId, route: Route, sha: Sha256) => void;
+  /**
+   * SEAM (first-seen double-seed fix): the docId of an IN-FLIGHT (debounced, not yet durable)
+   * index binding for `path`, i.e. the engine's `pendingBumps.get(path)?.docId`. Because
+   * {@link IngestDeps.bumpStamp} is debounced, a brand-new path's index entry does not exist while
+   * the timer runs — so a second write inside that window would otherwise look first-seen AGAIN and
+   * mint a SECOND docId, orphaning the first (with its seeded snapshot + dirty flag) forever. This
+   * lets the mint decision see the claim the pending bump already staked. Optional/omitted in unit
+   * tests (purely additive); omitting it restores the old mint-per-write behaviour.
+   */
+  pendingDocIdFor?: (path: VaultPath) => DocId | undefined;
   /** Task 9 wires the conflict artifact; here we just emit the losing text. */
   emitConflict: (path: VaultPath, losingText: string) => void;
 }
@@ -108,10 +118,20 @@ export class IngestPipeline {
       return { action: "skipped-deleted" };
     }
 
-    // 2. docId: reuse the index's, or mint one for a first-seen path. A minted docId
-    //    is an AFTER-START create: the engine seeds its create-meta + snapshot (step 7a).
-    const firstSeen = entry === undefined;
-    const docId = entry?.docId ?? d.newDocId();
+    // 2. docId: reuse the index's, else an IN-FLIGHT pending bump's, else mint one for a
+    //    first-seen path. A minted docId is an AFTER-START create: the engine seeds its
+    //    create-meta + snapshot (step 7a).
+    //    PENDING-BUMP REUSE (double-seed fix): `bumpStamp` is DEBOUNCED, so a brand-new path has
+    //    no index entry while the timer runs. Minting off the index alone made a SECOND write in
+    //    that window look first-seen again and mint a SECOND docId; the coalescing bump then kept
+    //    only the last one, stranding the first (seeded snapshot + meta + dirty flag, never live)
+    //    as a permanently-pending orphan that neither the orphan sweep nor the boot-prune clears.
+    //    The pending bump is the same logical doc for the same path, so REUSE its docId — write #2
+    //    is then an ordinary edit (firstSeen false ⇒ meta/snapshot are not re-seeded).
+    const pendingDocId = entry === undefined ? d.pendingDocIdFor?.(path) : undefined;
+    const boundDocId = entry?.docId ?? pendingDocId;
+    const firstSeen = boundDocId === undefined;
+    const docId = boundDocId ?? d.newDocId();
 
     // 3. Echo: is this our own write-back reflecting off the watcher?
     const diskHash = await sha256OfBytes(bytes);

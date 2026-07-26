@@ -130,6 +130,14 @@ async function setup(opts: SetupOpts): Promise<Harness> {
       return minted;
     },
     bumpStamp: (p, d, route, sha) => bumps.push({ path: p, docId: d, route, sha }),
+    // Models the engine's `pendingBumps.get(path)?.docId`: this harness NEVER fires a bump, so a
+    // recorded bump for `p` is exactly an in-flight (debounced, not yet durable) index binding.
+    pendingDocIdFor: (p) => {
+      for (let i = bumps.length - 1; i >= 0; i--) {
+        if (bumps[i]?.path === p) return bumps[i]?.docId;
+      }
+      return undefined;
+    },
     emitConflict: (p, losing) => conflicts.push({ path: p, losing }),
   };
 
@@ -383,5 +391,40 @@ describe("IngestPipeline.onVaultWrite (file → CRDT)", () => {
     const wi = orderLog.indexOf(`write:${NOTE}`);
     expect(wi).toBeGreaterThan(0);
     expect(orderLog[wi - 1]).toBe(`echo:${NOTE}`);
+  });
+});
+
+/**
+ * REGRESSION (real LifeOS vault, 2026-07-26): `bumpStamp` is DEBOUNCED, so a brand-new path's index
+ * entry is not durable while the timer runs. First-seen ingest minted off `index.get(path)` alone, so
+ * a SECOND write inside that window still saw an unbound path and minted a SECOND docId; `scheduleBump`
+ * then coalesced by path and overwrote the docId, silently discarding the first. The discarded docId
+ * kept its seeded snapshot + meta.create + durable dirty flag but was NEVER live, so BOTH cleanup paths
+ * declined it (the orphan sweep needs `lastLivePath`; the boot-prune needs "no snapshot") and it stayed
+ * pending forever. Observed as a Templater daily note: two docIds from the same device 905ms apart.
+ */
+describe("first-seen double-seed inside the debounced bumpStamp window", () => {
+  it("reuses the PENDING bump's docId instead of minting a second one", async () => {
+    // seedIndex:false ⇒ brand-new path. attach:false ⇒ adopt-pending, as a real after-start create is.
+    const h = await setup({ seedIndex: false, attach: false, disk: "<% tp.file.title %>\n" });
+
+    await h.pipeline.onVaultWrite(NOTE); // write #1: the raw template → mints docId
+    // Write #2 lands INSIDE the debounce window: the harness never fires bumps, so the index is
+    // still unbound — exactly the engine's state while the timer runs.
+    await h.vault.writeAtomic(NOTE, utf8("# Rendered daily note\n"));
+    await h.pipeline.onVaultWrite(NOTE);
+
+    // Exactly ONE docId for one path: no orphaned second seed.
+    expect(h.mintedIds).toHaveLength(1);
+    // Both bumps name that same docId, so whichever wins the coalesce binds the same doc.
+    expect(new Set(h.bumps.map((b) => b.docId))).toEqual(new Set(h.mintedIds));
+    // And no stranded dirty docId: the only dirty id is the one that gets bound.
+    expect(await h.engineState.listDirty()).toEqual(h.mintedIds);
+  });
+
+  it("still mints for a genuinely new path with no pending bump", async () => {
+    const h = await setup({ seedIndex: false, attach: false, disk: "hello\n" });
+    await h.pipeline.onVaultWrite(NOTE);
+    expect(h.mintedIds).toHaveLength(1);
   });
 });

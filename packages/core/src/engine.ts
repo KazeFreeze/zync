@@ -939,6 +939,9 @@ export class SyncEngine {
       bumpStamp: (path, docId, route, sha) => {
         this.scheduleBump(path, docId, route, sha);
       },
+      // Double-seed fix: expose the in-flight (debounced) index binding so a second write to a
+      // brand-new path inside the bump window reuses that docId instead of minting a second one.
+      pendingDocIdFor: (path) => this.pendingBumps.get(path)?.docId,
       emitConflict: (path, losingText) => {
         this.track(this.emitConflict(path, losingText));
       },
@@ -4452,6 +4455,42 @@ export class SyncEngine {
     for (const dirty of await this.ports.engineState.listDirty()) {
       if (!liveDocIds.has(dirty) && !snapshotDocIds.has(dirty)) {
         await this.ports.engineState.clearDirty(dirty);
+        continue;
+      }
+      // SUPERSEDED DOUBLE-SEED ORPHAN (2026-07-26, found on a real vault): the historical shape left by
+      // the now-fixed first-seen double-seed — a docId minted for a brand-new path inside the DEBOUNCED
+      // bump window, seeded (snapshot + meta + dirty) but displaced by a second mint before it was ever
+      // live. It is unreachable in BOTH directions: the orphan sweep declines it (no `lastLivePath`, so
+      // displacement is unprovable) and the prune above declines it (it HAS a snapshot). Its dirty flag is
+      // UNSATISFIABLE — dirty means "needs push", but push happens via a live index entry and this docId
+      // can never bind at `meta.originalPath` because a DIFFERENT live doc owns that path. Left alone it
+      // is permanently pending, which also makes every reconnect a doomed self-heal episode.
+      //
+      // SAFE because it is not a delete and not a data drop: the docStore snapshot is KEPT (content
+      // preserved, just no longer advertised as pending), and the orphan sweep is dirty-INDEPENDENT
+      // (driven by docStore.list() minus live entries), so clearing the flag never blocks a later
+      // recovery. Deliberately NOT recovered to a conflict copy: the content is a stale precursor of a
+      // file that still exists at that path (e.g. a template captured before expansion), so recovering
+      // would multiply junk conflict artifacts across devices. Logged, never silent.
+      if (!liveDocIds.has(dirty) && snapshotDocIds.has(dirty)) {
+        if (await this.ports.engineState.wasDeleted(dirty)) continue;
+        if ((await this.ports.engineState.getLastLivePath(dirty)) !== null) continue;
+        const snap = await this.ports.docStore.load(dirty);
+        if (snap === null) continue;
+        const probe = this.ports.crdt.loadDoc(dirty, snap);
+        const meta = probe.getMap<OrphanMeta>("meta").get("create");
+        probe.destroy();
+        if (meta === undefined) continue; // no create-meta ⇒ cannot prove which path it belonged to.
+        const occupant = this.index.get(meta.originalPath);
+        // Require POSITIVE displacement proof: the create path is live under a DIFFERENT docId.
+        if (occupant === undefined || occupant.deleted === true || occupant.docId === dirty)
+          continue;
+        await this.ports.engineState.clearDirty(dirty);
+        console.warn(
+          `[zync] cleared an unsatisfiable dirty flag on superseded doc ${dirty} ` +
+            `(created at ${meta.originalPath}, now owned by ${occupant.docId}); ` +
+            `its content snapshot is KEPT and nothing was deleted`,
+        );
       }
     }
   }

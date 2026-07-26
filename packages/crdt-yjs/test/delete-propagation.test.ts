@@ -511,4 +511,47 @@ describe("M1b — materializedHash observed at bootstrap", () => {
     expect(await durA.engineState.listDirty()).not.toContain(ghost); // pruned from the durable dirty set
     expect(await a.engine.pendingDocs()).not.toContain(ghost); // and no longer wedges quiescence
   });
+
+  it("bootstrap clears the unsatisfiable dirty flag on a SUPERSEDED double-seed orphan (keeps its snapshot)", async () => {
+    // The historical shape left by the now-fixed first-seen double-seed: a docId minted for a brand-new
+    // path inside the debounced bump window, seeded (snapshot + meta + dirty), then displaced by a second
+    // mint before it was EVER live. The orphan sweep declines it (no lastLivePath ⇒ displacement
+    // unprovable) and the no-snapshot prune declines it (it HAS a snapshot), so it stayed pending forever.
+    // Its dirty flag is unsatisfiable: the create path is owned by a DIFFERENT live doc, so it can never
+    // bind anywhere to be pushed. Bootstrap must clear the flag WITHOUT deleting the content snapshot.
+    const bus = new InProcessBus();
+    const durA = newDurable(true);
+
+    // 1. A real note at NOTE — this is the doc that WON the path (the second seed).
+    await durA.vault.writeAtomic(NOTE, utf8(CONTENT));
+
+    // 2. The superseded loser: a snapshot carrying meta.create pointing at NOTE, never bound live.
+    const loser = "device-a-1784780746251-0" as DocId;
+    const provider = new YjsCrdtProvider();
+    const loserDoc = provider.createDoc(loser);
+    loserDoc.getMap("meta").set("create", {
+      createdBy: "device-a" as DeviceId,
+      createdTs: "1784780746268",
+      originalPath: NOTE,
+    });
+    await durA.docStore.save(loser, loserDoc.encodeSnapshot());
+    loserDoc.destroy();
+    await durA.engineState.markDirty(loser);
+
+    const a = makeEngine(bus, durA, "device-a");
+    open.push(a.engine);
+    await a.engine.start();
+    await a.engine.waitConverged();
+
+    // The path is live under a DIFFERENT docId (the winner seeded from disk at bootstrap).
+    const winner = a.engine.index.get(NOTE);
+    expect(winner?.docId).toBeDefined();
+    expect(winner?.docId).not.toBe(loser);
+
+    // Flag cleared → no longer pending / wedging quiescence.
+    expect(await durA.engineState.listDirty()).not.toContain(loser);
+    expect(await a.engine.pendingDocs()).not.toContain(loser);
+    // CONTENT PRESERVED: the snapshot is kept, nothing was deleted.
+    expect(await durA.docStore.load(loser)).not.toBeNull();
+  });
 });
