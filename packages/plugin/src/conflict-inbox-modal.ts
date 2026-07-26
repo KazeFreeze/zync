@@ -90,7 +90,12 @@ export class ConflictInboxModal extends Modal {
     contentEl.empty();
 
     const entries = this.engine.inbox.list();
-    if (entries.length === 0) {
+    // STUCK is read straight from the engine, NOT from the inbox: the inbox is a SYNCED CrdtMap and
+    // stuck-ness is device-local (a peer holding the content is not stuck, and a dismiss there would
+    // flap against this device). Rendering it synthetically also keeps it out of "Dismiss all".
+    const stuck = this.engine.stuckDocs();
+
+    if (entries.length === 0 && stuck.length === 0) {
       const empty = contentEl.createDiv({ cls: "zync-empty" });
       setIcon(empty.createDiv({ cls: "zync-empty-icon" }), "check-circle");
       empty.createEl("p", { cls: "zync-empty-title", text: "You're all caught up" });
@@ -100,6 +105,9 @@ export class ConflictInboxModal extends Modal {
       });
       return;
     }
+
+    if (stuck.length > 0) this.renderStuckSection(contentEl, stuck);
+    if (entries.length === 0) return;
 
     // Resolve each entry's view once (drives both the rows and the bulk bar).
     const items = entries.map((entry) => {
@@ -138,6 +146,62 @@ export class ConflictInboxModal extends Modal {
     dismiss.onclick = () => {
       this.bulkDismiss(items.map((i) => i.entry.id));
     };
+  }
+
+  /**
+   * The STUCK section: a REPORT, not a chooser. A conflict row promises a decision with two safe
+   * buttons; these items may have NO available action, so they get no primary button (a fake CTA
+   * teaches users that buttons are decorative). Every stuck path is listed (the set is small by
+   * construction, bounded by the self-heal latch) rather than sampled, since this is the detail
+   * surface. "Open" appears only for a path that actually exists on disk.
+   */
+  private renderStuckSection(
+    parent: HTMLElement,
+    stuck: { docId: string; path: string | null }[],
+  ): void {
+    const list = parent.createDiv({ cls: "zync-list" });
+    const row = list.createDiv({ cls: "zync-row" });
+
+    const main = row.createDiv({ cls: "zync-row-main" });
+    const label = main.createDiv({ cls: "zync-row-label" });
+    const chip = label.createSpan({ cls: "zync-chip", text: "stuck" });
+    chip.dataset.kind = "stuck";
+    // Repeat the DOC count here: the status bar counts docs, so a single row must not read as "1".
+    label.createSpan({
+      cls: "zync-row-name",
+      text: stuck.length === 1 ? "1 item stuck" : `${String(stuck.length)} items stuck`,
+    });
+
+    const sub = row.createDiv({ cls: "zync-row-sub" });
+    sub.createSpan({
+      text: "Stopped syncing after repeated attempts. Reconnecting may clear this. ",
+    });
+
+    const SHOWN = 10;
+    for (const s of stuck.slice(0, SHOWN)) {
+      const line = sub.createDiv({ cls: "zync-row-sub" });
+      if (s.path === null) {
+        // No index entry: an untracked leftover. Never render a blank name.
+        line.createSpan({ text: `Untracked entry (${s.docId.slice(0, 8)})` });
+        continue;
+      }
+      line.createSpan({ text: `${baseName(s.path)} ` });
+      const onDisk = this.app.vault.getAbstractFileByPath(s.path) instanceof TFile;
+      if (onDisk) {
+        const path = s.path;
+        const a = line.createEl("a", { cls: "zync-inline-link", text: "Open", href: "#" });
+        a.onclick = (e): void => {
+          e.preventDefault();
+          void this.app.workspace.openLinkText(path, "", false);
+        };
+      } else {
+        // The defining symptom of the common class: the entry exists but its content never arrived.
+        line.createSpan({ cls: "zync-row-sub", text: "waiting for content that never arrived" });
+      }
+    }
+    if (stuck.length > SHOWN) {
+      sub.createDiv({ cls: "zync-row-sub", text: `+${String(stuck.length - SHOWN)} more` });
+    }
   }
 
   private renderRow(parent: HTMLElement, entry: InboxEntry, view: EntryView): void {

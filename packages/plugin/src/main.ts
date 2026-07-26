@@ -63,6 +63,13 @@ interface ZyncSettings {
    *  opt-in map is the real gate so nothing syncs until a plugin is explicitly opted in).
    *  Restart required to apply. */
   syncConfig: { themes: boolean; snippets: boolean; plugins: boolean; "plugin-data": boolean };
+  /**
+   * The stuck-doc SIGNATURE (sorted docIds) this device has already alerted on. Persisted so a
+   * PERSISTENT stuck set does not re-nag on every app start (frequent on Android, where the heal
+   * re-latches each launch), while a NEW stuck doc changes the signature and still breaks through.
+   * Device-local: Zync self-excludes its own plugin dir + data.json from config sync.
+   */
+  stuckAckSig?: string;
 }
 
 const DEFAULT_SETTINGS: ZyncSettings = {
@@ -86,6 +93,18 @@ const MAX_PROSE_BYTES = 1_000_000;
  * push-style via transport.onStatus and are unaffected by this constant.
  */
 const STATUS_POLL_INTERVAL_MS = 8_000;
+
+/**
+ * Long-form copy for the stuck state, shared by the status-bar tooltip and the sticky notice.
+ * States only what is true: these stopped and will not retry themselves. It deliberately avoids
+ * "needs attention" (implies an available action, which there may not be) and "error" (implies the
+ * plugin failed). Reconnecting DOES re-arm the heal, so that escape hatch is named.
+ */
+function stuckSummary(n: number): string {
+  return n === 1
+    ? "1 item stopped syncing and will not retry on its own. Reconnecting may clear it."
+    : `${String(n)} items stopped syncing and will not retry on their own. Reconnecting may clear them.`;
+}
 
 /** The standard "Restarting" toast, fired by every restart trigger. */
 function notifyRestarting(): void {
@@ -146,6 +165,8 @@ export default class ZyncPlugin extends Plugin {
   private conflictNotice: Notice | null = null;
   /** Single replace-in-place sticky for the loop-breaker "paused" warning. */
   private loopNotice: Notice | null = null;
+  /** Single replace-in-place sticky for the "stuck" warning (no stacking). */
+  private stuckNotice: Notice | null = null;
   /** Bumped on every start AND every stop; a start whose gen is stale was superseded (cancelled). */
   private startGen = 0;
 
@@ -594,12 +615,22 @@ export default class ZyncPlugin extends Plugin {
         : null;
     const nConf = engine ? engine.inbox.list().filter(isActionableConflict).length : 0;
     const nUpdates = engine ? engine.pendingPluginUpdates().length : 0;
+    // NEEDS-ATTENTION SPLIT: docs the bounded self-heal gave up on are still counted in `pending`
+    // (removing them there would clear the stop latch and make waitConverged lie), so split them out
+    // for DISPLAY only — otherwise the count silently never reaches 0 and the number loses its meaning.
+    const stuckDocs = engine ? engine.stuckDocs() : [];
+    const nStuck = stuckDocs.length;
+    const nSyncing = Math.max(0, pending - nStuck);
+    // Runs BEFORE the render memo: the alert is driven by the stuck SET changing, not by whether the
+    // status bar needs a repaint (and mobile has no status bar at all).
+    this.refreshStuckNotice(stuckDocs);
 
     // Render memo: renderStatus runs 2x per 8s poll + on every connection push. Skip the DOM
     // rebuild when the rendered state is unchanged (kills ~95% of the churn / any flicker).
     const key = [
       this.connText,
       pending,
+      nStuck,
       files ? `${String(files.done)}/${String(files.total)}/${String(files.failed)}` : "",
       nConf,
       nUpdates,
@@ -609,19 +640,28 @@ export default class ZyncPlugin extends Plugin {
 
     el.empty();
     el.addClass("zync-status");
-    const seg = (icon: string, text: string, modifier?: string): void => {
+    const seg = (icon: string, text: string, modifier?: string, tooltip?: string): void => {
       const s = el.createSpan({
         cls: modifier ? ["zync-status-seg", modifier] : "zync-status-seg",
       });
       setIcon(s, icon);
       s.createSpan({ text });
+      // A terse segment ("1 stuck") needs the long form somewhere reachable, incl. for screen readers.
+      if (tooltip !== undefined) {
+        s.setAttribute("aria-label", tooltip);
+        s.setAttribute("title", tooltip);
+      }
     };
 
     if (this.connText === "connected") seg("check-circle", "connected");
     else if (this.connText === "connecting") seg("refresh-cw", "connecting", "zync-status--muted");
     else if (this.connText === "error") seg("x-circle", "error", "zync-status--error");
     else seg("wifi-off", this.connText, "zync-status--muted"); // offline / not configured / other
-    if (pending > 0) seg("clock", `${String(pending)} pending`);
+    if (nSyncing > 0) seg("clock", `${String(nSyncing)} syncing`);
+    // "stuck", not "need attention": it promises no action (there may be none) and does not collide
+    // with the conflict sticky's "Needs attention" wording or the bare conflict count beside it.
+    if (nStuck > 0)
+      seg("alert-triangle", `${String(nStuck)} stuck`, "zync-status--error", stuckSummary(nStuck));
     if (files !== null)
       seg(
         "download",
@@ -633,8 +673,22 @@ export default class ZyncPlugin extends Plugin {
   }
 
   /** Compose the status line (shared by the desktop status bar and the "Zync: show status" command). */
-  private statusText(pending: number, files: string, conf: string, updates: string): string {
-    return `Zync: ${this.connText}${pending > 0 ? ` · ${String(pending)} pending` : ""}${files}${conf}${updates}`;
+  private statusText(
+    pending: number,
+    stuck: number,
+    files: string,
+    conf: string,
+    updates: string,
+  ): string {
+    // Same needs-attention split as the status bar: stuck docs stay inside `pending` for convergence
+    // semantics, but are reported separately so a non-zero count is always explainable.
+    const syncing = Math.max(0, pending - stuck);
+    return (
+      `Zync: ${this.connText}` +
+      (syncing > 0 ? ` · ${String(syncing)} syncing` : "") +
+      (stuck > 0 ? ` · ${String(stuck)} need attention` : "") +
+      `${files}${conf}${updates}`
+    );
   }
 
   private async explainActiveFile(): Promise<void> {
@@ -694,7 +748,8 @@ export default class ZyncPlugin extends Plugin {
     const conf = nConf > 0 ? ` · ${String(nConf)} conflict${nConf === 1 ? "" : "s"}` : "";
     const nUpdates = engine ? engine.pendingPluginUpdates().length : 0;
     const updates = nUpdates > 0 ? ` · ${String(nUpdates)} update${nUpdates === 1 ? "" : "s"}` : "";
-    return this.statusText(this.lastPending, files, conf, updates);
+    const nStuck = engine ? engine.stuckDocs().length : 0;
+    return this.statusText(this.lastPending, nStuck, files, conf, updates);
   }
 
   /** Execute a ConnectionAlert command as Obsidian Notices/timers (mobile only). */
@@ -770,6 +825,41 @@ export default class ZyncPlugin extends Plugin {
     }
     this.lastConflictCount = n;
     this.renderStatus(this.lastPending);
+  }
+
+  /**
+   * Sticky alert for the STUCK state. This is the ONLY push surface on mobile, which has no status
+   * bar, so without it the state is invisible on the plugin's primary platform.
+   *
+   * Fired on the stuck SET changing, never on a repaint: the engine only populates stuckDocs() after
+   * its bounded self-heal gives up, so there is no transient to debounce here. The signature (sorted
+   * docIds) is persisted, so a PERSISTENT stuck set alerts once and then stays quiet across restarts
+   * (Android relaunches would otherwise re-nag on every launch and train the user to ignore it),
+   * while a NEW stuck doc changes the signature and still breaks through.
+   */
+  private refreshStuckNotice(stuck: { docId: string; path: string | null }[]): void {
+    const sig = stuck
+      .map((s) => s.docId)
+      .sort()
+      .join(",");
+    if (sig === "") {
+      // Cleared (drained, or a reconnect re-armed the heal) — retire the sticky and re-arm alerting.
+      this.stuckNotice?.hide();
+      this.stuckNotice = null;
+      if (this.settings.stuckAckSig !== undefined) {
+        delete this.settings.stuckAckSig; // re-arm alerting for a future stuck set
+        void this.saveSettings();
+      }
+      return;
+    }
+    if (sig === this.settings.stuckAckSig) return; // already alerted on exactly this set
+    this.settings.stuckAckSig = sig;
+    void this.saveSettings();
+    this.stuckNotice?.hide(); // replace in place, never stack
+    this.stuckNotice = notifyWarning("Stuck", stuckSummary(stuck.length), {
+      label: "Review",
+      run: () => this.openInbox(),
+    });
   }
 
   /** Run an Obsidian command by id (the command bus is untyped in the public API). */

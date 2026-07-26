@@ -244,6 +244,60 @@ describe("F2 self-heal — drains pending after synced-stamp loss", () => {
     },
   );
 
+  // ── Test 2b: needs-attention surface ──────────────────────────────────────
+
+  it(
+    "2b) a stopped self-heal exposes the given-up docs DEVICE-LOCALLY (never the synced inbox) and retires them on re-arm",
+    { timeout: 20_000 },
+    async () => {
+      vi.useFakeTimers();
+      try {
+        const bus = new InProcessBus();
+        // Same never-clearing rig as test 2: the doc can never satisfy stamp == syncedStamp.
+        const stuckState = new MemEngineState();
+        stuckState.setSyncedStamp = (): Promise<void> => Promise.resolve();
+
+        const { engine, vault } = makeEngine(bus, "dev-a", stuckState);
+        const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+        await engine.start();
+        await vault.writeAtomic(path("stuck/x.md"), utf8("cannot-clear"));
+        await engine.whenIdle();
+
+        // Before the self-heal gives up, nothing is stuck — an ordinary pending doc is just syncing.
+        // (Gating on the stop latch is what prevents first-sync false flares.)
+        expect(engine.stuckDocs()).toEqual([]);
+
+        // Drive to the bound so the episode STOPS.
+        engine.requestSelfHeal();
+        await engine.whenIdle();
+        await driveSelfHeal(engine, SELFHEAL_MAX_NO_PROGRESS + 2);
+        await engine.whenIdle();
+
+        // Now the given-up docs are surfaced, resolved to their paths.
+        const stuck = engine.stuckDocs();
+        expect(stuck.length).toBeGreaterThan(0);
+        expect(stuck.map((s) => s.path)).toContain(path("stuck/x.md"));
+        // DEVICE-LOCAL: stuck-ness must NEVER enter the SYNCED inbox. A peer that holds the content
+        // would wrongly render "not syncing", and a dismiss there would flap against this device.
+        expect(engine.inbox.list().some((e) => e.id === "sync:stuck")).toBe(false);
+
+        // They STAY pending: removing them would let pending read empty, clearing the stop latch and
+        // re-arming this loop forever (and would make waitConverged lie).
+        expect((await engine.pendingDocs()).length).toBeGreaterThan(0);
+
+        // A fresh attempt (reconnect / manual reflush) retires the stale give-up surface.
+        engine.requestSelfHeal();
+        expect(engine.stuckDocs()).toEqual([]);
+
+        warnSpy.mockRestore();
+        await engine.stop();
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
   // ── Test 3: yields-to-live-work ───────────────────────────────────────────
 
   it(

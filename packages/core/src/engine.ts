@@ -661,6 +661,14 @@ export class SyncEngine {
    * whenever pending is observed empty (the episode is over — a later reset re-arms fresh).
    */
   private selfHealStopped = false;
+  /**
+   * The docIds the self-heal GAVE UP on for the current episode — the "needs attention" set behind
+   * {@link stuckDocs}. Populated ONLY when the bounded self-heal stops (never from the raw
+   * pending signature: during a genuine first sync every doc transiently looks un-acked, so
+   * classifying on that alone would flare thousands of false items). Cleared wherever
+   * `selfHealStopped` is, so a drain or fresh connectivity retires the surface.
+   */
+  private stuckDocIds: DocId[] = [];
   /** Reconnect-heal jitter timer; null when not pending. Cleared in stop() and when it fires. */
   private reconnectHealTimer: ReturnType<typeof setTimeout> | null = null;
   /**
@@ -2055,6 +2063,26 @@ export class SyncEngine {
     });
   }
 
+  /**
+   * The docs the bounded self-heal GAVE UP on: pending that will NOT drain on its own (a genuinely
+   * un-ackable doc, or content no peer can supply). Each is resolved to its current path when it
+   * still has an index entry; an entry-less docId (e.g. an orphaned dirty marker) reports `null`.
+   * READ-ONLY. Empty at steady state, and empties again as soon as pending drains or new
+   * connectivity re-arms the self-heal.
+   *
+   * DEVICE-LOCAL BY DESIGN — deliberately NOT published to the {@link Inbox}. The inbox is a SYNCED
+   * `CrdtMap`, but stuck-ness is a property of THIS device's view: a healthy peer that holds the
+   * content would wrongly render "not syncing", and a dismiss on one device would tombstone an entry
+   * that this device immediately re-adds (cross-device flap). The UI renders this as a synthetic
+   * section read straight from here instead.
+   */
+  stuckDocs(): { docId: DocId; path: VaultPath | null }[] {
+    if (this.stuckDocIds.length === 0) return [];
+    const pathOf = new Map<DocId, VaultPath>();
+    for (const [p, e] of this.index.entries()) if (!pathOf.has(e.docId)) pathOf.set(e.docId, p);
+    return this.stuckDocIds.map((docId) => ({ docId, path: pathOf.get(docId) ?? null }));
+  }
+
   /** Background blob fetch progress (materialized / total advertised / parked-failed). */
   blobProgress(): { materialized: number; total: number; failed: number } {
     return this.blobEngine.blobProgress();
@@ -2972,6 +3000,12 @@ export class SyncEngine {
         `[zync] self-heal STOPPED after ${reason}; ${String(pendingAfter.size)} doc(s) remain ` +
           `un-ackable and stay pending (real stuck relay/conflict): ${stuckSample}`,
       );
+      // STUCK SURFACE: the bounded self-heal has given up on these docs, so they will not drain on
+      // their own. Record them (device-local — see stuckDocs) so the UI can say "N syncing, 1 stuck"
+      // instead of a pending count that silently never reaches 0. They deliberately STAY in
+      // pendingDocs(): removing them would let pending read empty, which clears the stop latch and
+      // re-arms this loop forever, and would also make waitConverged lie. PRESENTATION split only.
+      this.stuckDocIds = [...pendingAfterList];
       return;
     }
 
@@ -3009,6 +3043,13 @@ export class SyncEngine {
     this.selfHealNoProgress = 0;
     this.selfHealPasses = 0;
     this.selfHealStopped = false;
+    // The episode is over (drained or torn down) → retire the needs-attention surface.
+    this.clearStuckDocs();
+  }
+
+  /** Drop the needs-attention set and tombstone its aggregate inbox item. Idempotent. */
+  private clearStuckDocs(): void {
+    this.stuckDocIds = [];
   }
 
   /**
@@ -3497,6 +3538,7 @@ export class SyncEngine {
     this.selfHealStopped = false;
     this.selfHealNoProgress = 0;
     this.selfHealPasses = 0;
+    this.clearStuckDocs(); // a fresh attempt is starting — the old give-up surface is stale
     this.auditRequested = true;
     this.scheduleReconcile();
   }
@@ -3517,6 +3559,7 @@ export class SyncEngine {
     this.selfHealStopped = false; // new connectivity → retry even if a prior episode gave up
     this.selfHealNoProgress = 0;
     this.selfHealPasses = 0;
+    this.clearStuckDocs(); // a fresh attempt is starting — the old give-up surface is stale
     this.auditRequested = true;
     this.scheduleReconcile();
   }

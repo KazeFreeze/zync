@@ -119,6 +119,11 @@
   background: rgba(var(--color-cyan-rgb), 0.15);
   color: var(--color-cyan);
 }
+/* Stuck: a REPORT (may have no action), distinct from an actionable conflict. */
+.zync-chip[data-kind="stuck"] {
+  background: rgba(var(--color-yellow-rgb), 0.15);
+  color: var(--color-yellow);
+}
 
 /* Compact buttons */
 .zync-btn {
