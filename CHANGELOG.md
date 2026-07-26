@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.2](https://github.com/KazeFreeze/zync/compare/zync-v0.5.1...zync-v0.5.2) (2026-07-26)
+
+
+### Bug Fixes
+
+* **core:** stop first-seen double-seed minting two docIds per path ([6d7e0de](https://github.com/KazeFreeze/zync/commit/6d7e0de44a60e583e239957766a27e502c89e409))
+
 ## [0.5.1](https://github.com/KazeFreeze/zync/compare/zync-v0.5.0...zync-v0.5.1) (2026-07-25)
 
 
