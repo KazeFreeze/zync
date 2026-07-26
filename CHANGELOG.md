@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/KazeFreeze/zync/compare/zync-v0.6.0...zync-v0.6.1) (2026-07-26)
+
+
+### Bug Fixes
+
+* **plugin:** stop the stuck row claiming attempts that never happened ([68832c2](https://github.com/KazeFreeze/zync/commit/68832c2aae4673762b002b74308f972efa0e04d9))
+
 ## [0.6.0](https://github.com/KazeFreeze/zync/compare/zync-v0.5.2...zync-v0.6.0) (2026-07-26)
 
 
