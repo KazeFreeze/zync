@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/KazeFreeze/zync/compare/zync-v0.5.2...zync-v0.6.0) (2026-07-26)
+
+
+### Features
+
+* **plugin:** surface stuck docs as their own state, device-locally ([ebe29bf](https://github.com/KazeFreeze/zync/commit/ebe29bfaaea9bf51faf8d626559f47b98b2b0be8))
+
 ## [0.5.2](https://github.com/KazeFreeze/zync/compare/zync-v0.5.1...zync-v0.5.2) (2026-07-26)
 
 
