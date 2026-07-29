@@ -680,13 +680,14 @@ export default class ZyncPlugin extends Plugin {
     conf: string,
     updates: string,
   ): string {
-    // Same needs-attention split as the status bar: stuck docs stay inside `pending` for convergence
-    // semantics, but are reported separately so a non-zero count is always explainable.
+    // Same split as the status bar: stuck docs stay inside `pending` for convergence semantics, but
+    // are reported separately so a non-zero count is always explainable. Wording MUST match the
+    // status-bar segment ("stuck") — this line is the same fact on a different surface.
     const syncing = Math.max(0, pending - stuck);
     return (
       `Zync: ${this.connText}` +
       (syncing > 0 ? ` · ${String(syncing)} syncing` : "") +
-      (stuck > 0 ? ` · ${String(stuck)} need attention` : "") +
+      (stuck > 0 ? ` · ${String(stuck)} stuck` : "") +
       `${files}${conf}${updates}`
     );
   }
