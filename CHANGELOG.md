@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.2](https://github.com/KazeFreeze/zync/compare/zync-v0.6.1...zync-v0.6.2) (2026-07-29)
+
+
+### Bug Fixes
+
+* **plugin:** match the status line to the status bar on stuck wording ([235d759](https://github.com/KazeFreeze/zync/commit/235d759832e3af201cb193093e5a9755485d7962))
+
 ## [0.6.1](https://github.com/KazeFreeze/zync/compare/zync-v0.6.0...zync-v0.6.1) (2026-07-26)
 
 
