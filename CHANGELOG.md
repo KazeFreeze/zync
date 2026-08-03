@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/KazeFreeze/zync/compare/zync-v0.7.0...zync-v0.8.0) (2026-08-03)
+
+
+### Features
+
+* **plugin:** render synced settings from the local index, not the relay ([20daf1e](https://github.com/KazeFreeze/zync/commit/20daf1e7cad223a1620f3dc2b4a9f657e39f7194))
+
 ## [0.7.0](https://github.com/KazeFreeze/zync/compare/zync-v0.6.6...zync-v0.7.0) (2026-08-03)
 
 
