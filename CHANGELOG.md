@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.6](https://github.com/KazeFreeze/zync/compare/zync-v0.6.5...zync-v0.6.6) (2026-08-03)
+
+
+### Bug Fixes
+
+* **plugin:** stop showing an unloaded index as "nothing is synced" ([c8e7411](https://github.com/KazeFreeze/zync/commit/c8e7411abd4f17c082275dcba1ed9c8579bc1fe3))
+
 ## [0.6.5](https://github.com/KazeFreeze/zync/compare/zync-v0.6.4...zync-v0.6.5) (2026-08-03)
 
 
