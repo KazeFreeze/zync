@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.5](https://github.com/KazeFreeze/zync/compare/zync-v0.6.4...zync-v0.6.5) (2026-08-03)
+
+
+### Bug Fixes
+
+* **plugin:** sort the synced-plugins list by display name ([63ba998](https://github.com/KazeFreeze/zync/commit/63ba998614c992e786186f069b396497c6ec10c6))
+
 ## [0.6.4](https://github.com/KazeFreeze/zync/compare/zync-v0.6.3...zync-v0.6.4) (2026-08-03)
 
 
