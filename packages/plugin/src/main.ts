@@ -967,6 +967,16 @@ export default class ZyncPlugin extends Plugin {
     await this.saveData(this.settings);
   }
 
+  /**
+   * True once the shared index has arrived from the relay. Until then every index-backed map is
+   * empty, so rendering it would show real choices as "off" and let a write be lost to the merge.
+   * False while the engine is not started, which is the same "do not trust absence" situation.
+   */
+  isIndexSynced(): boolean {
+    if (!this.engineReady || this.engine === null) return false;
+    return this.engine.isIndexSynced();
+  }
+
   /** Returns all plugins with a shared opt-in entry. Empty when engine is not yet started. */
   listPluginOptIn(): { id: string; optIn: boolean; isDesktopOnly: boolean }[] {
     if (!this.engineReady || this.engine === null) return [];
@@ -1221,6 +1231,26 @@ class ZyncSettingTab extends PluginSettingTab {
             this.display();
           }),
       );
+    }
+
+    // NOT-YET-SYNCED GATE: until the shared index completes its first handshake, every index-backed
+    // map is still EMPTY — which reads exactly like "no plugin is opted in", so the rows would all
+    // render OFF and invite the user to "fix" state that is merely in transit. Worse, a toggle
+    // written into the not-yet-populated doc can then LOSE the merge against the arriving relay
+    // state, so the change appears to revert. Show the real situation and accept no writes yet.
+    if (!disabled && !this.plugin.isIndexSynced()) {
+      const waiting = new Setting(containerEl)
+        .setName("Loading plugin sync settings")
+        .setDesc(
+          "Waiting for the shared list to arrive from the relay. Your current choices will appear here.",
+        );
+      waiting.settingEl.addClass("zync-section-notice");
+      waiting.addButton((b) =>
+        b.setButtonText("Check again").onClick(() => {
+          this.display();
+        }),
+      );
+      return;
     }
 
     const optedIn = new Set(

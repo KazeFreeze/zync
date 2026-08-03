@@ -512,6 +512,24 @@ describe("M1b — materializedHash observed at bootstrap", () => {
     expect(await a.engine.pendingDocs()).not.toContain(ghost); // and no longer wedges quiescence
   });
 
+  it("isIndexSynced reports whether the shared index actually arrived, independent of start()", async () => {
+    // REGRESSION (user-reported 2026-08-03): start() deliberately completes WITHOUT the first index
+    // sync when the budget expires, so `engineReady` alone says nothing about whether index-backed
+    // maps are populated. An empty map reads exactly like "nothing is set", which rendered every
+    // per-plugin Sync toggle as OFF and invited the user to re-toggle state that was merely in
+    // transit — a write that could then LOSE the merge against the arriving relay state.
+    const bus = new InProcessBus();
+    const durA = newDurable(true);
+    const a = makeEngine(bus, durA, "device-a");
+    open.push(a.engine);
+
+    await a.engine.start();
+    await a.engine.waitConverged();
+
+    // Connected in this rig, so the handshake lands and the latch is true.
+    expect(a.engine.isIndexSynced()).toBe(true);
+  });
+
   it("bootstrap REUSES a durable path binding instead of re-minting when the index has not loaded", async () => {
     // REGRESSION (real Pixel phone, 2026-08-03): start() waits only a BOUNDED time for the first
     // index sync, then deliberately falls through to bootstrap. On a slow mobile link the index is

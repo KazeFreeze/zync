@@ -662,6 +662,12 @@ export class SyncEngine {
    */
   private selfHealStopped = false;
   /**
+   * Latched true once the shared index doc completes its first relay handshake this session.
+   * See {@link isIndexSynced} — `start()` can complete WITHOUT this when the sync budget expires.
+   */
+  private indexSyncedOnce = false;
+
+  /**
    * The docIds the self-heal GAVE UP on for the current episode — the "needs attention" set behind
    * {@link stuckDocs}. Populated ONLY when the bounded self-heal stops (never from the raw
    * pending signature: during a genuine first sync every doc transiently looks un-acked, so
@@ -758,6 +764,19 @@ export class SyncEngine {
     // partition and would hang forever, so we let bootstrap seed locally instead.
     // On reconnect the index doc auto-resyncs and the index-observe subscription
     // drives convergence without a re-attach.
+    // INDEX-SYNCED SIGNAL: latch true whenever the first handshake lands, on EITHER rail. start()
+    // deliberately completes without it when the budget expires (below), so `engineReady` alone does
+    // NOT mean the shared index arrived — and a caller that reads a map before it does sees an EMPTY
+    // map, which is indistinguishable from "nothing is set". That misread every per-plugin Sync
+    // toggle as OFF. Callers that would otherwise present absence as a real value must gate on
+    // {@link isIndexSynced} instead.
+    void this.indexAttached.synced().then(
+      () => {
+        this.indexSyncedOnce = true;
+      },
+      () => undefined, // close/detach — leave the latch false; a later attach re-arms it
+    );
+
     const conn = transport.status();
     if (conn === "connected" || conn === "connecting") {
       // BOUNDED await: a flaky mobile link can leave synced() pending far longer than the
@@ -1603,6 +1622,20 @@ export class SyncEngine {
    * shared-consent model: opting a plugin in on one device surfaces it as opted-in
    * everywhere). Returns `[]` when the engine is not started.
    */
+  /**
+   * True once the shared index has completed its FIRST handshake with the relay this session.
+   *
+   * `start()` resolving does NOT imply this: when the first sync exceeds its budget the engine
+   * deliberately proceeds on the offline rail so a flaky link cannot hang startup. Until this is
+   * true, every index-backed map (opt-in, meta, enabled, tree) may still be EMPTY, and an empty map
+   * reads exactly like "nothing is set". Any UI that would render absence as a real value (an OFF
+   * toggle, a zero count) must gate on this, or it will show — and let the user overwrite — state
+   * that merely has not arrived yet.
+   */
+  isIndexSynced(): boolean {
+    return this.indexSyncedOnce;
+  }
+
   listPluginOptIn(): { id: string; optIn: boolean; isDesktopOnly: boolean }[] {
     const optInMap = this.pluginsOptIn;
     const metaMap = this.pluginsMeta;
