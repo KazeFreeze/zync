@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.3](https://github.com/KazeFreeze/zync/compare/zync-v0.6.2...zync-v0.6.3) (2026-08-03)
+
+
+### Bug Fixes
+
+* **core:** stop a not-yet-loaded index re-seeding the whole vault ([db85193](https://github.com/KazeFreeze/zync/commit/db851936f0fd31d7f82523ae2167e9b74309fdbd))
+
 ## [0.6.2](https://github.com/KazeFreeze/zync/compare/zync-v0.6.1...zync-v0.6.2) (2026-07-29)
 
 
