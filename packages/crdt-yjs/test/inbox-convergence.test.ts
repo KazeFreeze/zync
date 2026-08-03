@@ -69,4 +69,38 @@ describe("Inbox convergence over real YjsCrdtMap (resolve-tombstones-everywhere)
     a.doc.destroy();
     b.doc.destroy();
   });
+  it("resolveMany batches into ONE Yjs transaction (one observer fire, one update)", () => {
+    // REGRESSION: bulk dismiss resolved ids one at a time, so a large inbox meant N Yjs
+    // transactions and N observer cascades on the main thread — Obsidian froze. Proven here
+    // against the REAL YjsCrdtMap, since the single-replica fake cannot prove Yjs semantics.
+    const a = makeReplica();
+    const ids = ["i1", "i2", "i3", "i4", "i5", "i6"];
+    for (const id of ids) a.inbox.add({ ...ENTRY, id });
+
+    let fires = 0;
+    let seen: string[] = [];
+    a.inbox.observe((changed) => {
+      fires += 1;
+      seen = [...seen, ...changed];
+    });
+    let updates = 0;
+    a.doc.on("update", () => {
+      updates += 1;
+    });
+
+    a.inbox.resolveMany(ids);
+
+    expect(fires).toBe(1); // ONE observer fire for the whole batch
+    expect(updates).toBe(1); // ONE encoded update on the wire, not six
+    expect(seen.sort()).toEqual([...ids].sort());
+    expect(a.inbox.list()).toEqual([]);
+
+    // The batch still RELAYS: a peer applying that single update sees every tombstone.
+    const b = makeReplica();
+    sync(a.doc, b.doc);
+    expect(b.inbox.list()).toEqual([]);
+
+    a.doc.destroy();
+    b.doc.destroy();
+  });
 });

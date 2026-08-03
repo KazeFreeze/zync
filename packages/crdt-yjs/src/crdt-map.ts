@@ -33,8 +33,13 @@ export class YjsCrdtMap<V> implements CrdtMap<V> {
     });
   }
 
-  /** Run `fn` in a `"local-bridge"`-origin transaction when the map is doc-bound. */
-  private transact(fn: () => void): void {
+  /**
+   * Run `fn` in a `"local-bridge"`-origin transaction when the map is doc-bound. PUBLIC so callers
+   * can batch a bulk mutation into ONE transaction: `Y.Map` fires its observer once per
+   * transaction, so batching collapses N observer cascades into one. Yjs already merges a nested
+   * `doc.transact` into the outer one, so nesting is safe.
+   */
+  transact(fn: () => void): void {
     const doc = this.ymap.doc;
     if (doc === null) {
       fn();

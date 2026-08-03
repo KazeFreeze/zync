@@ -145,7 +145,7 @@ export class ConflictInboxModal extends Modal {
       text: "Dismiss all",
     });
     dismiss.onclick = () => {
-      this.bulkDismiss(items.map((i) => i.entry.id));
+      void this.bulkDismiss(items.map((i) => i.entry.id));
     };
   }
 
@@ -342,8 +342,21 @@ export class ConflictInboxModal extends Modal {
     this.render();
   }
 
-  private bulkDismiss(ids: string[]): void {
-    for (const id of ids) this.engine.inbox.resolve(id);
+  /**
+   * Clear many entries without freezing Obsidian. Two problems had to be fixed together: each
+   * resolve was its OWN CRDT transaction (so N entries meant N transactions AND N observer
+   * cascades), and the whole loop ran synchronously on the main thread (so the UI could not paint
+   * until it finished). Now each CHUNK is one batched transaction, and we yield between chunks so
+   * the app stays responsive on an inbox with hundreds of entries.
+   */
+  private async bulkDismiss(ids: string[]): Promise<void> {
+    const CHUNK = 50;
+    for (let i = 0; i < ids.length; i += CHUNK) {
+      this.engine.inbox.resolveMany(ids.slice(i, i + CHUNK));
+      // Yield to the event loop so Obsidian can paint between chunks (a macrotask, not a
+      // microtask: a microtask would run before the browser gets a chance to render).
+      if (i + CHUNK < ids.length) await new Promise((r) => setTimeout(r, 0));
+    }
     notifySuccess(
       "Cleared",
       `Cleared ${String(ids.length)} item${ids.length === 1 ? "" : "s"} from the inbox.`,

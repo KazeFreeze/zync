@@ -43,6 +43,14 @@ export interface CrdtMap<V> {
   delete(key: string): void;
   entries(): [string, V][];
   observe(cb: (changedKeys: string[]) => void): Unsubscribe;
+  /**
+   * Run `fn` as ONE atomic batch: every mutation inside lands in a single CRDT transaction, so
+   * observers fire ONCE with all changed keys instead of once per key. Without this a bulk op is
+   * N transactions AND N observer cascades on the main thread, which is what froze the UI when
+   * dismissing a large inbox. Optional so existing adapters stay valid; callers must fall back to
+   * plain per-key mutation when it is absent.
+   */
+  transact?(fn: () => void): void;
 }
 
 export type VaultEvent =

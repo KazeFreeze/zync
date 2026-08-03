@@ -35,7 +35,33 @@ export class FakeCrdtMap<V> implements CrdtMap<V> {
     return () => this.listeners.delete(cb);
   }
 
+  /**
+   * Batch mutations into ONE observer fire, mirroring `Y.Map`'s one-event-per-transaction
+   * semantics (a real Yjs observer receives a single event carrying every changed key). Modelling
+   * this is what makes "bulk ops do not storm observers" testable against the fake.
+   */
+  transact(fn: () => void): void {
+    if (this.batch !== null) {
+      fn(); // already inside a batch — nested transactions collapse into the outer one
+      return;
+    }
+    this.batch = new Set<string>();
+    try {
+      fn();
+    } finally {
+      const keys = [...this.batch];
+      this.batch = null;
+      if (keys.length > 0) for (const l of this.listeners) l(keys);
+    }
+  }
+
+  private batch: Set<string> | null = null;
+
   private emit(key: string): void {
+    if (this.batch !== null) {
+      this.batch.add(key);
+      return;
+    }
     for (const l of this.listeners) l([key]);
   }
 }

@@ -64,6 +64,20 @@ export class Inbox {
     this.map.set(id, { ...existing, deleted: true });
   }
 
+  /**
+   * Resolve MANY ids as one atomic batch. Bulk dismissal used to call {@link resolve} in a tight
+   * loop, so a large inbox became N CRDT transactions AND N observer cascades on the main thread —
+   * which froze Obsidian. Batching collapses that to ONE transaction and ONE observer fire.
+   * Falls back to the per-id path when the map has no `transact` seam (unchanged behaviour).
+   */
+  resolveMany(ids: readonly string[]): void {
+    const run = (): void => {
+      for (const id of ids) this.resolve(id);
+    };
+    if (this.map.transact !== undefined) this.map.transact(run);
+    else run();
+  }
+
   /** Observe changes; the callback receives the changed entry ids. */
   observe(cb: (changedIds: string[]) => void): Unsubscribe {
     return this.map.observe(cb);

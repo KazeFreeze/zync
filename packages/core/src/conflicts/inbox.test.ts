@@ -61,4 +61,38 @@ describe("Inbox (synced over a CrdtMap<InboxEntry>, per-entry LWW)", () => {
     expect(cb).toHaveBeenCalledWith(["x"]);
     expect(cb).toHaveBeenCalledTimes(2);
   });
+
+  describe("resolveMany (bulk dismiss)", () => {
+    it("resolves every id in ONE observer fire, not one per id", () => {
+      // REGRESSION: bulk dismiss called resolve() in a tight loop, so a large inbox became N CRDT
+      // transactions AND N observer cascades on the main thread — which froze Obsidian.
+      const map = new FakeCrdtMap<InboxEntry>();
+      const inbox = new Inbox(map);
+      const ids = ["a", "b", "c", "d", "e"];
+      for (const id of ids) inbox.add(entry({ id }));
+
+      const cb = vi.fn();
+      map.observe(cb); // subscribe AFTER the adds so we only measure the bulk op
+      inbox.resolveMany(ids);
+
+      expect(cb).toHaveBeenCalledTimes(1);
+      expect((cb.mock.calls[0]?.[0] as string[]).sort()).toEqual([...ids].sort());
+      expect(inbox.list()).toEqual([]); // all actually resolved
+    });
+
+    it("is a no-op for unknown ids and tolerates an empty list", () => {
+      const map = new FakeCrdtMap<InboxEntry>();
+      const inbox = new Inbox(map);
+      inbox.add(entry({ id: "real" }));
+      const cb = vi.fn();
+      map.observe(cb);
+
+      inbox.resolveMany([]); // nothing to do ⇒ no observer noise
+      expect(cb).not.toHaveBeenCalled();
+
+      inbox.resolveMany(["ghost", "real"]); // unknown id skipped, real one resolved
+      expect(cb).toHaveBeenCalledTimes(1);
+      expect(inbox.list()).toEqual([]);
+    });
+  });
 });
