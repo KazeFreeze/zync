@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/KazeFreeze/zync/compare/zync-v0.6.6...zync-v0.7.0) (2026-08-03)
+
+
+### Features
+
+* **core:** persist the shared index so a restart is not blind ([ed86bfc](https://github.com/KazeFreeze/zync/commit/ed86bfcc31a7938b31442a2e9a7cd8796055b827))
+
 ## [0.6.6](https://github.com/KazeFreeze/zync/compare/zync-v0.6.5...zync-v0.6.6) (2026-08-03)
 
 
