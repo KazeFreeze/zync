@@ -11,6 +11,27 @@ export type Unsubscribe = () => void;
  */
 export const INDEX_DOC_ID = "__zync_index__" as DocId;
 
+/**
+ * A locally persisted snapshot of the shared index doc, so a restart does not begin with an EMPTY
+ * index while it waits on the relay. That amnesia was the single root cause behind a whole-vault
+ * re-seed, a silently lost plugin opt-in, and settings rendering real choices as "off".
+ *
+ * IDENTITY-BOUND ON PURPOSE. Restoring a snapshot into a DIFFERENT vault or relay would push this
+ * device's entire stale tree into an empty index and resurrect an old vault inside a new one,
+ * silently. `identity` and `version` must both match or the snapshot MUST be discarded, so a
+ * re-pointed relay, a reset vault, or a format change degrades to the (safe) empty-index path.
+ */
+export interface IndexSnapshotRecord {
+  /** Storage format version. Bump to invalidate every stored snapshot fleet-wide. */
+  version: number;
+  /** Identifies the vault/relay this snapshot belongs to. Mismatch ⇒ discard. */
+  identity: string;
+  /** CRDT substrate tag ("yjs"). Mismatch ⇒ discard. */
+  substrate: string;
+  /** The encoded doc snapshot. */
+  snapshot: Uint8Array;
+}
+
 export interface TextEdit {
   at: number;
   delete: number;
@@ -206,6 +227,16 @@ export interface EngineStateStore {
   /** Device-local, NON-synced set of plugin ids this device refuses to enable (Slice 2b suppress). */
   getLocalSuppress(): Promise<string[]>;
   setLocalSuppress(ids: string[]): Promise<void>;
+  /**
+   * The persisted shared-index snapshot (see {@link IndexSnapshotRecord}). OPTIONAL so existing
+   * adapters stay valid; when absent the engine simply starts from an empty index exactly as before.
+   *
+   * Deliberately NOT stored via `docStore`: `docStore.list()` is consumed as "the set of NOTE docs"
+   * (durable path→docId reuse, the orphan sweep's docSet, the dirty scan), and putting the index doc
+   * in that namespace would make those scans depend on it being skipped by luck rather than design.
+   */
+  getIndexSnapshot?(): Promise<IndexSnapshotRecord | null>;
+  setIndexSnapshot?(rec: IndexSnapshotRecord): Promise<void>;
 }
 /**
  * Slice 2b: narrow wrapper around the undocumented `app.plugins` runtime API. Confined to the

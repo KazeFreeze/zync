@@ -380,6 +380,10 @@ export default class ZyncPlugin extends Plugin {
           // a device with "snippets on, themes off" never uploads or downloads theme files.
           configCategories: this.settings.syncConfig,
           isMobile: Platform.isMobile,
+          // Binds the persisted index snapshot to THIS relay. Point the plugin at a different
+          // relay and the identity stops matching, so the stale snapshot is discarded rather than
+          // pushing an old vault's entire tree into the new one.
+          indexIdentity: this.settings.serverWs,
         },
       );
       this.engine = engine;
@@ -983,11 +987,18 @@ export default class ZyncPlugin extends Plugin {
     return this.engine.listPluginOptIn();
   }
 
-  /** Opt a plugin in/out of sync. No-op when engine is not yet started. */
+  /**
+   * Opt a plugin in/out of sync. THROWS when the engine is not usable yet.
+   *
+   * This used to no-op silently, which was indistinguishable from a broken toggle: the click was
+   * discarded, the immediate re-render read unchanged state, and the toggle snapped back with no
+   * explanation. A dropped write must be reported, never swallowed.
+   */
   async setPluginOptIn(id: string, optIn: boolean): Promise<void> {
-    if (this.engineReady && this.engine !== null) {
-      await this.engine.setPluginOptIn(id, optIn);
+    if (!this.engineReady || this.engine === null) {
+      throw new Error("Zync is still starting. Try again in a moment.");
     }
+    await this.engine.setPluginOptIn(id, optIn);
   }
 
   // ── Task 9: suppress control + enabled indicator delegates ───────────────
@@ -1065,6 +1076,14 @@ class ZyncSettingTab extends PluginSettingTab {
    * instant you flip an override.
    */
   private readonly expandedPluginIds = new Set<string>();
+  /**
+   * Plugin ids whose opt-in change is STILL RUNNING. Opting in is not instantaneous — the engine
+   * reads the manifest, seeds the shared enabled bit, publishes every file of the plugin bundle and
+   * then its settings, and only then does that reach other devices. A bare on/off toggle cannot
+   * express that middle, so a working change looked like nothing had happened. Held outside
+   * display() for the same reason as the expanded set: we re-render on every change.
+   */
+  private readonly inFlightOptIn = new Set<string>();
 
   constructor(app: App, plugin: ZyncPlugin) {
     super(app, plugin);
@@ -1314,14 +1333,33 @@ class ZyncSettingTab extends PluginSettingTab {
     });
 
     // Primary Sync toggle — the opt-in / master gate for this plugin.
+    const inFlight = this.inFlightOptIn.has(p.id);
+    if (inFlight) {
+      // The middle state a bare toggle cannot express: the change is applying and has not
+      // necessarily reached other devices yet. Word-first, per the UI standard.
+      row.descEl.createSpan({ cls: "zync-note", text: "Applying…" });
+    }
     row.addToggle((t) =>
       t
         .setValue(synced)
         .setTooltip("Sync this plugin across devices")
-        .setDisabled(disabled)
+        // Disabled while its own change runs, so a second click cannot race the first.
+        .setDisabled(disabled || inFlight)
         .onChange(async (v) => {
-          await this.plugin.setPluginOptIn(p.id, v);
-          this.display();
+          this.inFlightOptIn.add(p.id);
+          this.display(); // show "Applying…" immediately
+          try {
+            await this.plugin.setPluginOptIn(p.id, v);
+          } catch (err) {
+            // NEVER fail silently: a dropped opt-in is indistinguishable from a broken toggle.
+            notifyWarning(
+              "Could not change sync",
+              `${p.name}: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          } finally {
+            this.inFlightOptIn.delete(p.id);
+            this.display();
+          }
         }),
     );
 

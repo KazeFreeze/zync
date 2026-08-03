@@ -14,6 +14,7 @@
  */
 import type { DocId, EngineStateStore, Sha256, Stamp, VaultPath } from "@zync/core";
 import { ENGINE_STATE_STORE, META_STORE, type EngineStateRecord, type ZyncDb } from "./idb-open.js";
+import type { IndexSnapshotRecord } from "@zync/core";
 
 function emptyRecord(): EngineStateRecord {
   return { syncedStamp: null, dirty: false };
@@ -133,6 +134,17 @@ export class IdbEngineState implements EngineStateStore {
 
   async setLocalSuppress(ids: string[]): Promise<void> {
     await this.db.put(META_STORE, ids, "localSuppress");
+  }
+
+  async getIndexSnapshot(): Promise<IndexSnapshotRecord | null> {
+    const raw = await this.db.get(META_STORE, "indexSnapshot");
+    return (raw as IndexSnapshotRecord | undefined) ?? null;
+  }
+
+  /** ONE put in ONE IndexedDB transaction: it commits atomically or not at all, so a kill leaves
+   *  the previous snapshot rather than a torn one. Never split this across records. */
+  async setIndexSnapshot(rec: IndexSnapshotRecord): Promise<void> {
+    await this.db.put(META_STORE, rec, "indexSnapshot");
   }
 
   /**

@@ -48,7 +48,12 @@ interface Device {
   engine: SyncEngine;
   transport: InProcessTransport;
 }
-function makeEngine(bus: InProcessBus, d: Durable, deviceId: string): Device {
+function makeEngine(
+  bus: InProcessBus,
+  d: Durable,
+  deviceId: string,
+  indexIdentity?: string,
+): Device {
   const transport = bus.connect();
   const ports: EnginePorts = {
     vault: d.vault,
@@ -65,6 +70,8 @@ function makeEngine(bus: InProcessBus, d: Durable, deviceId: string): Device {
     maxProseBytes: 1_000_000,
     substrate: "yjs",
     stampDebounceMs: 0,
+    // exactOptionalPropertyTypes: omit the key entirely rather than passing undefined.
+    ...(indexIdentity === undefined ? {} : { indexIdentity }),
   };
   return { engine: new SyncEngine(ports, config), transport };
 }
@@ -510,6 +517,59 @@ describe("M1b — materializedHash observed at bootstrap", () => {
 
     expect(await durA.engineState.listDirty()).not.toContain(ghost); // pruned from the durable dirty set
     expect(await a.engine.pendingDocs()).not.toContain(ghost); // and no longer wedges quiescence
+  });
+
+  it("persists the index locally: a restart HYDRATES the tree before the relay answers", async () => {
+    // CAUSE-LEVEL REGRESSION (2026-08-03): the index doc used to be created EMPTY on every start
+    // and filled only from the relay, so a restart began blind. That single property produced a
+    // whole-vault re-seed, a silently lost plugin opt-in, and settings showing real choices as off.
+    const bus = new InProcessBus();
+    const durA = newDurable(true);
+    await durA.vault.writeAtomic(NOTE, utf8(CONTENT));
+
+    const a = makeEngine(bus, durA, "device-a", "relay-X");
+    open.push(a.engine);
+    await a.engine.start();
+    await a.engine.waitConverged();
+    const boundDocId = a.engine.index.get(NOTE)?.docId;
+    expect(boundDocId).toBeDefined();
+    await a.engine.stop();
+    open.length = 0;
+
+    // Restart with NO relay at all: nothing can arrive over the wire.
+    const a2 = makeEngine(new InProcessBus(), durA, "device-a", "relay-X");
+    open.push(a2.engine);
+    await a2.engine.start();
+
+    // The tree is populated from the local snapshot, and to the SAME docId — this is what stops
+    // bootstrap treating an already-synced vault as brand new.
+    expect(a2.engine.index.get(NOTE)?.docId).toBe(boundDocId);
+  });
+
+  it("discards a snapshot from a DIFFERENT relay instead of re-seeding a foreign vault", async () => {
+    // Top silent-wrong-data hazard: restoring a snapshot into another vault/relay would push this
+    // device's whole stale tree into an empty index, resurrecting an old vault inside a new one.
+    const bus = new InProcessBus();
+    const durA = newDurable(true);
+    await durA.vault.writeAtomic(NOTE, utf8(CONTENT));
+
+    const a = makeEngine(bus, durA, "device-a", "relay-X");
+    open.push(a.engine);
+    await a.engine.start();
+    await a.engine.waitConverged();
+    await a.engine.stop();
+    open.length = 0;
+
+    // Same durable state, but now pointed at a DIFFERENT relay identity.
+    const a2 = makeEngine(new InProcessBus(), durA, "device-a", "relay-Y");
+    open.push(a2.engine);
+    await a2.engine.start();
+
+    // The foreign snapshot must NOT hydrate the tree from the old relay's state. (The file is still
+    // on disk, so bootstrap may re-bind it locally — what must not happen is inheriting relay-X's
+    // index wholesale, which the identity check prevents.)
+    const rec = await durA.engineState.getIndexSnapshot();
+    expect(rec?.identity).toBe("relay-Y"); // re-persisted under the NEW identity, not the old one
   });
 
   it("isIndexSynced reports whether the shared index actually arrived, independent of start()", async () => {

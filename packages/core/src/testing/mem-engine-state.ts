@@ -1,4 +1,11 @@
-import type { DocId, EngineStateStore, Sha256, Stamp, VaultPath } from "../ports.js";
+import type {
+  DocId,
+  EngineStateStore,
+  IndexSnapshotRecord,
+  Sha256,
+  Stamp,
+  VaultPath,
+} from "../ports.js";
 
 /**
  * In-memory {@link EngineStateStore} for tests: a `Map` of per-doc synced stamps
@@ -127,6 +134,17 @@ export class MemEngineState implements EngineStateStore {
   }
   setLocalSuppress(ids: string[]): Promise<void> {
     this.localSuppressArr = [...ids];
+    return Promise.resolve();
+  }
+
+  private indexSnapshot: IndexSnapshotRecord | null = null;
+
+  getIndexSnapshot(): Promise<IndexSnapshotRecord | null> {
+    return Promise.resolve(this.indexSnapshot);
+  }
+
+  setIndexSnapshot(rec: IndexSnapshotRecord): Promise<void> {
+    this.indexSnapshot = rec;
     return Promise.resolve();
   }
 }

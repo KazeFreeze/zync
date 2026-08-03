@@ -165,6 +165,13 @@ export interface EngineConfig {
    * startup. Default {@link DEFAULT_INDEX_SYNC_START_BUDGET_MS}. Tests inject a small value.
    */
   indexSyncStartBudgetMs?: number;
+  /**
+   * Identifies the vault/relay this device syncs with, used to bind the persisted index snapshot
+   * ({@link IndexSnapshotRecord}). OMITTED ⇒ the index is NOT persisted and every start begins
+   * empty, exactly as before. Fail-safe by design: without a way to prove a snapshot belongs to
+   * THIS vault, restoring one could resurrect an old vault inside a new one.
+   */
+  indexIdentity?: string;
 }
 
 const utf8 = (s: string): Uint8Array => new TextEncoder().encode(s);
@@ -288,6 +295,10 @@ export const SELFHEAL_MAX_PASSES = 50;
 export const DEFAULT_RECONNECT_HEAL_JITTER_MAX_MS = 15_000;
 /** Default {@link EngineConfig.indexSyncStartBudgetMs} — long enough a healthy link always wins. */
 export const DEFAULT_INDEX_SYNC_START_BUDGET_MS = 10_000;
+/** Trailing debounce before persisting the index doc after an update. */
+export const INDEX_PERSIST_DEBOUNCE_MS = 2_000;
+/** Max time an index persist may be deferred by a continuous update storm (first sync). */
+export const INDEX_PERSIST_MAX_WAIT_MS = 20_000;
 
 /** A pending debounced bump: its settle promise is tracked by {@link SyncEngine.whenIdle}. */
 interface PendingBump {
@@ -404,6 +415,8 @@ export class SyncEngine {
   // ── subscriptions to unwind on stop() ───────────────────────────────────
   private vaultUnsub: Unsubscribe | null = null;
   private indexUnsub: Unsubscribe | null = null;
+  /** Unsubscribe for the index-persist update subscription. */
+  private indexPersistUnsub: Unsubscribe | null = null;
   private blobUnsub: Unsubscribe | null = null;
   /**
    * F1 reconnect-backstop subscription. Unsubscribed in stop() so no status callback
@@ -666,6 +679,11 @@ export class SyncEngine {
    * See {@link isIndexSynced} — `start()` can complete WITHOUT this when the sync budget expires.
    */
   private indexSyncedOnce = false;
+  /** Index-persist bookkeeping — see {@link scheduleIndexPersist}. */
+  private indexPersistTimer: ReturnType<typeof setTimeout> | null = null;
+  private indexPersistMaxTimer: ReturnType<typeof setTimeout> | null = null;
+  private indexPersistInFlight = false;
+  private indexPersistAgain = false;
 
   /**
    * The docIds the self-heal GAVE UP on for the current episode — the "needs attention" set behind
@@ -752,7 +770,16 @@ export class SyncEngine {
     const deviceId = identity.deviceId();
 
     // 1. Index doc — ALWAYS attached. Its tree/inbox/blobs maps relay over the transport.
-    const indexDoc = crdt.createDoc(INDEX_DOC_ID);
+    //
+    // HYDRATE FROM LOCAL FIRST. Starting from an EMPTY index and waiting on the relay is what made
+    // a slow start indistinguishable from an empty vault: it re-seeded ~190 docIds on a real phone,
+    // silently dropped a plugin opt-in across a restart, and rendered real settings as "off".
+    // Loading the last known state first means the offline rail begins from THIS DEVICE'S OWN prior
+    // index — a causal subset of what the fleet already has, so merging it back can add information
+    // but never revive a deletion (IndexDoc tombstones are LWW values a later delete supersedes).
+    // MUST happen here, BEFORE any getMap/observe wiring below: applying a snapshot into an
+    // already-observed doc would replay all of it through index-observe as fake remote events.
+    const indexDoc = (await this.loadPersistedIndex()) ?? crdt.createDoc(INDEX_DOC_ID);
     this.indexDoc = indexDoc;
     this.index = new IndexDoc(indexDoc.getMap("tree"), deviceId);
     this.inbox = new Inbox(indexDoc.getMap("inbox"));
@@ -770,9 +797,17 @@ export class SyncEngine {
     // map, which is indistinguishable from "nothing is set". That misread every per-plugin Sync
     // toggle as OFF. Callers that would otherwise present absence as a real value must gate on
     // {@link isIndexSynced} instead.
+    // Persist on EVERY update regardless of origin: remote state must survive a restart too, or the
+    // next start is blind again — which is the whole bug this fixes.
+    this.indexPersistUnsub = indexDoc.onUpdate(() => {
+      this.scheduleIndexPersist();
+    });
     void this.indexAttached.synced().then(
       () => {
         this.indexSyncedOnce = true;
+        // Punctuation save: the freshest full state we will ever hold this session.
+        this.clearIndexPersistTimers();
+        this.persistIndexNow();
       },
       () => undefined, // close/detach — leave the latch false; a later attach re-arms it
     );
@@ -1025,6 +1060,8 @@ export class SyncEngine {
 
     // 6. Bootstrap: seed local prose that has no index entry yet; then sweep orphans.
     await this.bootstrap();
+    // Punctuation save: bootstrap is where the index gains this device's on-disk reality.
+    this.persistIndexNow();
 
     // 6b. CONFIG RECONCILE BACKSTOP (startup): after the initial config sweep has settled, re-scan
     //     disk-vs-config-map once to catch drift left by a PREVIOUS session — a device that was
@@ -1170,6 +1207,14 @@ export class SyncEngine {
     // Settle anything still in flight so stop() leaves no open work.
     await this.whenIdle();
 
+    // Punctuation save (BEST-EFFORT ONLY): a clean stop is the ideal moment to checkpoint, but
+    // Obsidian unload and Android process death frequently skip it — which is exactly why the
+    // debounced save above is the load-bearing one, not this.
+    this.clearIndexPersistTimers();
+    await this.persistIndexFinal();
+
+    this.indexPersistUnsub?.();
+    this.indexPersistUnsub = null;
     this.vaultUnsub?.();
     this.indexUnsub?.();
     this.blobUnsub?.();
@@ -3374,6 +3419,122 @@ export class SyncEngine {
    * UNHANDLED rejection in Node — which crashes a long-lived daemon. Attaching this no-op
    * catch immediately makes it a HANDLED rejection. One canonical location for the rationale.
    */
+  /** Storage format for {@link IndexSnapshotRecord}. Bump to invalidate every stored snapshot. */
+  private static readonly INDEX_SNAPSHOT_VERSION = 1;
+
+  /**
+   * Load the persisted index doc, or null to start fresh. NEVER throws: a corrupt, foreign or
+   * unreadable snapshot must degrade to exactly the previous behaviour (empty index, relay sync),
+   * never abort start(). Discards the snapshot unless BOTH its identity and format version match,
+   * so re-pointing at another relay or resetting the vault cannot re-seed a stale tree.
+   */
+  private async loadPersistedIndex(): Promise<CrdtDoc | null> {
+    const identity = this.config.indexIdentity;
+    if (identity === undefined) return null;
+    try {
+      const rec = await this.ports.engineState.getIndexSnapshot?.();
+      if (rec === undefined || rec === null) return null;
+      if (rec.version !== SyncEngine.INDEX_SNAPSHOT_VERSION) return null;
+      if (rec.identity !== identity) return null;
+      if (rec.substrate !== this.substrate) return null;
+      return this.ports.crdt.loadDoc(INDEX_DOC_ID, rec.snapshot);
+    } catch {
+      return null; // unreadable/corrupt ⇒ fall back to a fresh doc + full relay sync
+    }
+  }
+
+  /**
+   * Persist the index doc. Single-flight with a re-run latch: encoding is cheap at this size, but
+   * the first sync of a large vault fires updates in a storm and overlapping saves are pointless.
+   * Best-effort — a failed save just means the next start hydrates from an older snapshot, which is
+   * safe (stale is indistinguishable from "changes happened while the app was closed", which the
+   * structural pre-pass already handles).
+   */
+  private persistIndexNow(): void {
+    if (this.indexPersistInFlight) {
+      this.indexPersistAgain = true;
+      return;
+    }
+    const identity = this.config.indexIdentity;
+    const doc = this.indexDoc;
+    if (identity === undefined || doc === null) return;
+    this.indexPersistInFlight = true;
+    // NOTE: two engine instances over the same store (a second window, or a plugin reload mid-BRAT
+    // update) can race this key. Last write wins, and BOTH are valid states of the same history, so
+    // the loser's delta simply re-merges via the relay. Do not "fix" this with a lock.
+    void Promise.resolve(
+      this.ports.engineState.setIndexSnapshot?.({
+        version: SyncEngine.INDEX_SNAPSHOT_VERSION,
+        identity,
+        substrate: this.substrate,
+        snapshot: doc.encodeSnapshot(),
+      }),
+    )
+      .catch(() => undefined)
+      .finally(() => {
+        this.indexPersistInFlight = false;
+        if (this.indexPersistAgain) {
+          this.indexPersistAgain = false;
+          this.persistIndexNow();
+        }
+      });
+  }
+
+  /**
+   * Debounced index persist. Subscribed to updates of EVERY origin: REMOTE state must survive a
+   * restart too (an index that only kept local edits would still start blind). Trailing debounce
+   * with a max-wait so a long first-sync storm still checkpoints instead of deferring forever.
+   */
+  private scheduleIndexPersist(): void {
+    if (this.config.indexIdentity === undefined) return;
+    if (this.indexPersistTimer !== null) clearTimeout(this.indexPersistTimer);
+    this.indexPersistMaxTimer ??= setTimeout(() => {
+      this.indexPersistMaxTimer = null;
+      if (this.indexPersistTimer !== null) {
+        clearTimeout(this.indexPersistTimer);
+        this.indexPersistTimer = null;
+      }
+      this.persistIndexNow();
+    }, INDEX_PERSIST_MAX_WAIT_MS);
+    this.indexPersistTimer = setTimeout(() => {
+      this.indexPersistTimer = null;
+      if (this.indexPersistMaxTimer !== null) {
+        clearTimeout(this.indexPersistMaxTimer);
+        this.indexPersistMaxTimer = null;
+      }
+      this.persistIndexNow();
+    }, INDEX_PERSIST_DEBOUNCE_MS);
+  }
+
+  /** Awaited teardown save, so stop() cannot race the write. Best-effort; never throws. */
+  private async persistIndexFinal(): Promise<void> {
+    const identity = this.config.indexIdentity;
+    const doc = this.indexDoc;
+    if (identity === undefined || doc === null) return;
+    try {
+      await this.ports.engineState.setIndexSnapshot?.({
+        version: SyncEngine.INDEX_SNAPSHOT_VERSION,
+        identity,
+        substrate: this.substrate,
+        snapshot: doc.encodeSnapshot(),
+      });
+    } catch {
+      /* stale snapshot on next start is safe; never block teardown */
+    }
+  }
+
+  /** Stop both index-persist timers (teardown / after a punctuation save). */
+  private clearIndexPersistTimers(): void {
+    if (this.indexPersistTimer !== null) {
+      clearTimeout(this.indexPersistTimer);
+      this.indexPersistTimer = null;
+    }
+    if (this.indexPersistMaxTimer !== null) {
+      clearTimeout(this.indexPersistMaxTimer);
+      this.indexPersistMaxTimer = null;
+    }
+  }
+
   private swallowOfflineSynced(handle: AttachedDoc): void {
     void handle.synced().catch(() => undefined);
   }
