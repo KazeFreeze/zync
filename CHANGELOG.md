@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.4](https://github.com/KazeFreeze/zync/compare/zync-v0.6.3...zync-v0.6.4) (2026-08-03)
+
+
+### Bug Fixes
+
+* **plugin:** stop bulk dismiss freezing obsidian on a large inbox ([37a2242](https://github.com/KazeFreeze/zync/commit/37a2242e13ad5b03d347354eeed8464fec923487))
+
 ## [0.6.3](https://github.com/KazeFreeze/zync/compare/zync-v0.6.2...zync-v0.6.3) (2026-08-03)
 
 
