@@ -58,7 +58,8 @@ import { applyBootstrap } from "./protocol/bootstrap.js";
 import { supervisedImport } from "./conflicts/supervised-import.js";
 import { orphanSweep, orphanRecoveryPath, type OrphanMeta } from "./protocol/orphan-sweep.js";
 import { makeStamp, stampHash, stampsEqual } from "./protocol/stamp.js";
-import { isDocStampPending } from "./protocol/doc-pending.js";
+import { isDocStampPending, partitionPending } from "./protocol/doc-pending.js";
+import type { LiveEntryFacts, SyncSnapshot } from "./protocol/doc-pending.js";
 import { BlobEngine, type BlobFetchPolicy, type BlobManifestEntry } from "./blobs/blob-engine.js";
 import { Inbox } from "./conflicts/inbox.js";
 import { withConflictSuffix, writeConflictArtifact } from "./conflicts/artifact.js";
@@ -173,6 +174,9 @@ export interface EngineConfig {
    */
   indexIdentity?: string;
 }
+
+/** Defined next to the pure partition that builds it. Re-exported here as the engine's API type. */
+export type { SyncSnapshot } from "./protocol/doc-pending.js";
 
 const utf8 = (s: string): Uint8Array => new TextEncoder().encode(s);
 const decode = (b: Uint8Array): string => new TextDecoder().decode(b);
@@ -2038,10 +2042,24 @@ export class SyncEngine {
       : makeStamp(await sha256OfBytes(bytes), this.ports.identity.deviceId());
   }
 
+  /**
+   * THE per-live-entry pending clause: stamp != synced OR disk != stamp. Returns the disk hash
+   * alongside the verdict because {@link syncSnapshot} needs BOTH from a single `vault.read`, and
+   * this is the one place the clause is written — {@link isPathPending} (the explainer) and the
+   * pending scan (the convergence oracle) must never drift apart.
+   */
+  private async docPendingFacts(
+    path: VaultPath,
+    entry: TreeEntry,
+  ): Promise<{ pending: boolean; diskHash: Stamp | null }> {
+    const synced = await this.ports.engineState.getSyncedStamp(entry.docId);
+    const diskHash = await this.diskStampOf(path);
+    return { pending: isDocStampPending(entry.stamp, synced, diskHash), diskHash };
+  }
+
   /** Per-live-entry pending check shared with pendingDocs(): stamp != synced OR disk != stamp. */
   private async isDocPending(path: VaultPath, entry: TreeEntry): Promise<boolean> {
-    const synced = await this.ports.engineState.getSyncedStamp(entry.docId);
-    return isDocStampPending(entry.stamp, synced, await this.diskStampOf(path));
+    return (await this.docPendingFacts(path, entry)).pending;
   }
 
   /**
@@ -2088,20 +2106,46 @@ export class SyncEngine {
   }
 
   /**
-   * Docs whose tree stamp ≠ synced stamp, unioned with the dirty set, unioned with
-   * UNAPPLIED DELETES (0b-2 Task 1): a tombstoned entry whose path STILL has a local
-   * file is pending until structural reconcile removes it — otherwise
-   * {@link waitConverged} could pass while a delete is unapplied (false quiescence).
+   * ONE O(n) pending pass, partitioned for display. {@link pendingDocs} defines `pending` and
+   * {@link SyncSnapshot} defines the buckets; the partition algebra itself is the pure
+   * {@link partitionPending}, so every awkward case is table-testable without an engine.
+   *
+   * STANDING INVARIANT — `pending` here means exactly what {@link pendingDocs} documents, read for
+   * read: the same five sources in the same order, and `listDirty()` sampled ONCE, AFTER the
+   * live-entry loop. That position is not cosmetic. `pending` is the convergence oracle, so
+   * sampling the dirty set BEFORE a loop that does a disk read per live entry (seconds on a large
+   * vault) would let a doc that turns dirty mid-scan go unseen and `waitConverged` return a false
+   * green. Anything added here must extend `pending` without reordering or re-reading it.
+   *
+   * COST: one `getSyncedStamp` + one `vault.read` per live entry, `listDirty()` once, and NO
+   * per-entry dirty lookup — the direction split classifies afterwards off that single result.
+   * During a first sync EVERY entry is pending, so a per-entry dirty read would be +1 store read
+   * per note per pass on both the `waitConverged` loop and the plugin's 8s status poll.
    */
-  async pendingDocs(): Promise<DocId[]> {
+  async syncSnapshot(): Promise<SyncSnapshot> {
+    const stuckSet = new Set<DocId>(this.stuckDocIds);
     const pending = new Set<DocId>();
+    // Per-entry direction facts, COLLECTED here and folded after the loop, so the single
+    // `listDirty()` that source 2 already fetches also supplies the dirty input — no per-entry
+    // dirty lookup, and `arriving` reads the SAME dirty sample as `pending`.
+    const directionFacts: LiveEntryFacts[] = [];
+
     for (const [path, entry] of this.index.liveEntries()) {
       // Pending iff the stamp differs from the synced stamp (not yet acked) OR from the on-disk
       // content hash (UNMATERIALIZED CONTENT, 0b-2 Task 2 C3: a live entry whose on-disk hash ≠ its
       // stamp hasn't reached disk yet — keeps waitConverged looping until reconcile materializes it).
-      if (await this.isDocPending(path, entry)) pending.add(entry.docId);
+      const { pending: isPending, diskHash } = await this.docPendingFacts(path, entry);
+      // RECORDED BEFORE the pending gate, deliberately: mid-rename BOTH keys are live under one
+      // docId, and the NEW path (the one holding the file) is typically NOT pending. Skipping it
+      // here would leave only the absent old key and show an OUTBOUND rename as arriving.
+      directionFacts.push({ docId: entry.docId, diskHash });
+      if (!isPending) continue;
+      pending.add(entry.docId);
     }
-    for (const dirty of await this.ports.engineState.listDirty()) pending.add(dirty);
+    // ORDER-CRITICAL: sampled AFTER the live-entry loop, exactly once. Do not hoist. See the
+    // standing invariant in this method's doc comment.
+    const dirtyList = await this.ports.engineState.listDirty();
+    for (const dirty of dirtyList) pending.add(dirty);
     for (const [path, entry] of this.index.entries()) {
       if (entry.deleted !== true) continue;
       if ((await this.ports.vault.read(path)) !== null) pending.add(entry.docId);
@@ -2121,7 +2165,28 @@ export class SyncEngine {
     // buffer is EMPTY (whenIdle force-drains it before any sample), so this never wedges convergence.
     for (const [, s] of this.renameBuf.sources) pending.add(s.docId);
     for (const t of this.renameBuf.targets) pending.add(`rename-target:${t}` as DocId);
-    return [...pending];
+
+    return partitionPending({
+      pending: [...pending],
+      live: directionFacts,
+      dirty: new Set<DocId>(dirtyList),
+      stuck: stuckSet,
+    });
+  }
+
+  /**
+   * Docs whose tree stamp ≠ synced stamp, unioned with the dirty set, unioned with
+   * UNAPPLIED DELETES (0b-2 Task 1): a tombstoned entry whose path STILL has a local
+   * file is pending until structural reconcile removes it — otherwise
+   * {@link waitConverged} could pass while a delete is unapplied (false quiescence).
+   *
+   * Also unioned with open rename transactions and the live-rename buffer's sources/targets — see
+   * the five commented sources in {@link syncSnapshot}, which computes this. Unchanged in meaning
+   * and in return order by that refactor: this is the convergence oracle `waitConverged`, the
+   * bounded self-heal and every harness scenario gate on.
+   */
+  async pendingDocs(): Promise<DocId[]> {
+    return (await this.syncSnapshot()).pending;
   }
 
   /**
@@ -2174,8 +2239,8 @@ export class SyncEngine {
     return this.stuckDocIds.map((docId) => ({ docId, path: pathOf.get(docId) ?? null }));
   }
 
-  /** Background blob fetch progress (materialized / total advertised / parked-failed). */
-  blobProgress(): { materialized: number; total: number; failed: number } {
+  /** Background blob fetch progress (materialized / total advertised / parked-failed / real-fetch-only). */
+  blobProgress(): { materialized: number; total: number; failed: number; written: number } {
     return this.blobEngine.blobProgress();
   }
 

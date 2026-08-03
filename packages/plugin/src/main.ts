@@ -34,8 +34,9 @@ import { overrideState } from "./plugin-override-state.js";
 import { configDirty, type SyncConfigFlags } from "./config-dirty.js";
 import { PluginReconciler } from "./plugin-reconciler.js";
 import { ConnectionAlert, type AlertCommand } from "./connection-alert.js";
-import { notify, notifyInfo, notifyWarning, notifyError } from "./notify.js";
-import { explainNotifyProps, type NotifyAction } from "./notify-model.js";
+import { notify, updateNotice, notifyInfo, notifyWarning, notifyError } from "./notify.js";
+import { explainNotifyProps, type NotifyAction, type NotifyOptions } from "./notify-model.js";
+import { arrivingSegment, arrivingNotice, type ArrivingInputs } from "./arriving-view.js";
 
 /**
  * Zync plugin — M1 desktop walking skeleton (M1-T5 wiring).
@@ -85,14 +86,25 @@ const CONFIG_DIR = ".obsidian/zync"; // vault-relative; the BaseStore zone Obsid
 const MAX_PROSE_BYTES = 1_000_000;
 
 /**
- * How often (ms) to poll engine.pendingDocs() for the status bar.
+ * How often (ms) to poll engine.syncSnapshot() for the status bar.
  *
- * pendingDocs() is an O(n) disk-read scan — intentionally authoritative but expensive. During a
+ * syncSnapshot() is an O(n) disk-read scan — intentionally authoritative but expensive. During a
  * large first-sync (~1000+ notes) polling at 2 s produced ~450-900 full scans over the sync
  * window. 8 s is still plenty fresh for a "N pending" indicator; connect/disconnect updates arrive
  * push-style via transport.onStatus and are unaffected by this constant.
  */
 const STATUS_POLL_INTERVAL_MS = 8_000;
+
+/** The DISPLAY counts, straight from engine.syncSnapshot(). Never derived by subtraction in the
+ *  plugin: a subtraction double-counted the stuck/arriving overlap in design review. These four
+ *  are a disjoint partition — arriving + sending + stuck === pending. */
+interface StatusCounts {
+  pending: number;
+  arriving: number;
+  sending: number;
+  stuck: number;
+}
+const ZERO_COUNTS: StatusCounts = { pending: 0, arriving: 0, sending: 0, stuck: 0 };
 
 /**
  * Long-form copy for the stuck state, shared by the status-bar tooltip and the sticky notice.
@@ -141,11 +153,16 @@ export default class ZyncPlugin extends Plugin {
   private dbName: string | null = null;
   private statusBar: HTMLElement | null = null;
   private statusTimer: number | null = null;
-  /** Guards against concurrent pendingDocs() scans when a poll takes longer than the interval. */
+  /** Guards against concurrent syncSnapshot() scans when a poll takes longer than the interval. */
   private statusRefreshInFlight = false;
-  /** Last computed pending count — rendered immediately on a connText push so a status change is
+  /** Last computed counts — rendered immediately on a connText push so a status change is
    *  reflected without waiting for the next (coarse, possibly skipped) expensive scan. */
-  private lastPending = 0;
+  private lastCounts: StatusCounts = ZERO_COUNTS;
+  /** The docIds behind `lastCounts.stuck` — i.e. `syncSnapshot().stuck`, the FILTERED set (docs
+   *  that are actually pending). Always populated from the SAME snapshot as `lastCounts`, never a
+   *  separate call, so the two can never disagree. Used to filter the raw, unfiltered
+   *  `engine.stuckDocs()` before it reaches the notice — see `renderStatus`. */
+  private lastStuckIds: string[] = [];
   /** Render memo key for the status bar — prevents redundant DOM rebuilds (renderStatus runs 2x per
    *  8s poll + on every connection push). Null forces the first render. */
   private lastStatusKey: string | null = null;
@@ -167,13 +184,24 @@ export default class ZyncPlugin extends Plugin {
   private loopNotice: Notice | null = null;
   /** Single replace-in-place sticky for the "stuck" warning (no stacking). */
   private stuckNotice: Notice | null = null;
+  /** Single replace-in-place sticky for bulk arrival progress (mobile's only surface). */
+  private arrivingNoticeEl: Notice | null = null;
+  /** The outstanding count at the moment the user tapped the arriving notice away, or null if it
+   *  has not been dismissed. Suppresses re-showing (a re-show 8s later would read as nagging)
+   *  until either the episode ends or MORE work arrives than there was at the tap. Storing the
+   *  count rather than a bare flag is what stops an accidental tap from muting the surface for a
+   *  whole sync — see the reasoning in `refreshArrivingNotice`. */
+  private arrivingDismissedAt: number | null = null;
+  /** Latest outstanding total (arriving + blobs), so the dismissal handler reads the count at TAP
+   *  time rather than at notice-creation time. */
+  private arrivingOutstanding = 0;
   /** Bumped on every start AND every stop; a start whose gen is stale was superseded (cancelled). */
   private startGen = 0;
 
   override async onload(): Promise<void> {
     await this.loadSettings();
     this.statusBar = this.addStatusBarItem();
-    this.renderStatus(0);
+    this.renderStatus(ZERO_COUNTS);
     if (this.statusBar !== null) {
       this.statusBar.style.cursor = "pointer";
       // Route to pending-updates modal when there are staged plugin updates; inbox otherwise.
@@ -293,7 +321,7 @@ export default class ZyncPlugin extends Plugin {
     if (this.engine !== null) return;
     if (this.settings.serverWs === "") {
       this.connText = "not configured";
-      this.renderStatus(0);
+      this.renderStatus(ZERO_COUNTS);
       notify({
         kind: "info",
         title: "Setup needed",
@@ -392,7 +420,7 @@ export default class ZyncPlugin extends Plugin {
         this.alert = new ConnectionAlert({
           now: () => Date.now(),
           emit: (cmd) => this.execAlert(cmd),
-          pending: () => this.lastPending,
+          pending: () => this.lastCounts.pending,
         });
       }
       this.unsubs.push(
@@ -458,7 +486,7 @@ export default class ZyncPlugin extends Plugin {
 
       // Task 8: refresh the status bar whenever a pending plugin-update arrives or is cleared.
       this.pendingUpdatesUnsub = engine.onPendingUpdates(() => {
-        this.renderStatus(this.lastPending);
+        this.renderStatus(this.lastCounts);
       });
 
       // Surface sync conflicts as they land.
@@ -473,7 +501,7 @@ export default class ZyncPlugin extends Plugin {
 
       // Poll pending count for the status bar. Tracked so stopEngine clears it — registerInterval
       // alone would leak one timer per restart. Coarse cadence (STATUS_POLL_INTERVAL_MS) because
-      // pendingDocs() is O(n) disk I/O; connection status arrives push-style via onStatus above.
+      // syncSnapshot() is O(n) disk I/O; connection status arrives push-style via onStatus above.
       this.statusTimer = window.setInterval(
         () => void this.refreshStatus(),
         STATUS_POLL_INTERVAL_MS,
@@ -490,7 +518,7 @@ export default class ZyncPlugin extends Plugin {
       }
       console.error("[zync] failed to start engine:", err);
       this.connText = "error";
-      this.renderStatus(0);
+      this.renderStatus(ZERO_COUNTS);
       notifyError("Failed to start", err instanceof Error ? err.message : String(err), {
         label: "Retry",
         run: () => void this.startEngine(),
@@ -515,8 +543,9 @@ export default class ZyncPlugin extends Plugin {
     }
     // Reset the in-flight guard so a mid-poll stop doesn't permanently block polling after restart.
     this.statusRefreshInFlight = false;
-    // Reset the cached pending count so a restart doesn't briefly render a stale number.
-    this.lastPending = 0;
+    // Reset the cached counts so a restart doesn't briefly render a stale number.
+    this.lastCounts = ZERO_COUNTS;
+    this.lastStuckIds = [];
     this.editorBinding?.stop();
     this.editorBinding = null;
     for (const u of this.unsubs.splice(0)) u();
@@ -541,6 +570,12 @@ export default class ZyncPlugin extends Plugin {
     this.loopNotice = null;
     this.conflictNotice?.hide();
     this.conflictNotice = null;
+    this.stuckNotice?.hide();
+    this.stuckNotice = null;
+    this.arrivingNoticeEl?.hide();
+    this.arrivingNoticeEl = null;
+    this.arrivingDismissedAt = null;
+    this.arrivingOutstanding = 0;
     this.runtime = null;
     if (this.engine !== null) {
       try {
@@ -586,29 +621,39 @@ export default class ZyncPlugin extends Plugin {
   // ── status + conflicts ───────────────────────────────────────────────────────
 
   private async refreshStatus(): Promise<void> {
-    // Render the CHEAP current state immediately (connText + last-known pending). This path runs on
+    // Render the CHEAP current state immediately (connText + last-known counts). This path runs on
     // every call — including the push-driven onStatus calls — so a connection change is reflected
     // at once, even while an expensive scan below is in-flight (or skipped).
-    this.renderStatus(this.lastPending);
-    // Skip the EXPENSIVE O(n) pendingDocs() scan if a previous one is still running — prevents
+    this.renderStatus(this.lastCounts);
+    // Skip the EXPENSIVE O(n) syncSnapshot() scan if a previous one is still running — prevents
     // unbounded pileup during a large first-sync where a single scan can exceed the poll interval.
     if (this.statusRefreshInFlight) return;
     this.statusRefreshInFlight = true;
     try {
       if (this.engine !== null) {
         try {
-          this.lastPending = (await this.engine.pendingDocs()).length;
+          const snap = await this.engine.syncSnapshot();
+          this.lastCounts = {
+            pending: snap.pending.length,
+            arriving: snap.arriving.length,
+            sending: snap.sending.length,
+            stuck: snap.stuck.length,
+          };
+          // Same snapshot as lastCounts above — never a second call — so lastCounts.stuck and
+          // lastStuckIds.length agree by construction.
+          this.lastStuckIds = snap.stuck;
         } catch {
           // engine stopped mid-poll — ignore
         }
       }
-      this.renderStatus(this.lastPending);
+      this.renderStatus(this.lastCounts);
     } finally {
       this.statusRefreshInFlight = false;
     }
   }
 
-  private renderStatus(pending: number): void {
+  private renderStatus(counts: StatusCounts): void {
+    const { pending, arriving, sending } = counts;
     const el = this.statusBar;
     if (el === null) return;
     const engine = this.engineReady ? this.engine : null;
@@ -622,19 +667,45 @@ export default class ZyncPlugin extends Plugin {
     // NEEDS-ATTENTION SPLIT: docs the bounded self-heal gave up on are still counted in `pending`
     // (removing them there would clear the stop latch and make waitConverged lie), so split them out
     // for DISPLAY only — otherwise the count silently never reaches 0 and the number loses its meaning.
-    const stuckDocs = engine ? engine.stuckDocs() : [];
-    const nStuck = stuckDocs.length;
-    const nSyncing = Math.max(0, pending - nStuck);
+    //
+    // engine.stuckDocs() is UNFILTERED and only clears once pending drains FULLY, so after a partial
+    // drain it disagrees with counts.stuck (syncSnapshot().stuck, which IS filtered to docs that are
+    // still pending). Filter it down to lastStuckIds — the docIds behind counts.stuck, from that same
+    // snapshot — before handing it to the notice, so the toast and the bar can never disagree.
+    const stuckIds = new Set(this.lastStuckIds);
+    const stuckDocs = engine ? engine.stuckDocs().filter((s) => stuckIds.has(s.docId)) : [];
+    const nStuck = counts.stuck;
+    const nSyncing = sending;
     // Runs BEFORE the render memo: the alert is driven by the stuck SET changing, not by whether the
     // status bar needs a repaint (and mobile has no status bar at all).
     this.refreshStuckNotice(stuckDocs);
+    // MOBILE ONLY. Desktop already renders the "N arriving" segment in this same status bar
+    // (arrivingSeg below); calling this unconditionally would put the identical information on
+    // screen a SECOND time as a sticky toast for the whole arrival. Mobile has no status bar, so
+    // this notice is the only surface there — that is the entire point of the feature. Do not
+    // remove this gate to "be consistent" with refreshStuckNotice just above: that one stays
+    // ungated on purpose, because it is a PROBLEM notice (the UI standard is sticky-for-problems),
+    // while this one is progress, which desktop already shows another way.
+    if (Platform.isMobile) this.refreshArrivingNotice(counts);
+
+    // Computed BEFORE the memo key, and folded INTO it as rendered text. The key must be keyed on
+    // what is DRAWN, not on the inputs someone remembered to list: `arrivingSegment` also reads
+    // hydration and started-ness, so a key carrying only the counts would go stale. Concretely,
+    // "connected but not yet hydrated" with an already-synced vault renders "receiving index" and
+    // locks the key at all-zero counts; hydration then completes without changing any count, the
+    // key matches, and the bar keeps claiming to receive an index forever. Folding the segment's
+    // own text in makes the memo self-maintaining as this function grows new inputs.
+    const arrivingSeg = arrivingSegment(this.arrivingInputs(counts));
 
     // Render memo: renderStatus runs 2x per 8s poll + on every connection push. Skip the DOM
     // rebuild when the rendered state is unchanged (kills ~95% of the churn / any flicker).
     const key = [
       this.connText,
       pending,
+      arriving,
       nStuck,
+      nSyncing,
+      arrivingSeg === null ? "" : `${arrivingSeg.icon}:${arrivingSeg.text}`,
       files ? `${String(files.done)}/${String(files.total)}/${String(files.failed)}` : "",
       nConf,
       nUpdates,
@@ -661,6 +732,8 @@ export default class ZyncPlugin extends Plugin {
     else if (this.connText === "connecting") seg("refresh-cw", "connecting", "zync-status--muted");
     else if (this.connText === "error") seg("x-circle", "error", "zync-status--error");
     else seg("wifi-off", this.connText, "zync-status--muted"); // offline / not configured / other
+    if (arrivingSeg !== null)
+      seg(arrivingSeg.icon, arrivingSeg.text, undefined, arrivingSeg.tooltip);
     if (nSyncing > 0) seg("clock", `${String(nSyncing)} syncing`);
     // "stuck", not "need attention": it promises no action (there may be none) and does not collide
     // with the conflict sticky's "Needs attention" wording or the bare conflict count beside it.
@@ -676,22 +749,53 @@ export default class ZyncPlugin extends Plugin {
     if (nUpdates > 0) seg("refresh-cw", String(nUpdates));
   }
 
+  /** The single place the arriving surfaces read their inputs, so the status bar and the mobile
+   *  notice can never disagree about hydration, connection or counts. */
+  private arrivingInputs(counts: StatusCounts): ArrivingInputs {
+    const engine = this.engineReady ? this.engine : null;
+    const b = engine?.blobProgress();
+    return {
+      started: engine !== null,
+      connected: this.connText === "connected",
+      hydrated: engine?.isIndexHydrated() ?? false,
+      arriving: counts.arriving,
+      // blobsSettled() ("materialized-or-parked, no queued/in-flight/retry") is the authority, and
+      // `failed` is subtracted too — `materialized` is a per-session counter that only increments on
+      // a SUCCESSFUL materialize, so a PERMANENTLY-parked blob would otherwise sit in `b.total -
+      // b.materialized` forever and never let this reach zero. That mattered because the mobile
+      // notice's hysteresis only retires once BOTH planes hit zero — one un-fetchable attachment
+      // would have pinned "Receiving 1 attachments" on screen for good.
+      //
+      // `written > 0` proves at least one blob genuinely had to be FETCHED. Without it, an eager
+      // start on an already-synced vault reports every advertised blob as outstanding while it is
+      // merely re-verifying files already on disk — a sticky "Receiving N attachments" on every
+      // launch. Same principle as the index-hydration gate: a count of "not yet checked" must not
+      // be rendered as a count of "not here".
+      //
+      // Pre-existing limit, NOT fixed here: the desktop "Files x/y" status-bar segment (below, in
+      // renderStatus) reads blobProgress() directly and does not have this gate — out of scope.
+      blobsOutstanding:
+        b && engine !== null && !engine.blobsSettled() && b.written > 0
+          ? Math.max(0, b.total - b.materialized - b.failed)
+          : 0,
+      showing: this.arrivingNoticeEl !== null,
+    };
+  }
+
   /** Compose the status line (shared by the desktop status bar and the "Zync: show status" command). */
-  private statusText(
-    pending: number,
-    stuck: number,
-    files: string,
-    conf: string,
-    updates: string,
-  ): string {
-    // Same split as the status bar: stuck docs stay inside `pending` for convergence semantics, but
-    // are reported separately so a non-zero count is always explainable. Wording MUST match the
-    // status-bar segment ("stuck") — this line is the same fact on a different surface.
-    const syncing = Math.max(0, pending - stuck);
+  private statusText(counts: StatusCounts, files: string, conf: string, updates: string): string {
+    // Same partition as the status bar: counts come straight from the engine, no subtraction.
+    // Wording MUST match the status-bar segments — this line is the same facts on a different
+    // surface, and the two drifting apart was already a shipped bug once (v0.6.2). It therefore
+    // derives its arriving phrase from the SAME arrivingSegment() the bar renders, rather than
+    // re-deriving one from the counts, so the indeterminate "receiving index" state cannot be
+    // visible on one surface and missing from the other.
+    const arrivingSeg = arrivingSegment(this.arrivingInputs(counts));
     return (
       `Zync: ${this.connText}` +
-      (syncing > 0 ? ` · ${String(syncing)} syncing` : "") +
-      (stuck > 0 ? ` · ${String(stuck)} stuck` : "") +
+      (arrivingSeg === null ? "" : ` · ${arrivingSeg.text}`) +
+      (counts.sending > 0 ? ` · ${String(counts.sending)} syncing` : "") +
+      (counts.stuck > 0 ? ` · ${String(counts.stuck)} stuck` : "") +
       `${files}${conf}${updates}`
     );
   }
@@ -753,8 +857,9 @@ export default class ZyncPlugin extends Plugin {
     const conf = nConf > 0 ? ` · ${String(nConf)} conflict${nConf === 1 ? "" : "s"}` : "";
     const nUpdates = engine ? engine.pendingPluginUpdates().length : 0;
     const updates = nUpdates > 0 ? ` · ${String(nUpdates)} update${nUpdates === 1 ? "" : "s"}` : "";
-    const nStuck = engine ? engine.stuckDocs().length : 0;
-    return this.statusText(this.lastPending, nStuck, files, conf, updates);
+    // DISPLAY must read counts.stuck (filtered to pending), never engine.stuckDocs().length
+    // (unfiltered) — see the partition contract on StatusCounts.
+    return this.statusText(this.lastCounts, files, conf, updates);
   }
 
   /** Execute a ConnectionAlert command as Obsidian Notices/timers (mobile only). */
@@ -829,7 +934,7 @@ export default class ZyncPlugin extends Plugin {
       this.conflictNotice = null;
     }
     this.lastConflictCount = n;
-    this.renderStatus(this.lastPending);
+    this.renderStatus(this.lastCounts);
   }
 
   /**
@@ -865,6 +970,69 @@ export default class ZyncPlugin extends Plugin {
       label: "Review",
       run: () => this.openInbox(),
     });
+  }
+
+  /**
+   * The mobile first-sync surface. Mobile has NO status bar, so without this a downloading vault
+   * is completely silent there — the original complaint this feature exists to answer.
+   *
+   * Updates IN PLACE rather than hide-and-recreate (the shape `refreshStuckNotice` uses): this
+   * count changes on every 8s poll, and recreating would re-animate the toast dozens of times
+   * during one first sync. No signature-mute either — that exists so a PERSISTENT stuck set does
+   * not re-nag each launch, whereas this count is expected to drain and retire itself.
+   */
+  private refreshArrivingNotice(counts: StatusCounts): void {
+    const inputs = this.arrivingInputs(counts);
+    // Tracked on the instance, not closed over, so the click handler reads the count AT TAP TIME
+    // rather than the one from whenever the notice happened to be created.
+    this.arrivingOutstanding = inputs.arriving + inputs.blobsOutstanding;
+    const next = arrivingNotice(inputs);
+    if (next.kind === "hidden") {
+      this.arrivingNoticeEl?.hide();
+      this.arrivingNoticeEl = null;
+      this.arrivingDismissedAt = null; // episode over — re-arm for the next bulk arrival
+      return;
+    }
+    // A dismissal means "quiet about THIS batch", not "quiet forever". Re-arm as soon as there is
+    // MORE outstanding than when the user tapped it away, so a genuinely new batch always breaks
+    // through. Deliberately content-based rather than a timer: a time-window gate in the
+    // config-sync work had to be replaced with a structural one after it swallowed real edits.
+    //
+    // KNOWN LIMIT, deliberately accepted: a sync that STALLS above the threshold stays muted for
+    // as long as it stalls, because nothing new arrives to re-arm it. That is what dismissal
+    // means, it fails silent rather than lying, and two other surfaces still answer the question
+    // on mobile — the "Zync: show status" command, and the stuck-docs notice if it is genuinely
+    // wedged. Worth re-evaluating on a real phone, where an accidental tap is easy.
+    if (this.arrivingDismissedAt !== null && this.arrivingOutstanding <= this.arrivingDismissedAt)
+      return;
+    this.arrivingDismissedAt = null;
+    // durationMs 0 = sticky. The `info` KIND_STICKY default is 4000, which would auto-dismiss
+    // mid-sync, so the duration is set explicitly rather than via the notifyInfo wrapper.
+    // `detail` is spread conditionally because the repo runs exactOptionalPropertyTypes.
+    const opts: NotifyOptions = {
+      kind: "info",
+      title: next.title,
+      durationMs: 0,
+      ...(next.detail !== null && { detail: next.detail }),
+    };
+    if (this.arrivingNoticeEl === null) {
+      const n = notify(opts);
+      // A tap anywhere on a Notice dismisses it, and nothing else observes that. Without this the
+      // field stays non-null, `showing` keeps claiming the toast is up, and updateNotice would
+      // write into a detached node — silently blanking mobile's only progress surface for the
+      // rest of the sync.
+      n.noticeEl.addEventListener("click", () => {
+        // Identity guard: only act if THIS notice is still the live one. Without it, a click
+        // landing on a hidden-but-not-yet-collected node after a stop/start would null out and
+        // mute the NEWER notice while leaving a stale toast on screen. Whether Obsidian's private
+        // hide() can leave a node clickable is not verifiable from this repo, so do not depend on
+        // the answer.
+        if (this.arrivingNoticeEl !== n) return;
+        this.arrivingNoticeEl = null;
+        this.arrivingDismissedAt = this.arrivingOutstanding;
+      });
+      this.arrivingNoticeEl = n;
+    } else updateNotice(this.arrivingNoticeEl, opts);
   }
 
   /** Run an Obsidian command by id (the command bus is untyped in the public API). */

@@ -83,7 +83,7 @@ export {
   SELFHEAL_MAX_NO_PROGRESS,
   SELFHEAL_MAX_PASSES,
 } from "./engine.js";
-export type { EnginePorts, EngineConfig } from "./engine.js";
+export type { EnginePorts, EngineConfig, SyncSnapshot } from "./engine.js";
 export { BlobEngine } from "./blobs/blob-engine.js";
 export type { BlobManifestEntry, BlobFetchPolicy, BlobEngineDeps } from "./blobs/blob-engine.js";
 export * from "./blobs/blob-fetch-queue.js";

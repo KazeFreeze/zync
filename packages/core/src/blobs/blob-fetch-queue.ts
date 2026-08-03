@@ -40,6 +40,9 @@ export class BlobFetchQueue {
   readonly #retryTimers = new Map<VaultPath, ReturnType<typeof setTimeout>>();
   #inFlightBytes = 0;
   #materialized = 0;
+  /** Real fetches ONLY (`outcome === "written"`), never the idempotent "already on disk" hit that
+   *  `#materialized` also counts. See `progress()`'s doc for why this exists as a separate counter. */
+  #written = 0;
   #stopped = false;
   #tick: ReturnType<typeof setInterval> | null = null;
   /**
@@ -151,6 +154,7 @@ export class BlobFetchQueue {
       // hook handled the path out-of-band (e.g. config raised a conflict inbox item) — no vault write
       // happened, treated identically to `superseded` (done, not failed, not retried).
       if (outcome !== "superseded" && outcome !== "conflict") this.#materialized++;
+      if (outcome === "written") this.#written++;
       // A successful re-materialize heals a previously-parked failure; re-emit the aggregate report so
       // the inbox item resolves once the LAST parked path clears (fires onFailure([]) on full recovery).
       // Suppress the notify after stop() (in-flight heal during shutdown -> torn-down consumer); the
@@ -190,11 +194,19 @@ export class BlobFetchQueue {
     this.#d.onFailure([...this.#failed]);
   }
 
-  progress(): { materialized: number; total: number; failed: number } {
+  /**
+   * `materialized` counts a "written" OR an idempotent "already on disk" hit — it answers "has this
+   * path been CHECKED", not "did bytes move". `written` answers the narrower question: how many
+   * blobs actually had to be fetched this session. The eager policy enqueues every manifest entry at
+   * start, so on an already-synced vault `materialized` climbs from 0 while `written` stays 0 — the
+   * distinguishing signal a caller needs before it can claim a real download is in progress.
+   */
+  progress(): { materialized: number; total: number; failed: number; written: number } {
     return {
       materialized: this.#materialized,
       total: this.#d.manifestEntries().length,
       failed: this.#failed.size,
+      written: this.#written,
     };
   }
 

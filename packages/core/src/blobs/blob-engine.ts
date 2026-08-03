@@ -229,7 +229,7 @@ export class BlobEngine {
     return this.#queue.settled();
   }
 
-  blobProgress(): { materialized: number; total: number; failed: number } {
+  blobProgress(): { materialized: number; total: number; failed: number; written: number } {
     return this.#queue.progress();
   }
 }

@@ -81,6 +81,10 @@ export type ConnStatus = "connected" | "connecting" | "offline" | "unauthorized"
 export interface Status {
   conn: ConnStatus;
   pendingDocs: number;
+  /** Live index entries whose content has not materialized on THIS device (inbound). */
+  arriving: number;
+  /** pendingDocs minus stuck minus arriving (outbound or awaiting ack). */
+  sending: number;
   conflicts: unknown[];
   writeCount: number;
   ingestCount: number;

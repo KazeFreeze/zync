@@ -576,14 +576,17 @@ async function fsTree(deps: ControlApiDeps): Promise<JsonResponse> {
 
 async function status(deps: ControlApiDeps): Promise<JsonResponse> {
   const { engine, state } = deps;
-  const pending = deps.isStarted() ? (await engine.pendingDocs()).length : 0;
+  // ONE snapshot: the pending scan is O(n) disk reads, so do not call it separately per count.
+  const snap = deps.isStarted() ? await engine.syncSnapshot() : null;
   // Inbox is only constructed after start(); guard so /status works boot-idle.
   const conflicts = deps.isStarted() ? engine.inbox.list() : [];
   return {
     status: 200,
     body: {
       conn: deps.transport.status(),
-      pendingDocs: pending,
+      pendingDocs: snap?.pending.length ?? 0,
+      arriving: snap?.arriving.length ?? 0,
+      sending: snap?.sending.length ?? 0,
       conflicts,
       writeCount: state.writeCount,
       ingestCount: state.ingestCount,

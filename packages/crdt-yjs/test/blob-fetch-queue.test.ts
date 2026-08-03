@@ -79,6 +79,57 @@ describe("BlobFetchQueue — concurrency + dedup", () => {
   });
 });
 
+describe("BlobFetchQueue — written vs materialized", () => {
+  it("counts a real fetch in BOTH `written` and `materialized`", async () => {
+    const c = controllable();
+    const q = newQueue(c, 4);
+    q.enqueue(p("a"), sha("s1"), 10);
+    await Promise.resolve();
+    c.release("a");
+    await q.whenDrained();
+    expect(q.progress()).toMatchObject({ materialized: 1, written: 1 });
+  });
+
+  it("an idempotent 'already on disk' hit counts toward `materialized` but NOT `written`", async () => {
+    const materialize = (): Promise<MaterializeOutcome> => Promise.resolve("already");
+    const q = new BlobFetchQueue({
+      materialize,
+      manifestEntries: () => [],
+      clock: new FakeClock(),
+      onFailure: () => undefined,
+      concurrency: 4,
+      maxInFlightBytes: 1e9,
+      maxRetries: 4,
+      retryTickMs: 1e9,
+    });
+    q.enqueue(p("a"), sha("s1"), 10);
+    await q.whenDrained();
+    expect(q.progress()).toMatchObject({ materialized: 1, written: 0 });
+  });
+
+  it("neither `superseded` nor `conflict` outcomes move `written` (or `materialized`)", async () => {
+    let call = 0;
+    const outcomes: MaterializeOutcome[] = ["superseded", "conflict"];
+    const materialize = (): Promise<MaterializeOutcome> =>
+      Promise.resolve(outcomes[call++] ?? "superseded");
+    const q = new BlobFetchQueue({
+      materialize,
+      manifestEntries: () => [],
+      clock: new FakeClock(),
+      onFailure: () => undefined,
+      concurrency: 4,
+      maxInFlightBytes: 1e9,
+      maxRetries: 4,
+      retryTickMs: 1e9,
+    });
+    q.enqueue(p("a"), sha("s1"), 10);
+    await q.whenDrained();
+    q.enqueue(p("b"), sha("s2"), 10);
+    await q.whenDrained();
+    expect(q.progress()).toMatchObject({ materialized: 0, written: 0 });
+  });
+});
+
 describe("BlobFetchQueue — byte budget", () => {
   it("does not start a job that would exceed the in-flight byte budget", async () => {
     const c = controllable();
