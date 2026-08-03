@@ -207,4 +207,60 @@ describe("S7: orphan-recovery-after-observe-collision", () => {
       }
     },
   );
+
+  it(
+    "IDENTICAL content on both sides is a no-op: the loser is NOT recovered into a duplicate",
+    { timeout: 20_000 },
+    async () => {
+      // REGRESSION (real vault, 2026-08-03): a phone whose index had not loaded re-seeded an
+      // ALREADY-SYNCED vault, so ~190 losers were orphaned at once. Every one held byte-identical
+      // content to its winner, yet the sweep "recovered" each into a "(conflict, …)" duplicate of a
+      // real note. Identical content is not a conflict: the winner already has exactly these bytes,
+      // so there is nothing to rescue and a copy is pure pollution.
+      vi.useFakeTimers();
+      try {
+        const bus = new InProcessBus();
+        const a = makeDevice(bus, "dev-a");
+        const b = makeDevice(bus, "dev-b");
+
+        await a.engine.start();
+        await b.engine.start();
+        await a.engine.whenIdle();
+        await b.engine.whenIdle();
+
+        a.transport.goOffline();
+
+        // Same path, SAME bytes on both sides (the whole-vault re-seed signature).
+        await a.vault.writeAtomic(DAILY, utf8(A_BODY));
+        await b.vault.writeAtomic(DAILY, utf8(A_BODY));
+
+        await a.engine.whenIdle();
+        await b.engine.whenIdle();
+
+        a.transport.goOnline();
+
+        for (let i = 0; i < 8; i++) {
+          await a.engine.whenIdle();
+          await b.engine.whenIdle();
+        }
+        await vi.advanceTimersByTimeAsync(AUDIT_QUIESCENCE_MS + 200);
+        for (let i = 0; i < 4; i++) {
+          await a.engine.whenIdle();
+          await b.engine.whenIdle();
+        }
+
+        // NO conflict artifact anywhere: the loser carried the winner's exact content.
+        expect([...conflictPaths(a.engine), ...conflictPaths(b.engine)]).toEqual([]);
+
+        // And the content survived on both sides (the guard skips a COPY, it never drops bytes).
+        expect(decode((await a.vault.read(DAILY)) ?? new Uint8Array())).toBe(A_BODY);
+        expect(decode((await b.vault.read(DAILY)) ?? new Uint8Array())).toBe(A_BODY);
+
+        await a.engine.stop();
+        await b.engine.stop();
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
 });

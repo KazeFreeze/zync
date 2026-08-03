@@ -4287,7 +4287,33 @@ export class SyncEngine {
    * local copy from having its content silently overwritten (M1) and restores the
    * zero-attach identical-adopt property (M2). Finishes with an orphan sweep.
    */
+  /**
+   * Durable path → docId bindings for docs THIS device already materialized, used by the bootstrap
+   * seed loop to avoid re-minting when the index has not loaded. Built LAZILY on the first unbound
+   * path and cached for the rest of the pass: a healthy start (index synced ⇒ every path bound)
+   * never builds it, so this costs nothing on the common path. Reset per bootstrap.
+   *
+   * A doc this device durably observed as DELETED is excluded: re-creating that path deserves a
+   * fresh docId, not a resurrection of the tombstoned one.
+   */
+  private durableBindings: Map<string, DocId> | null = null;
+
+  private async durableDocIdFor(path: VaultPath): Promise<DocId | undefined> {
+    if (this.durableBindings === null) {
+      const map = new Map<string, DocId>();
+      for (const id of await this.ports.docStore.list()) {
+        const p = await this.ports.engineState.getLastLivePath(id);
+        if (p === null) continue;
+        if (await this.ports.engineState.wasDeleted(id)) continue;
+        map.set(p, id);
+      }
+      this.durableBindings = map;
+    }
+    return this.durableBindings.get(path);
+  }
+
   private async bootstrap(): Promise<void> {
+    this.durableBindings = null; // re-derive per bootstrap (durable state may have changed)
     const deviceId = this.ports.identity.deviceId();
     // M1a: offline rename re-key happens INLINE; the unmatched-lost set is DEFERRED past the seed loop
     // (applyDeferredLost). The seed loop now CONSUMES an in-place collision first (an external mv onto an
@@ -4369,7 +4395,17 @@ export class SyncEngine {
       }
 
       const treeStamp = existing?.stamp ?? null;
-      const docId = existing?.docId ?? this.mintDocId();
+      // INDEX-NOT-LOADED GUARD: `existing` is undefined for EVERY path when the index has not
+      // synced yet — and start() deliberately falls through to this bootstrap after a bounded
+      // wait (DEFAULT_INDEX_SYNC_START_BUDGET_MS), so a slow mobile link reaches here with an
+      // EMPTY index while the whole vault sits on disk from a PREVIOUS successful sync. Minting
+      // off `existing` alone then re-seeds the ENTIRE vault under fresh docIds; when the index
+      // finally arrives every path LWW-collides, the fresh ids lose, and the orphan sweep
+      // "recovers" hundreds of them into (conflict, …) duplicates. Observed on a real Pixel:
+      // ~190 docIds minted inside ~2 seconds. So consult DURABLE local state first — a path this
+      // device already materialized has a lastLivePath binding — and REUSE that docId. Genuinely
+      // new files are absent from the map and still mint.
+      const docId = existing?.docId ?? (await this.durableDocIdFor(path)) ?? this.mintDocId();
       const result = await applyBootstrap(
         {
           base: this.base,
@@ -4593,6 +4629,16 @@ export class SyncEngine {
           if (lastPath === null) return null;
           const occupant = this.index.get(lastPath);
           if (occupant === undefined || occupant.deleted === true || occupant.docId === docId)
+            return null;
+
+          // IDENTICAL-CONTENT NO-OP: two devices seeding the SAME path with the SAME bytes is not a
+          // conflict — the winner already holds exactly this content, so there is nothing to rescue
+          // and a recovery would only mint a duplicate note. This is the defence-in-depth layer for
+          // whole-vault re-seeds (a slow start that re-mints an already-synced vault): even when
+          // hundreds of losers are orphaned at once, none of them are byte-different from the
+          // winner, so none produce a "(conflict, …)" artifact. A GENUINELY divergent loser (real
+          // concurrent edits) still differs from the occupant's stamp and is recovered as before.
+          if (stampHash(occupant.stamp) === (await sha256OfText(canonicalizeProse(text))))
             return null;
 
           return { text, type: "crdt-prose" as Route, meta };

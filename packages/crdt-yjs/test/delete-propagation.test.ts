@@ -512,6 +512,38 @@ describe("M1b — materializedHash observed at bootstrap", () => {
     expect(await a.engine.pendingDocs()).not.toContain(ghost); // and no longer wedges quiescence
   });
 
+  it("bootstrap REUSES a durable path binding instead of re-minting when the index has not loaded", async () => {
+    // REGRESSION (real Pixel phone, 2026-08-03): start() waits only a BOUNDED time for the first
+    // index sync, then deliberately falls through to bootstrap. On a slow mobile link the index is
+    // still EMPTY while the whole vault sits on disk from a previous successful sync, so every path
+    // looked first-seen and bootstrap minted a fresh docId for the ENTIRE vault (~190 ids inside ~2
+    // seconds). When the index arrived every path LWW-collided, the fresh ids lost, and the orphan
+    // sweep "recovered" them into (conflict, …) duplicates of real notes.
+    const bus = new InProcessBus();
+    const durA = newDurable(true);
+    const known = "device-a-1111-0" as DocId;
+
+    // A file this device ALREADY materialized from sync: on disk, with a docStore snapshot and a
+    // durable lastLivePath binding. The in-memory index is empty (nothing to sync from in this rig),
+    // which is exactly the index-not-loaded state.
+    await durA.vault.writeAtomic(NOTE, utf8(CONTENT));
+    const provider = new YjsCrdtProvider();
+    const seeded = provider.createDoc(known);
+    await durA.docStore.save(known, seeded.encodeSnapshot());
+    seeded.destroy();
+    await durA.engineState.setLastLivePath(known, NOTE);
+
+    const a = makeEngine(bus, durA, "device-a");
+    open.push(a.engine);
+    await a.engine.start();
+    await a.engine.waitConverged();
+
+    // The path must bind to the KNOWN docId. A fresh mint here is the whole-vault re-seed bug.
+    expect(a.engine.index.get(NOTE)?.docId).toBe(known);
+    // And the content is intact (no data was traded away to win the assertion above).
+    expect(decode(await durA.vault.read(NOTE))).toBe(CONTENT);
+  });
+
   it("bootstrap clears the unsatisfiable dirty flag on a SUPERSEDED double-seed orphan (keeps its snapshot)", async () => {
     // The historical shape left by the now-fixed first-seen double-seed: a docId minted for a brand-new
     // path inside the debounced bump window, seeded (snapshot + meta + dirty), then displaced by a second
