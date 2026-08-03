@@ -519,6 +519,45 @@ describe("M1b — materializedHash observed at bootstrap", () => {
     expect(await a.engine.pendingDocs()).not.toContain(ghost); // and no longer wedges quiescence
   });
 
+  it("persisted index: an OFFLINE delete racing a remote EDIT does not silently lose the edit", async () => {
+    // The one place local index persistence moves a DESTRUCTIVE decision earlier: a device that
+    // deleted a file while closed can now delete-route from hydrated (stale) state BEFORE the relay
+    // answers. The tombstone it lays carries the OLD content hash, so a peer holding NEWER bytes
+    // must win via the contested-tombstone resurrect rather than losing the edit.
+    const bus = new InProcessBus();
+    const durA = newDurable(true);
+    const durB = newDurable(true);
+    await durA.vault.writeAtomic(NOTE, utf8(CONTENT));
+
+    const a = makeEngine(bus, durA, "device-a", "relay-X");
+    const b = makeEngine(bus, durB, "device-b", "relay-X");
+    open.push(a.engine, b.engine);
+    await a.engine.start();
+    await b.engine.start();
+    await converge(a, b);
+
+    // A goes down (its index snapshot is now persisted and will hydrate on restart).
+    await a.engine.stop();
+
+    // While A is down: B EDITS the note, and A's copy is deleted on disk.
+    const EDIT = `${CONTENT}\n\nB's later edit that must not vanish.\n`;
+    await durB.vault.writeAtomic(NOTE, utf8(EDIT));
+    await b.engine.whenIdle();
+    await durA.vault.remove(NOTE);
+
+    // A restarts hydrated-but-stale, then reconnects.
+    const a2 = makeEngine(bus, durA, "device-a", "relay-X");
+    open.push(a2.engine);
+    await a2.engine.start();
+    await converge(a2, b);
+
+    // NO SILENT LOSS: B's edit must still exist somewhere the user can reach.
+    const onB = decode(await durB.vault.read(NOTE));
+    const onA = decode(await durA.vault.read(NOTE));
+    const survived = onB.includes("must not vanish") || onA.includes("must not vanish");
+    expect(survived).toBe(true);
+  });
+
   it("persists the index locally: a restart HYDRATES the tree before the relay answers", async () => {
     // CAUSE-LEVEL REGRESSION (2026-08-03): the index doc used to be created EMPTY on every start
     // and filled only from the relay, so a restart began blind. That single property produced a

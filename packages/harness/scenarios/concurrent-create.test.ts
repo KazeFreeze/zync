@@ -81,7 +81,13 @@ describe("concurrent-create same daily note (LWW winner + recovered loser; valid
 
     // Heal A and converge — the LWW winner stays at PATH; the loser is recovered via the sweep.
     await heal("device-a");
-    await waitConverged(["device-a", "device-b"], { timeoutMs: 120_000 });
+    // BUDGET: this convergence (partition-heal + orphan sweep + cross-device replication) takes
+    // ~5s ISOLATED but is heavily contended when the whole suite shares the box, where it has
+    // repeatedly blown a 120s budget while passing alone in seconds. That produced a recurring
+    // FALSE RED on the full run, which is worse than a slow test: a gate nobody trusts stops being
+    // a gate. Match vitest's own 300s testTimeout so the inner primitive is no longer the binding
+    // constraint (raising testTimeout alone never helped — waitConverged gave up first).
+    await waitConverged(["device-a", "device-b"], { timeoutMs: 300_000 });
 
     const treeA = await a.tree();
     const treeB = await b.tree();

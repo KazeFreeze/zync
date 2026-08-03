@@ -976,6 +976,16 @@ export default class ZyncPlugin extends Plugin {
    * empty, so rendering it would show real choices as "off" and let a write be lost to the merge.
    * False while the engine is not started, which is the same "do not trust absence" situation.
    */
+  /**
+   * True once the index-backed maps hold real state (restored locally OR synced). The settings
+   * section gates on THIS rather than isIndexSynced: a hydrated index is genuine local truth, so
+   * rendering it is correct even before the relay answers.
+   */
+  isIndexHydrated(): boolean {
+    if (!this.engineReady || this.engine === null) return false;
+    return this.engine.isIndexHydrated();
+  }
+
   isIndexSynced(): boolean {
     if (!this.engineReady || this.engine === null) return false;
     return this.engine.isIndexSynced();
@@ -1257,11 +1267,11 @@ class ZyncSettingTab extends PluginSettingTab {
     // render OFF and invite the user to "fix" state that is merely in transit. Worse, a toggle
     // written into the not-yet-populated doc can then LOSE the merge against the arriving relay
     // state, so the change appears to revert. Show the real situation and accept no writes yet.
-    if (!disabled && !this.plugin.isIndexSynced()) {
+    if (!disabled && !this.plugin.isIndexHydrated()) {
       const waiting = new Setting(containerEl)
         .setName("Loading plugin sync settings")
         .setDesc(
-          "Waiting for the shared list to arrive from the relay. Your current choices will appear here.",
+          "Waiting for your synced settings to load. Your current choices will appear here.",
         );
       waiting.settingEl.addClass("zync-section-notice");
       waiting.addButton((b) =>

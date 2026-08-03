@@ -679,6 +679,8 @@ export class SyncEngine {
    * See {@link isIndexSynced} — `start()` can complete WITHOUT this when the sync budget expires.
    */
   private indexSyncedOnce = false;
+  /** True when this session started from a locally persisted index snapshot. */
+  private indexHydratedFromSnapshot = false;
   /** Index-persist bookkeeping — see {@link scheduleIndexPersist}. */
   private indexPersistTimer: ReturnType<typeof setTimeout> | null = null;
   private indexPersistMaxTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1677,6 +1679,17 @@ export class SyncEngine {
    * toggle, a zero count) must gate on this, or it will show — and let the user overwrite — state
    * that merely has not arrived yet.
    */
+  /**
+   * True once the index-backed maps hold REAL state — either restored from this device's persisted
+   * snapshot or synced from the relay. This, not {@link isIndexSynced}, is what a UI should gate on
+   * before rendering index-backed values: a hydrated map is genuine local truth, so showing it is
+   * correct and a write over it causally supersedes the fleet's prior value instead of entering a
+   * clientID coin flip. Use {@link isIndexSynced} only to say whether the RELAY has been reached.
+   */
+  isIndexHydrated(): boolean {
+    return this.indexHydratedFromSnapshot || this.indexSyncedOnce;
+  }
+
   isIndexSynced(): boolean {
     return this.indexSyncedOnce;
   }
@@ -3437,7 +3450,9 @@ export class SyncEngine {
       if (rec.version !== SyncEngine.INDEX_SNAPSHOT_VERSION) return null;
       if (rec.identity !== identity) return null;
       if (rec.substrate !== this.substrate) return null;
-      return this.ports.crdt.loadDoc(INDEX_DOC_ID, rec.snapshot);
+      const doc = this.ports.crdt.loadDoc(INDEX_DOC_ID, rec.snapshot);
+      this.indexHydratedFromSnapshot = true;
+      return doc;
     } catch {
       return null; // unreadable/corrupt ⇒ fall back to a fresh doc + full relay sync
     }
