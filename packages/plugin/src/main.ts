@@ -1035,9 +1035,15 @@ function installedCommunityPlugins(app: App): InstalledPlugin[] {
     }
   ).plugins;
   const manifests = pm?.manifests ?? {};
-  return Object.values(manifests)
-    .filter((m) => m.id !== "zync")
-    .map((m) => ({ id: m.id, name: m.name ?? m.id, isDesktopOnly: m.isDesktopOnly === true }));
+  return (
+    Object.values(manifests)
+      .filter((m) => m.id !== "zync")
+      .map((m) => ({ id: m.id, name: m.name ?? m.id, isDesktopOnly: m.isDesktopOnly === true }))
+      // Obsidian's `manifests` is keyed by id in load order, so an unsorted list looks arbitrary
+      // and makes a specific plugin hard to find. Sort by DISPLAY NAME (what the row shows),
+      // case- and accent-insensitively so "Calendar" and "calendar" land together.
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }))
+  );
 }
 
 class ZyncSettingTab extends PluginSettingTab {
