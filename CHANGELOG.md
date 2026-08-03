@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/KazeFreeze/zync/compare/zync-v0.8.0...zync-v0.9.0) (2026-08-03)
+
+
+### Features
+
+* **sync:** show what is arriving, not just how much is syncing ([96d382d](https://github.com/KazeFreeze/zync/commit/96d382db8af1cdc796d73a939357d2ad6ff36ff2))
+
 ## [0.8.0](https://github.com/KazeFreeze/zync/compare/zync-v0.7.0...zync-v0.8.0) (2026-08-03)
 
 
