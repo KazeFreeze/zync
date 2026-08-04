@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.2](https://github.com/KazeFreeze/zync/compare/zync-v0.9.1...zync-v0.9.2) (2026-08-04)
+
+
+### Bug Fixes
+
+* **plugin:** show synced plugin settings as soon as the index is readable ([5dc180f](https://github.com/KazeFreeze/zync/commit/5dc180f971ca758478649cec91451933defff142))
+
 ## [0.9.1](https://github.com/KazeFreeze/zync/compare/zync-v0.9.0...zync-v0.9.1) (2026-08-04)
 
 
