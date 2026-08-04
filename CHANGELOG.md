@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.1](https://github.com/KazeFreeze/zync/compare/zync-v0.9.0...zync-v0.9.1) (2026-08-04)
+
+
+### Bug Fixes
+
+* **sync:** stop an unreachable server from wedging startup ([bc6d5fb](https://github.com/KazeFreeze/zync/commit/bc6d5fb6a1ad4c195d628287a73ba3960a1d4889))
+
 ## [0.9.0](https://github.com/KazeFreeze/zync/compare/zync-v0.8.0...zync-v0.9.0) (2026-08-03)
 
 
