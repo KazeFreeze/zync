@@ -27,6 +27,17 @@ async function makeTmpDir(label: string): Promise<string> {
   return dir;
 }
 
+/** The config the most recent {@link boot} used — lets a test re-boot over the SAME store dirs. */
+let lastConfig: DaemonConfig | null = null;
+
+/** Boot a daemon over an EXISTING config (same dirs) — models a process restart. */
+async function bootWith(config: DaemonConfig): Promise<void> {
+  lastConfig = config;
+  daemon = await createDaemon(config);
+  const port = await daemon.listen();
+  baseUrl = `http://127.0.0.1:${String(port)}`;
+}
+
 /** Boot an idle daemon (offline transport) and start its HTTP server on an ephemeral port. */
 async function boot(overrides: Partial<DaemonConfig> = {}): Promise<void> {
   const vaultDir = await makeTmpDir("vault");
@@ -49,9 +60,7 @@ async function boot(overrides: Partial<DaemonConfig> = {}): Promise<void> {
     connect: false, // OFFLINE — no relay
     ...overrides,
   };
-  daemon = await createDaemon(config);
-  const port = await daemon.listen();
-  baseUrl = `http://127.0.0.1:${String(port)}`;
+  await bootWith(config);
 }
 
 afterEach(async () => {
@@ -379,5 +388,63 @@ describe("headless-client daemon — durability-trust wiring", () => {
 
   it("configFromEnv: unset -> durabilityTrusted true (trust a real local root by default)", () => {
     expect(configFromEnv({}).durabilityTrusted).toBe(true);
+  });
+});
+
+/**
+ * Index persistence — the facet the Docker harness could not exercise at all until the daemon
+ * started passing `indexIdentity`. Without it `loadPersistedIndex` returns null immediately and
+ * `setIndexSnapshot?.()` is a silent no-op, so persistence was disabled fleet-wide in the harness
+ * regardless of the adapter.
+ */
+describe("index persistence", () => {
+  it("persists an index snapshot bound to the relay identity", async () => {
+    await boot();
+    const cfg = lastConfig;
+    if (cfg === null) throw new Error("boot did not record a config");
+    await post("/sync/start");
+    await post("/fs/write", { path: "notes/persist.md", contentBase64: b64("body\n") });
+    await waitForIngest(1);
+
+    const raw = await fsp.readFile(path.join(cfg.configDir, "index-snapshot.json"), "utf8");
+    const rec = JSON.parse(raw) as { identity: string; substrate: string; snapshotB64: string };
+    // Identity binding is load-bearing: a snapshot is discarded unless it matches, which is what
+    // stops re-pointing at a different relay from resurrecting an old vault inside a new one.
+    expect(rec.identity).toBe(cfg.serverWs);
+    expect(rec.substrate).toBe("yjs");
+    expect(rec.snapshotB64.length).toBeGreaterThan(0);
+  });
+
+  it("a restart over the same store hydrates the index with the relay unreachable", async () => {
+    await boot();
+    const cfg = lastConfig;
+    if (cfg === null) throw new Error("boot did not record a config");
+    await post("/sync/start");
+    await post("/fs/write", { path: "notes/persist.md", contentBase64: b64("body\n") });
+    await waitForIngest(1);
+
+    // The FIRST run has nothing to hydrate from — it built the index from scratch. Offline,
+    // `hydrated` can only ever be true via the snapshot, so this is the differential.
+    expect(((await get("/status")).json as { hydrated: boolean }).hydrated).toBe(false);
+    const docIdBefore = ((await get("/doc?path=notes/persist.md")).json as { docId: string | null })
+      .docId;
+    expect(docIdBefore).not.toBeNull();
+
+    await daemon?.close();
+    daemon = null;
+
+    await bootWith(cfg); // same dirs = same store: a process restart
+    await post("/sync/start");
+    expect(((await get("/status")).json as { hydrated: boolean }).hydrated).toBe(true);
+
+    // `hydrated` alone is NOT enough: it only says a snapshot record loaded without throwing.
+    // The index must actually CARRY the state — a doc that decodes to an empty tree would
+    // report hydrated:true while having lost everything.
+    const doc = (await get("/doc?path=notes/persist.md")).json as {
+      docId: string | null;
+      live: boolean;
+    };
+    expect(doc.live).toBe(true);
+    expect(doc.docId).toBe(docIdBefore);
   });
 });

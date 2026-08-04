@@ -42,6 +42,9 @@ const COMPOSE_ARGS = ["compose", "-p", PROJECT, "-f", COMPOSE_FILE];
 /** The partitionable network (device <-> server sync traffic). */
 const SYNCNET = `${PROJECT}_syncnet`;
 
+/** The UNREACHABLE-host network — see {@link blackhole} and the compose `blackhole` service. */
+const BLACKHOLENET = `${PROJECT}_blackholenet`;
+
 /** Logical device name → published control-API port (compose `ports:` map). */
 const CONTROL_PORTS: Record<DeviceName, number> = {
   "device-a": 17070,
@@ -80,6 +83,12 @@ export type ConnStatus = "connected" | "connecting" | "offline" | "unauthorized"
 /** `GET /status`. */
 export interface Status {
   conn: ConnStatus;
+  /**
+   * `engine.isIndexHydrated()` — the shared index holds REAL state, restored from the local
+   * snapshot OR synced from the relay. While the relay is unreachable only the snapshot can set
+   * it, so offline this reads as "hydrated from disk".
+   */
+  hydrated: boolean;
   pendingDocs: number;
   /** Live index entries whose content has not materialized on THIS device (inbound). */
   arriving: number;
@@ -408,6 +417,36 @@ export async function partition(name: DeviceName): Promise<void> {
 /** Heal a partition: reconnect the device to syncnet. */
 export async function heal(name: DeviceName): Promise<void> {
   const container = await resolveContainer(name);
+  await execa("docker", ["network", "connect", SYNCNET, container]);
+}
+
+/**
+ * UNREACHABLE lever — strictly stronger than {@link partition}.
+ *
+ * `partition()` removes the device from syncnet, which also stops the `server` name from
+ * RESOLVING: requests then fail IMMEDIATELY (ENOTFOUND). That is the "refused" shape, and code
+ * that mishandles a never-settling request passes it happily.
+ *
+ * `blackhole()` instead swaps the device onto `blackholenet`, where the compose `blackhole`
+ * service holds the `server` alias. The hostname still resolves and TCP still connects — the peer
+ * simply never answers. `fetch()` and the WS handshake hang exactly as they do against an
+ * unreachable host on a real phone, which is the failure mode that wedged `start()` in v0.9.1.
+ *
+ * The device's own config is untouched (`ws://server:1234` / `http://server:8080`), so there is no
+ * container recreation and no env change — the NAME simply points somewhere silent.
+ *
+ * Reverse with {@link unblackhole}.
+ */
+export async function blackhole(name: DeviceName): Promise<void> {
+  const container = await resolveContainer(name);
+  await execa("docker", ["network", "disconnect", SYNCNET, container]);
+  await execa("docker", ["network", "connect", BLACKHOLENET, container]);
+}
+
+/** Reverse {@link blackhole}: drop the silent host and rejoin the real syncnet. */
+export async function unblackhole(name: DeviceName): Promise<void> {
+  const container = await resolveContainer(name);
+  await execa("docker", ["network", "disconnect", BLACKHOLENET, container]);
   await execa("docker", ["network", "connect", SYNCNET, container]);
 }
 

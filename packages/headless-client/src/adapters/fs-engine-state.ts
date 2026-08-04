@@ -1,5 +1,5 @@
 /**
- * FsEngineStateStore — crash-survivable EngineStateStore backed by a single JSON file.
+ * FsEngineStateStore — crash-survivable EngineStateStore backed by a JSON file.
  *
  * Usage:
  *   const store = await FsEngineStateStore.open("/path/to/state.json");
@@ -10,12 +10,22 @@
  *
  * An in-memory copy is kept for synchronous reads — all public methods are
  * async to satisfy the EngineStateStore port interface.
+ *
+ * ONE facet lives outside that file: the index snapshot, in an `index-snapshot.json` SIDECAR
+ * next to it. See {@link FsEngineStateStore.setIndexSnapshot} for why.
  */
 
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
-import type { DocId, EngineStateStore, Sha256, Stamp, VaultPath } from "@zync/core";
+import type {
+  DocId,
+  EngineStateStore,
+  IndexSnapshotRecord,
+  Sha256,
+  Stamp,
+  VaultPath,
+} from "@zync/core";
 import { isEnoent, atomicWriteBytes } from "./fs-utils.js";
 
 interface StateFile {
@@ -37,8 +47,21 @@ interface StateFile {
   localSuppress?: string[];
 }
 
+/**
+ * On-disk shape of the index-snapshot sidecar. `IndexSnapshotRecord.snapshot` is a `Uint8Array`
+ * and this store is JSON, so the bytes are base64'd on write and decoded on read. Keep the two
+ * halves symmetric: a silent asymmetry hands the engine a CORRUPT snapshot that still "loads".
+ */
+interface SerializedIndexSnapshot {
+  version: number;
+  identity: string;
+  substrate: string;
+  snapshotB64: string;
+}
+
 export class FsEngineStateStore implements EngineStateStore {
   private readonly filePath: string;
+  private readonly indexSnapshotPath: string;
   private syncedStamps: Map<DocId, Stamp>;
   private dirty: Set<DocId>;
   private lastLive: Map<DocId, VaultPath>;
@@ -60,6 +83,7 @@ export class FsEngineStateStore implements EngineStateStore {
     localSuppressArr: string[],
   ) {
     this.filePath = filePath;
+    this.indexSnapshotPath = path.join(path.dirname(filePath), "index-snapshot.json");
     this.syncedStamps = syncedStamps;
     this.dirty = dirty;
     this.lastLive = lastLive;
@@ -228,6 +252,59 @@ export class FsEngineStateStore implements EngineStateStore {
   async setLocalSuppress(ids: string[]): Promise<void> {
     this.localSuppressArr = [...ids];
     await this.persist();
+  }
+
+  /**
+   * The persisted shared-index snapshot, or null when there is none (or it is unreadable).
+   * Read exactly ONCE per `engine.start()`, so it is loaded straight off disk rather than held
+   * resident for the daemon's whole life.
+   */
+  async getIndexSnapshot(): Promise<IndexSnapshotRecord | null> {
+    let raw: string;
+    try {
+      raw = await fsp.readFile(this.indexSnapshotPath, "utf8");
+    } catch (err) {
+      if (isEnoent(err)) return null;
+      throw err;
+    }
+    const rec = JSON.parse(raw) as SerializedIndexSnapshot;
+    return {
+      version: rec.version,
+      identity: rec.identity,
+      substrate: rec.substrate,
+      snapshot: new Uint8Array(Buffer.from(rec.snapshotB64, "base64")),
+    };
+  }
+
+  /**
+   * ONE atomic rewrite of a SIDECAR file — deliberately NOT a facet of the main state file.
+   *
+   * `persist()` rewrites the entire state JSON on every synced-stamp / dirty-flag write, which
+   * happens once per doc: ~1,660 times over the lifeos fixture alone. A base64'd snapshot is
+   * ~950 KB on a vault that size, so embedding it here would re-serialize and re-fsync roughly a
+   * gigabyte of unchanged bytes per scenario. The sidecar keeps those hot writes small, and the
+   * snapshot's own write is coalesced upstream by the engine's single-flight `persistIndexNow`.
+   *
+   * Atomic (temp + rename + parent-dir fsync), so a SIGKILL mid-write leaves the PREVIOUS snapshot
+   * rather than a torn one. Never split this across two files: the metadata and the bytes must
+   * commit together or an identity/version check would pass against the wrong payload.
+   *
+   * The sidecar name is fixed, so it assumes ONE state store per directory — true by construction
+   * (each device owns its `.obsidian/zync`, each test its own temp dir). If that ever stops
+   * holding, derive the name from the state file's basename rather than sharing a directory.
+   */
+  async setIndexSnapshot(rec: IndexSnapshotRecord): Promise<void> {
+    await fsp.mkdir(path.dirname(this.indexSnapshotPath), { recursive: true });
+    const payload: SerializedIndexSnapshot = {
+      version: rec.version,
+      identity: rec.identity,
+      substrate: rec.substrate,
+      snapshotB64: Buffer.from(rec.snapshot).toString("base64"),
+    };
+    await atomicWriteBytes(
+      this.indexSnapshotPath,
+      new TextEncoder().encode(JSON.stringify(payload)),
+    );
   }
 
   // ---------------------------------------------------------------------------

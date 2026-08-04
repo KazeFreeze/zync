@@ -162,6 +162,13 @@ export async function createDaemon(config: DaemonConfig): Promise<Daemon> {
       configDir: config.engineConfigDir,
       maxProseBytes: config.maxProseBytes,
       ingestDisabled: config.ingestDisabled,
+      // Index persistence. WITHOUT this the engine's `loadPersistedIndex` returns null immediately
+      // and every `setIndexSnapshot?.()` is a silent no-op, so persistence is disabled regardless
+      // of the adapter — which is exactly why the harness could not exercise it at all. The relay
+      // WS URL is the identity, matching the plugin (`this.settings.serverWs`). Binding is
+      // load-bearing: a snapshot is discarded unless the identity matches, which is what stops
+      // re-pointing at a different relay from resurrecting an old vault inside a new one.
+      indexIdentity: config.serverWs,
       // Wire the blob fetch policy end-to-end (0b-3 Fix 3) so a synced blob materializes
       // onto this follower's disk. Only pass it when set so the engine's own default applies.
       ...(config.blobPolicy !== undefined ? { blobPolicy: config.blobPolicy } : {}),

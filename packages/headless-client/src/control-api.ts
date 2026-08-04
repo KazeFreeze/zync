@@ -584,6 +584,10 @@ async function status(deps: ControlApiDeps): Promise<JsonResponse> {
     status: 200,
     body: {
       conn: deps.transport.status(),
+      // Real index state — restored from the local snapshot OR synced from the relay. While the
+      // relay is unreachable only the snapshot can set it, so offline this reads as "hydrated from
+      // disk", which is what the offline-restart scenario asserts.
+      hydrated: deps.isStarted() ? engine.isIndexHydrated() : false,
       pendingDocs: snap?.pending.length ?? 0,
       arriving: snap?.arriving.length ?? 0,
       sending: snap?.sending.length ?? 0,

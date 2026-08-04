@@ -177,3 +177,102 @@ describe("FsEngineStateStore — skip-if-unchanged (no O(n^2) backstop rewrite)"
     }
   });
 });
+
+/**
+ * The index snapshot — the facet whose ABSENCE here is why the harness could not exercise index
+ * persistence at all.
+ *
+ * It lives in its OWN sidecar file, not in the hot state JSON: `persist()` rewrites the whole state
+ * file on every synced-stamp write, and a ~1 MB base64 snapshot embedded there would be re-serialized
+ * and re-fsynced ~1,660 times over the lifeos fixture. Separate file ⇒ hot writes stay small.
+ */
+describe("FsEngineStateStore — index snapshot", () => {
+  it("absent by default", async () => {
+    const { store } = await makeTmpState();
+    expect(await store.getIndexSnapshot()).toBeNull();
+  });
+
+  it("set then get round-trips every field and the exact bytes", async () => {
+    const { store } = await makeTmpState();
+    const snapshot = new Uint8Array([0, 1, 2, 250, 251, 255]);
+    await store.setIndexSnapshot({
+      version: 1,
+      identity: "ws://relay:1234",
+      substrate: "yjs",
+      snapshot,
+    });
+
+    const got = await store.getIndexSnapshot();
+    expect(got).not.toBeNull();
+    expect(got?.version).toBe(1);
+    expect(got?.identity).toBe("ws://relay:1234");
+    expect(got?.substrate).toBe("yjs");
+    expect([...(got?.snapshot ?? [])]).toEqual([...snapshot]);
+  });
+
+  /**
+   * The sidecar is JSON but the snapshot is binary, so it is base64'd on the way in and decoded on
+   * the way out. A silent asymmetry there would hand the engine a CORRUPT snapshot that still
+   * "loads" — exactly the class of failure this coverage exists to prevent. Every byte value 0..255
+   * must survive a real reopen from disk, not just the in-memory copy.
+   */
+  it("all 256 byte values survive a reopen from disk", async () => {
+    const { store, filePath } = await makeTmpState();
+    const snapshot = new Uint8Array(256);
+    for (let i = 0; i < 256; i++) snapshot[i] = i;
+    await store.setIndexSnapshot({ version: 7, identity: "vault-x", substrate: "yjs", snapshot });
+
+    const reopened = await FsEngineStateStore.open(filePath);
+    const got = await reopened.getIndexSnapshot();
+    expect(got?.version).toBe(7);
+    expect(got?.identity).toBe("vault-x");
+    expect(got?.substrate).toBe("yjs");
+    expect([...(got?.snapshot ?? [])]).toEqual([...snapshot]);
+  });
+
+  it("a later save replaces the earlier one", async () => {
+    const { store, filePath } = await makeTmpState();
+    await store.setIndexSnapshot({
+      version: 1,
+      identity: "a",
+      substrate: "yjs",
+      snapshot: new Uint8Array([1]),
+    });
+    await store.setIndexSnapshot({
+      version: 1,
+      identity: "b",
+      substrate: "yjs",
+      snapshot: new Uint8Array([2, 3]),
+    });
+
+    const reopened = await FsEngineStateStore.open(filePath);
+    const got = await reopened.getIndexSnapshot();
+    expect(got?.identity).toBe("b");
+    expect([...(got?.snapshot ?? [])]).toEqual([2, 3]);
+  });
+
+  it("an existing state file with no snapshot sidecar reads as absent", async () => {
+    const { store, filePath } = await makeTmpState();
+    await store.setSyncedStamp(id("d1"), "abc:dev-1");
+
+    const reopened = await FsEngineStateStore.open(filePath);
+    expect(await reopened.getIndexSnapshot()).toBeNull();
+    expect(await reopened.getSyncedStamp(id("d1"))).toBe("abc:dev-1");
+  });
+
+  /** The hot state file must NOT grow with the snapshot — that is the whole point of the sidecar. */
+  it("saving a snapshot does not rewrite the hot state file", async () => {
+    const { store, filePath } = await makeTmpState();
+    await store.setSyncedStamp(id("d1"), "abc:dev-1");
+    const before = await fsp.readFile(filePath, "utf8");
+
+    await store.setIndexSnapshot({
+      version: 1,
+      identity: "a",
+      substrate: "yjs",
+      snapshot: new Uint8Array(4096),
+    });
+
+    expect(await fsp.readFile(filePath, "utf8")).toBe(before);
+  });
+});

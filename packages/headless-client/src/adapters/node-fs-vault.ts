@@ -189,7 +189,18 @@ export class NodeFsVault implements VaultPort {
         await this.walk(absEntry, rootDir, prefix, results);
       } else if (entry.isFile()) {
         if (prefix !== undefined && !rel.startsWith(prefix)) continue;
-        const stat = await fsp.stat(absEntry);
+        // A scan RACES concurrent deletes: the entry existed at readdir, and a delete landing
+        // before its stat (a peer's remote delete materializing mid-scan) removes it underneath
+        // us. Skip it — it is simply not part of this listing — exactly as the readdir above
+        // already tolerates a directory vanishing. Without this, ONE such file threw ENOENT and
+        // aborted the WHOLE listing, surfacing as a `GET /fs/tree` 500.
+        let stat;
+        try {
+          stat = await fsp.stat(absEntry);
+        } catch (err) {
+          if (isEnoent(err)) continue;
+          throw err;
+        }
         results.push({ path: rel, size: stat.size, mtime: stat.mtimeMs });
       }
     }

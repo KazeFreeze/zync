@@ -48,6 +48,9 @@ x-device-healthcheck:
 networks:
   controlnet:
   syncnet:
+  # The BLACKHOLE network — see the `blackhole` service. Devices are never attached to it at
+  # rest; the `blackhole()` lever swaps a device from syncnet onto this one.
+  blackholenet:
 
 # Named volumes for the CRASH-SAFETY scenarios. tmpfs (used by b/c/proj for
 # speed) is re-mounted EMPTY when a container restarts — it lives in the
@@ -73,6 +76,33 @@ volumes:
   server-snapshots:
 
 services:
+  # UNREACHABLE-host stand-in. Accepts TCP on the relay + blob ports and then NEVER writes a
+  # byte, so a request to it hangs instead of failing fast.
+  #
+  # WHY this exists rather than reusing `partition()`: `docker network disconnect` makes the
+  # `server` name stop RESOLVING, so requests fail immediately (ENOTFOUND). That is the
+  # "refused" shape. The v0.9.1 wedge — start() never completing — only reproduces when the
+  # host is genuinely UNREACHABLE, i.e. the request never settles at all, which on Android is
+  # what an unreachable relay does to fetch(). A scenario built on partition() alone would pass
+  # while the real failure mode went untested.
+  #
+  # It claims the `server` ALIAS on its own network, so `blackhole()` (disconnect syncnet +
+  # connect blackholenet) re-points the device's existing `ws://server:1234` /
+  # `http://server:8080` config at a silent host with no container recreation and no env change.
+  blackhole:
+    image: node:22-slim
+    command:
+      - node
+      - -e
+      - |
+        const net = require('net');
+        // Accept and hold. No response, no FIN, no RST — the connection just hangs open.
+        for (const port of [1234, 8080]) net.createServer(() => {}).listen(port);
+        setInterval(() => {}, 1 << 30);
+    networks:
+      blackholenet:
+        aliases: [server]
+
   minio:
     image: minio/minio
     command: server /data --console-address ":9001"
