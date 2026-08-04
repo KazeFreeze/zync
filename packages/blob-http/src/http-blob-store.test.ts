@@ -330,3 +330,30 @@ describe("HttpBlobStore — error taxonomy mapping", () => {
     await expect(store.has(SHA)).rejects.toBeInstanceOf(BlobTransientError);
   });
 });
+
+describe("unbounded-fetch guard (offline start() wedge)", () => {
+  it("rejects with BlobTransientError when fetch never settles, instead of hanging forever", async () => {
+    // THE BUG THIS PINS: on a device with no route to the relay, `fetch` does not reject — it
+    // hangs. bootstrap() awaits onLocalBlobWrite -> blobStore.has() for EVERY on-disk blob, so a
+    // single hung fetch wedges bootstrap, which wedges start(), which leaves engineReady false
+    // forever. Measured on a real tablet: start() never completed in 5.5+ minutes offline.
+    const original = globalThis.fetch;
+    // Faithful stub: a real `fetch` to an unreachable host never settles on its own, but DOES
+    // reject when its AbortSignal fires. A stub that ignores the signal would be untestable by
+    // construction and would not model the platform.
+    globalThis.fetch = ((_url: unknown, init?: { signal?: AbortSignal }) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          reject(new DOMException("The operation was aborted.", "AbortError"));
+        });
+      })) as unknown as typeof fetch;
+    try {
+      const store = new HttpBlobStore("http://192.0.2.1:9", "t", { timeoutMs: 150 });
+      await expect(store.has("a".repeat(64) as unknown as Sha256)).rejects.toBeInstanceOf(
+        BlobTransientError,
+      );
+    } finally {
+      globalThis.fetch = original;
+    }
+  }, 5000);
+});

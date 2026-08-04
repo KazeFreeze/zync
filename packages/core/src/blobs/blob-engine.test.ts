@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import type { DeviceId, IdentityPort, Sha256, VaultPath } from "../ports.js";
 import { sha256OfBytes } from "../hash.js";
 import { EchoLedger } from "../bridge/echo.js";
-import { CorruptBlobError } from "../errors.js";
+import { BlobTransientError, CorruptBlobError } from "../errors.js";
 import { FakeVault } from "../testing/fake-vault.js";
 import { FakeBlobStore } from "../testing/fake-blob-store.js";
 import { FakeCrdtMap } from "../testing/fake-crdt-map.js";
@@ -74,6 +74,40 @@ describe("BlobEngine.onLocalBlobWrite (content-address → manifest + store)", (
     expect(entry).toEqual({ sha256: sha, size: PNG.length, deviceId: DEV_A });
     expect(await h.blobStore.has(sha)).toBe(true);
     expect(await h.blobStore.get(sha)).toEqual(PNG);
+  });
+
+  it("does NOT throw when the blob store is unreachable, and still publishes the manifest entry", async () => {
+    // THE BUG THIS PINS: bootstrap() awaits onLocalBlobWrite for EVERY on-disk blob. With an
+    // unreachable relay the store call fails, and if that propagates it takes bootstrap -> start()
+    // down with it, leaving engineReady false forever and the UI stuck on "Loading". The manifest
+    // set is pure local CRDT and is safe offline, so it must still happen; the byte upload is
+    // best-effort and heals on a later start or via the fetch queue's retry tick.
+    const h = makeEngine("eager");
+    const sha = await sha256OfBytes(PNG);
+    h.blobStore.has = () =>
+      Promise.reject(new BlobTransientError({ sha, cause: "HEAD network: unreachable" }));
+    h.blobStore.put = () =>
+      Promise.reject(new BlobTransientError({ sha, cause: "PUT network: unreachable" }));
+
+    await expect(h.engine.onLocalBlobWrite(path("img.png"), PNG)).resolves.toBeUndefined();
+    expect(h.manifest.get("img.png")).toEqual({ sha256: sha, size: PNG.length, deviceId: DEV_A });
+  });
+
+  it("stops retrying the unreachable store for the rest of the pass (one timeout, not N)", async () => {
+    // 320 blobs x a 15s timeout is 80 minutes of wedge. After the first transient failure the
+    // pass must stop calling the store, while still publishing every manifest entry.
+    const h = makeEngine("eager");
+    let calls = 0;
+    const sha = await sha256OfBytes(PNG);
+    h.blobStore.has = () => {
+      calls += 1;
+      return Promise.reject(new BlobTransientError({ sha, cause: "HEAD network: unreachable" }));
+    };
+    for (let i = 0; i < 25; i++) {
+      await h.engine.onLocalBlobWrite(path(`img-${String(i)}.png`), PNG);
+    }
+    expect(calls).toBe(1);
+    expect(h.manifest.get("img-24.png")).toBeDefined();
   });
 
   it("keep-old-versions: a new write under a new sha does NOT delete the old blob", async () => {

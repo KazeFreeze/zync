@@ -79,6 +79,9 @@ export interface BlobEngineDeps {
  * garbage collection in 0b-2; reclaiming unreferenced shas is a later concern.
  */
 export class BlobEngine {
+  /** Set when the blob store proved unreachable this pass; re-armed by {@link resetLocalAdvertise}. */
+  #localAdvertiseBlocked = false;
+
   readonly #deps: BlobEngineDeps;
   readonly #queue: BlobFetchQueue;
 
@@ -104,8 +107,24 @@ export class BlobEngine {
   async onLocalBlobWrite(path: VaultPath, bytes: Uint8Array): Promise<void> {
     const d = this.#deps;
     const sha = await sha256OfBytes(bytes);
-    if (!(await d.blobStore.has(sha))) {
-      await d.blobStore.put(sha, bytes);
+    // OFFLINE-SAFE: uploading the bytes is BEST-EFFORT; publishing the manifest entry is not.
+    // bootstrap() awaits this for EVERY on-disk blob, so letting a store failure propagate takes
+    // bootstrap -> start() down with it and leaves `engineReady` false forever — the UI then sits
+    // on "Loading" with no way out, and every restart repeats it. The manifest set below is pure
+    // local CRDT and is correct offline, so it must still happen. A missing upload heals on a
+    // later start or via the fetch queue's retry tick.
+    //
+    // The latch matters as much as the catch: a large vault has hundreds of blobs, and retrying an
+    // unreachable store once per blob turns a bounded timeout into an unbounded stall. One attempt
+    // per pass; `resetLocalAdvertise()` re-arms it at the start of each bootstrap.
+    if (!this.#localAdvertiseBlocked) {
+      try {
+        if (!(await d.blobStore.has(sha))) {
+          await d.blobStore.put(sha, bytes);
+        }
+      } catch {
+        this.#localAdvertiseBlocked = true;
+      }
     }
     // IDEMPOTENCY: skip the manifest write when this path already advertises this exact sha.
     // `YjsCrdtMap.set` wraps every set in a RELAYED "local-bridge" transaction, and `Y.Map.set`
@@ -120,6 +139,12 @@ export class BlobEngine {
       size: bytes.length,
       deviceId: d.identity.deviceId(),
     });
+  }
+
+  /** Re-arm local blob advertisement. Called once per bootstrap so an unreachable store costs ONE
+   *  bounded attempt per pass rather than one per blob, and recovers on a later online start. */
+  resetLocalAdvertise(): void {
+    this.#localAdvertiseBlocked = false;
   }
 
   /**

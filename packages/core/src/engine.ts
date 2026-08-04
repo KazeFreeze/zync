@@ -4587,6 +4587,8 @@ export class SyncEngine {
   }
 
   private async bootstrap(): Promise<void> {
+    // One bounded blob-store attempt per bootstrap, not one per blob (see resetLocalAdvertise).
+    this.blobEngine.resetLocalAdvertise();
     this.durableBindings = null; // re-derive per bootstrap (durable state may have changed)
     const deviceId = this.ports.identity.deviceId();
     // M1a: offline rename re-key happens INLINE; the unmatched-lost set is DEFERRED past the seed loop

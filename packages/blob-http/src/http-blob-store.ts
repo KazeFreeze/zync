@@ -27,6 +27,10 @@ import {
 } from "@zync/core";
 import type { BlobStorePort, Sha256 } from "@zync/core";
 
+/** Per-request ceiling. Generous enough for a large PUT on a slow link, small enough that an
+ *  unreachable host cannot stall bootstrap. */
+export const DEFAULT_BLOB_TIMEOUT_MS = 15_000;
+
 export class HttpBlobStore implements BlobStorePort {
   private readonly baseUrl: string;
   /** Pre-built auth headers (empty when no token configured). Spread into each request. */
@@ -36,10 +40,13 @@ export class HttpBlobStore implements BlobStorePort {
    * @param baseUrl e.g. "http://localhost:3000" — no trailing slash
    * @param token   optional static auth token; when set, sent as `Bearer` on every verb
    */
-  constructor(baseUrl: string, token?: string) {
+  private readonly timeoutMs: number;
+
+  constructor(baseUrl: string, token?: string, opts?: { timeoutMs?: number }) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
     this.authHeaders =
       token !== undefined && token !== "" ? { Authorization: `Bearer ${token}` } : {};
+    this.timeoutMs = opts?.timeoutMs ?? DEFAULT_BLOB_TIMEOUT_MS;
   }
 
   /** Map a non-ok HTTP status to the blob error taxonomy (drives the fetch queue's retry-vs-park). */
@@ -62,8 +69,14 @@ export class HttpBlobStore implements BlobStorePort {
     url: string,
     init?: RequestInit,
   ): Promise<Response> {
+    // BOUNDED: an unreachable host does NOT reject `fetch` on every platform — on Android it
+    // simply never settles. bootstrap() awaits a blob op per on-disk blob, so one hung fetch
+    // wedges bootstrap, which wedges start(), which leaves `engineReady` false forever and every
+    // gated surface stuck on "Loading". Measured on a real tablet: start() never completed in
+    // 5.5+ minutes offline. A timeout turns "hangs forever" into an ordinary transient error the
+    // retry/park machinery already understands.
     try {
-      return await fetch(url, init);
+      return await fetch(url, { ...init, signal: AbortSignal.timeout(this.timeoutMs) });
     } catch (cause) {
       throw new BlobTransientError({ sha, cause: `${verb} network: ${String(cause)}` });
     }
