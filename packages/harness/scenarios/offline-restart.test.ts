@@ -92,10 +92,13 @@ test("an offline restart hydrates the index from its local snapshot", async () =
 
   // ── close the app, lose the network, reopen ───────────────────────────────────────────────
   // Stop the ENGINE first: `stop()` clears the persist timers and AWAITS a final save, so the
-  // snapshot on disk is deterministic. Without it this raced the 2s debounce / 20s max-wait and
-  // the SIGKILL landed mid-window, leaving a 2-byte (empty) snapshot on disk — the crash-during-
-  // first-sync durability gap, which is its OWN scenario (see the deferred list) and must not be
-  // conflated with the offline-restart property under test here.
+  // snapshot on disk is deterministic.
+  //
+  // The empty-snapshot crash window this originally hit is FIXED (the first update of a session is
+  // now saved on the leading edge) and pinned by a unit test. But LATER updates are still trailing-
+  // debounced, so a SIGKILL landing within ~2s of the delete below could persist a snapshot that
+  // predates the tombstone. Keep the graceful stop: this scenario is about offline restart, and it
+  // should not fail for a timing reason it does not mean to test.
   await a.stop();
   // ...then kill the PROCESS anyway, so nothing still in RAM can carry the index across.
   await crash("device-a");

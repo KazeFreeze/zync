@@ -5,6 +5,7 @@ import {
   type EngineConfig,
   type DeviceId,
   type DocId,
+  INDEX_DOC_ID,
   type IdentityPort,
   type VaultPath,
 } from "@zync/core";
@@ -757,5 +758,48 @@ describe("SyncEngine.isIndexReadable", () => {
     open.length = 0;
 
     expect(a.engine.isIndexReadable()).toBe(false);
+  });
+});
+
+/**
+ * CRASH WINDOW: the durable index snapshot must never be EMPTY once the index has content.
+ *
+ * Index persistence is a 2s trailing debounce with a 20s max-wait. During a busy first sync every
+ * update resets the debounce, so the only save that had landed was the `synced()` punctuation save
+ * — fired at t≈0, when the index was still empty. A hard kill before the max-wait elapsed left that
+ * EMPTY snapshot as the durable state, and the device came back blind on the next start. Phone OSes
+ * kill backgrounded apps routinely, so this is a real path, not a theoretical one.
+ *
+ * A STALE snapshot is safe by design; an EMPTY one is not. The first content-bearing update is
+ * therefore persisted on the LEADING edge, before any debouncing.
+ */
+describe("SyncEngine index-persist crash window", () => {
+  const NOTE3 = p("notes/crash-window.md");
+
+  it("persists the first content-bearing update immediately, not after the debounce", async () => {
+    const durA = newDurable(true);
+    const a = makeEngine(new InProcessBus(), durA, "device-a", "relay-R");
+    open.push(a.engine);
+    // Start on an EMPTY vault, so the synced() punctuation save writes an empty snapshot — exactly
+    // the state the real device was in. The content then arrives LIVE, after start(), which is what
+    // leaves it governed purely by the debounce.
+    await a.engine.start();
+
+    await durA.vault.writeAtomic(NOTE3, utf8(CONTENT));
+    await a.engine.waitConverged();
+    // Let the leading-edge write land, WITHOUT approaching the 2s debounce.
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Deliberately NO stop(): stop() awaits persistIndexFinal, which would mask the bug entirely.
+    const rec = await durA.engineState.getIndexSnapshot();
+    expect(rec).not.toBeNull();
+    if (rec === null) return;
+
+    const doc = new YjsCrdtProvider().loadDoc(INDEX_DOC_ID, rec.snapshot);
+    const paths = doc
+      .getMap<{ docId: string }>("tree")
+      .entries()
+      .map(([k]) => k);
+    expect(paths).toContain(NOTE3);
   });
 });

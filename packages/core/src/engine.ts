@@ -692,6 +692,11 @@ export class SyncEngine {
    * after {@link stop} has destroyed them. See {@link isIndexReadable}.
    */
   private indexSurfaceReady = false;
+  /**
+   * Whether this session has already taken the leading-edge index save. Reset on every
+   * {@link start} — see {@link scheduleIndexPersist} for why the first update is not debounced.
+   */
+  private indexPersistLeadingDone = false;
   /** Index-persist bookkeeping — see {@link scheduleIndexPersist}. */
   private indexPersistTimer: ReturnType<typeof setTimeout> | null = null;
   private indexPersistMaxTimer: ReturnType<typeof setTimeout> | null = null;
@@ -816,6 +821,9 @@ export class SyncEngine {
     // {@link isIndexSynced} instead.
     // Persist on EVERY update regardless of origin: remote state must survive a restart too, or the
     // next start is blind again — which is the whole bug this fixes.
+    // Re-arm the leading-edge save for THIS session: a stop()/start() cycle faces the same crash
+    // window as a cold boot, and the flag is instance state.
+    this.indexPersistLeadingDone = false;
     this.indexPersistUnsub = indexDoc.onUpdate(() => {
       this.scheduleIndexPersist();
     });
@@ -3595,9 +3603,27 @@ export class SyncEngine {
    * Debounced index persist. Subscribed to updates of EVERY origin: REMOTE state must survive a
    * restart too (an index that only kept local edits would still start blind). Trailing debounce
    * with a max-wait so a long first-sync storm still checkpoints instead of deferring forever.
+   *
+   * The FIRST update of a session bypasses the debounce entirely — see below.
    */
   private scheduleIndexPersist(): void {
     if (this.config.indexIdentity === undefined) return;
+
+    // LEADING EDGE, once per session. A pure trailing debounce left a real crash window: on a
+    // first-ever start the `synced()` punctuation save writes an EMPTY snapshot at t≈0, and a busy
+    // first sync then resets the 2s debounce on every update, so nothing else lands until the 20s
+    // max-wait. A hard kill inside that window — routine on mobile, where the OS reaps backgrounded
+    // apps — left the EMPTY snapshot as the durable state and the device came back blind.
+    //
+    // A STALE snapshot is safe by design (indistinguishable from "changes happened while closed",
+    // which the structural pre-pass handles). An EMPTY one is not. Saving the first update
+    // immediately costs one extra write per session and makes "durable state is empty while the
+    // index has content" unreachable.
+    if (!this.indexPersistLeadingDone) {
+      this.indexPersistLeadingDone = true;
+      this.persistIndexNow();
+      return;
+    }
     if (this.indexPersistTimer !== null) clearTimeout(this.indexPersistTimer);
     this.indexPersistMaxTimer ??= setTimeout(() => {
       this.indexPersistMaxTimer = null;
