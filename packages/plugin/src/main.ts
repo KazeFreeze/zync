@@ -37,6 +37,7 @@ import { ConnectionAlert, type AlertCommand } from "./connection-alert.js";
 import { notify, updateNotice, notifyInfo, notifyWarning, notifyError } from "./notify.js";
 import { explainNotifyProps, type NotifyAction, type NotifyOptions } from "./notify-model.js";
 import { arrivingSegment, arrivingNotice, type ArrivingInputs } from "./arriving-view.js";
+import { syncedPluginsGate } from "./synced-plugins-gate.js";
 
 /**
  * Zync plugin — M1 desktop walking skeleton (M1-T5 wiring).
@@ -94,6 +95,9 @@ const MAX_PROSE_BYTES = 1_000_000;
  * push-style via transport.onStatus and are unaffected by this constant.
  */
 const STATUS_POLL_INTERVAL_MS = 8_000;
+
+/** How often the settings tab re-checks whether the engine has caught up. See armReadinessRefresh. */
+const READINESS_POLL_MS = 400;
 
 /** The DISPLAY counts, straight from engine.syncSnapshot(). Never derived by subtraction in the
  *  plugin: a subtraction double-counted the stuck/arriving overlap in design review. These four
@@ -1150,18 +1154,41 @@ export default class ZyncPlugin extends Plugin {
    * rendering it is correct even before the relay answers.
    */
   isIndexHydrated(): boolean {
-    if (!this.engineReady || this.engine === null) return false;
-    return this.engine.isIndexHydrated();
+    return this.indexReadable;
+  }
+
+  /**
+   * Safe to READ index-backed state, and what it holds is genuine.
+   *
+   * DELIBERATELY NOT gated on `engineReady`. That flag means "start() fully resolved" — the index
+   * handshake budget, then config bootstrap, then a walk over every note and blob — which on a real
+   * vault is tens of seconds. The index itself hydrates from the local snapshot in the third
+   * statement of start(), so gating reads on engineReady hid settings that were already in hand and
+   * rendered "Loading plugin sync settings" for the entire startup. Reading early is safe because
+   * `isIndexReadable()` is false until the maps are actually constructed.
+   */
+  private get indexReadable(): boolean {
+    return this.engine?.isIndexReadable() ?? false;
   }
 
   isIndexSynced(): boolean {
-    if (!this.engineReady || this.engine === null) return false;
+    if (this.engine === null) return false;
     return this.engine.isIndexSynced();
   }
 
-  /** Returns all plugins with a shared opt-in entry. Empty when engine is not yet started. */
+  /** `engine.start()` has fully resolved, so the engine accepts WRITES. Not a read gate. */
+  isEngineReady(): boolean {
+    return this.engineReady && this.engine !== null;
+  }
+
+  /** The transport reports a live connection. */
+  isConnected(): boolean {
+    return this.connText === "connected";
+  }
+
+  /** Returns all plugins with a shared opt-in entry. Empty until the index is readable. */
   listPluginOptIn(): { id: string; optIn: boolean; isDesktopOnly: boolean }[] {
-    if (!this.engineReady || this.engine === null) return [];
+    if (!this.indexReadable || this.engine === null) return [];
     return this.engine.listPluginOptIn();
   }
 
@@ -1181,9 +1208,9 @@ export default class ZyncPlugin extends Plugin {
 
   // ── Task 9: suppress control + enabled indicator delegates ───────────────
 
-  /** Plugin ids suppressed on this device. Empty when engine is not yet started. */
+  /** Plugin ids suppressed on this device. Empty until the index is readable. */
   listPluginSuppress(): string[] {
-    if (!this.engineReady || this.engine === null) return [];
+    if (!this.indexReadable || this.engine === null) return [];
     return this.engine.listPluginSuppress();
   }
 
@@ -1194,9 +1221,9 @@ export default class ZyncPlugin extends Plugin {
     }
   }
 
-  /** All plugins with a shared enabled entry (shared CRDT state). Empty when not yet started. */
+  /** All plugins with a shared enabled entry (shared CRDT state). Empty until index is readable. */
   listPluginEnabled(): { id: string; enabled: boolean }[] {
-    if (!this.engineReady || this.engine === null) return [];
+    if (!this.indexReadable || this.engine === null) return [];
     return this.engine.listPluginEnabled();
   }
 
@@ -1262,6 +1289,8 @@ class ZyncSettingTab extends PluginSettingTab {
    * display() for the same reason as the expanded set: we re-render on every change.
    */
   private readonly inFlightOptIn = new Set<string>();
+  /** Pending re-render while the engine catches up. See {@link armReadinessRefresh}. */
+  private readinessTimer: number | null = null;
 
   constructor(app: App, plugin: ZyncPlugin) {
     super(app, plugin);
@@ -1271,6 +1300,12 @@ class ZyncSettingTab extends PluginSettingTab {
   override display(): void {
     const { containerEl } = this;
     containerEl.empty();
+    // Drop any pending readiness poll: this render re-decides whether one is still needed, so a
+    // stale timer would fire a redundant re-render after the section had already gone live.
+    if (this.readinessTimer !== null) {
+      window.clearTimeout(this.readinessTimer);
+      this.readinessTimer = null;
+    }
 
     if (
       this.plugin.startedSyncConfig !== null &&
@@ -1430,25 +1465,40 @@ class ZyncSettingTab extends PluginSettingTab {
       );
     }
 
-    // NOT-YET-SYNCED GATE: until the shared index completes its first handshake, every index-backed
-    // map is still EMPTY — which reads exactly like "no plugin is opted in", so the rows would all
-    // render OFF and invite the user to "fix" state that is merely in transit. Worse, a toggle
-    // written into the not-yet-populated doc can then LOSE the merge against the arriving relay
-    // state, so the change appears to revert. Show the real situation and accept no writes yet.
-    if (!disabled && !this.plugin.isIndexHydrated()) {
-      const waiting = new Setting(containerEl)
-        .setName("Loading plugin sync settings")
-        .setDesc(
-          "Waiting for your synced settings to load. Your current choices will appear here.",
-        );
+    // READINESS GATE: an index-backed map that is not yet populated reads exactly like "no plugin
+    // is opted in", so the rows would render OFF and invite the user to "fix" state that is merely
+    // in transit — and a toggle written into the empty doc can then LOSE the merge against the
+    // arriving relay state, so the change appears to revert.
+    //
+    // But "populated" and "engine fully started" are DIFFERENT questions, and answering both with
+    // engineReady is what made a hydrated index sit on "Loading…" for the whole of start(). The
+    // pure gate splits them: show as soon as the index is readable, accept writes once start()
+    // finishes. See synced-plugins-gate.ts.
+    const gate = syncedPluginsGate({
+      indexReadable: this.plugin.isIndexHydrated(),
+      engineReady: this.plugin.isEngineReady(),
+      connected: this.plugin.isConnected(),
+    });
+
+    if (!disabled && gate.kind === "waiting") {
+      const waiting = new Setting(containerEl).setName(gate.title).setDesc(gate.desc);
       waiting.settingEl.addClass("zync-section-notice");
       waiting.addButton((b) =>
         b.setButtonText("Check again").onClick(() => {
           this.display();
         }),
       );
+      this.armReadinessRefresh();
       return;
     }
+
+    // Readable but still starting: the real state is shown, writes are refused until start() lands.
+    const writable = gate.kind === "rows" ? gate.writable : false;
+    if (!disabled && gate.kind === "rows" && gate.notice !== null) {
+      const starting = new Setting(containerEl).setName("Starting up").setDesc(gate.notice);
+      starting.settingEl.addClass("zync-section-notice");
+    }
+    if (!disabled && !writable) this.armReadinessRefresh();
 
     const optedIn = new Set(
       this.plugin
@@ -1459,11 +1509,41 @@ class ZyncSettingTab extends PluginSettingTab {
     const suppressed = new Set(this.plugin.listPluginSuppress());
     const settingsOff = new Set(this.plugin.listPluginSettingsSyncOff());
 
+    // `inert` folds the two read-only reasons into the one the row already understands: the master
+    // toggle being off, and start() not having finished yet. Both mean "show the truth, take no
+    // input" — so the rows are visible and honest either way, which is the entire point.
+    const inert = disabled || !writable;
     const list = containerEl.createDiv({ cls: "zync-plugin-list" });
-    if (disabled) list.addClass("zync-disabled");
+    if (inert) list.addClass("zync-disabled");
     for (const p of installedCommunityPlugins(this.app)) {
-      this.renderPluginRow(list, p, optedIn, suppressed, settingsOff, disabled);
+      this.renderPluginRow(list, p, optedIn, suppressed, settingsOff, inert);
     }
+  }
+
+  /**
+   * Re-render once the engine catches up. Without this the section is not merely slow, it is STUCK:
+   * display() only ever runs from user interaction, so the "Loading…" row stayed on screen
+   * indefinitely after the engine was ready — until you pressed "Check again" or reopened Settings.
+   * That, more than the wait itself, is what made it look like it never finished.
+   *
+   * A poll rather than an engine event: the index becoming readable is not a change to any observed
+   * map (the snapshot is applied to a fresh doc BEFORE observers are wired, deliberately), so there
+   * is nothing to subscribe to. The check is two booleans, and {@link hide} disarms it.
+   */
+  private armReadinessRefresh(): void {
+    if (this.readinessTimer !== null) return;
+    this.readinessTimer = window.setTimeout(() => {
+      this.readinessTimer = null;
+      this.display();
+    }, READINESS_POLL_MS);
+  }
+
+  override hide(): void {
+    if (this.readinessTimer !== null) {
+      window.clearTimeout(this.readinessTimer);
+      this.readinessTimer = null;
+    }
+    super.hide();
   }
 
   /** One plugin's row: a single Sync toggle + chevron-expand of its overrides. */

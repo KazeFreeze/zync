@@ -704,3 +704,58 @@ describe("M1b — materializedHash observed at bootstrap", () => {
     expect(await durA.docStore.load(loser)).not.toBeNull();
   });
 });
+
+/**
+ * `isIndexReadable()` — "the index-backed maps EXIST and hold real state".
+ *
+ * Distinct from `isIndexHydrated()`, which is a pure latch: it flips inside `loadPersistedIndex`,
+ * a microtask BEFORE `this.index`/`this.inbox` are assigned, and it stays true after `stop()` has
+ * destroyed them. Anything that reads the maps must gate on readability, or it can touch an
+ * undefined (or torn-down) index.
+ */
+describe("SyncEngine.isIndexReadable", () => {
+  const NOTE2 = p("notes/readable.md");
+
+  it("is false before start(), when the index maps do not exist yet", () => {
+    const a = makeEngine(new InProcessBus(), newDurable(true), "device-a", "relay-R");
+    expect(a.engine.isIndexReadable()).toBe(false);
+  });
+
+  it("is true after an offline restart that hydrated from the local snapshot", async () => {
+    const durA = newDurable(true);
+    await durA.vault.writeAtomic(NOTE2, utf8(CONTENT));
+
+    const a = makeEngine(new InProcessBus(), durA, "device-a", "relay-R");
+    open.push(a.engine);
+    await a.engine.start();
+    await a.engine.waitConverged();
+    await a.engine.stop();
+    open.length = 0;
+
+    const a2 = makeEngine(new InProcessBus(), durA, "device-a", "relay-R");
+    open.push(a2.engine);
+    await a2.engine.start();
+
+    expect(a2.engine.isIndexReadable()).toBe(true);
+    // And the maps really are readable, not just flagged as such.
+    expect(a2.engine.index.get(NOTE2)?.docId).toBeDefined();
+  });
+
+  /**
+   * stop() destroys the index doc. The hydrated LATCH stays true across that, so a surface gating
+   * on it alone would keep reading a torn-down index during teardown.
+   */
+  it("goes false again after stop(), even though the hydrated latch stays true", async () => {
+    const durA = newDurable(true);
+    const a = makeEngine(new InProcessBus(), durA, "device-a", "relay-R");
+    open.push(a.engine);
+    await a.engine.start();
+    await a.engine.waitConverged();
+    expect(a.engine.isIndexReadable()).toBe(true);
+
+    await a.engine.stop();
+    open.length = 0;
+
+    expect(a.engine.isIndexReadable()).toBe(false);
+  });
+});

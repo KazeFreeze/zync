@@ -685,6 +685,13 @@ export class SyncEngine {
   private indexSyncedOnce = false;
   /** True when this session started from a locally persisted index snapshot. */
   private indexHydratedFromSnapshot = false;
+  /**
+   * True while the index-backed surface (`index`, `inbox`, the plugin maps) is CONSTRUCTED and
+   * safe to read. Deliberately separate from the hydrated latch: that latch flips inside
+   * {@link loadPersistedIndex}, a microtask BEFORE these fields are assigned, and it stays true
+   * after {@link stop} has destroyed them. See {@link isIndexReadable}.
+   */
+  private indexSurfaceReady = false;
   /** Index-persist bookkeeping — see {@link scheduleIndexPersist}. */
   private indexPersistTimer: ReturnType<typeof setTimeout> | null = null;
   private indexPersistMaxTimer: ReturnType<typeof setTimeout> | null = null;
@@ -789,6 +796,10 @@ export class SyncEngine {
     this.indexDoc = indexDoc;
     this.index = new IndexDoc(indexDoc.getMap("tree"), deviceId);
     this.inbox = new Inbox(indexDoc.getMap("inbox"));
+    // The maps now EXIST — from here on reading them is safe. Set after the assignments above,
+    // never before: the hydrated latch is already true at this point (loadPersistedIndex sets it
+    // and then awaits back to here), so a UI gating on that alone could read an undefined index.
+    this.indexSurfaceReady = true;
     this.indexAttached = transport.attach(indexDoc);
     // Await the FIRST index sync when the transport is reachable ("connected" or
     // "connecting" — the production socket is still handshaking when status is
@@ -1313,6 +1324,10 @@ export class SyncEngine {
     this.indexAttached = null;
     this.indexDoc?.destroy();
     this.indexDoc = null;
+    // The maps are destroyed — reading them is no longer safe. The hydrated latch deliberately
+    // stays true (it records what this SESSION started from), so this flag is the one that must
+    // fall for any reader gating on readability.
+    this.indexSurfaceReady = false;
 
     // The transport is shared/owned by the caller; we detach our docs but do NOT
     // close it here (multiple engines/tests share one bus).
@@ -1696,6 +1711,22 @@ export class SyncEngine {
 
   isIndexSynced(): boolean {
     return this.indexSyncedOnce;
+  }
+
+  /**
+   * True once the index-backed maps EXIST and hold real state — i.e. it is safe to READ them and
+   * what you read is genuine, not an empty placeholder.
+   *
+   * This is what a UI should gate rendering on. {@link isIndexHydrated} alone is not enough: it is
+   * a latch that flips inside `loadPersistedIndex` (a microtask before the maps are assigned) and
+   * stays true after {@link stop} has destroyed them.
+   *
+   * It says nothing about whether the engine will accept WRITES — `start()` may still be running.
+   * Those are separate questions, and conflating them is what made a fully hydrated index render as
+   * "still loading" for the whole of start().
+   */
+  isIndexReadable(): boolean {
+    return this.indexSurfaceReady && this.isIndexHydrated();
   }
 
   listPluginOptIn(): { id: string; optIn: boolean; isDesktopOnly: boolean }[] {

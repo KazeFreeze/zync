@@ -587,7 +587,11 @@ async function status(deps: ControlApiDeps): Promise<JsonResponse> {
       // Real index state — restored from the local snapshot OR synced from the relay. While the
       // relay is unreachable only the snapshot can set it, so offline this reads as "hydrated from
       // disk", which is what the offline-restart scenario asserts.
-      hydrated: deps.isStarted() ? engine.isIndexHydrated() : false,
+      //
+      // isIndexReadable (not isIndexHydrated) so the harness gates the SAME predicate the plugin UI
+      // renders on: it additionally proves the index-backed maps exist, and it falls back to false
+      // on teardown. Equivalent here, since /status only reads it once started.
+      hydrated: deps.isStarted() ? engine.isIndexReadable() : false,
       pendingDocs: snap?.pending.length ?? 0,
       arriving: snap?.arriving.length ?? 0,
       sending: snap?.sending.length ?? 0,
