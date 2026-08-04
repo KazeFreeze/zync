@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.3](https://github.com/KazeFreeze/zync/compare/zync-v0.9.2...zync-v0.9.3) (2026-08-04)
+
+
+### Bug Fixes
+
+* **core:** persist the first index update immediately, closing a crash window ([033ca00](https://github.com/KazeFreeze/zync/commit/033ca000eb916a10546d59ebc79ecad09edc729c))
+
 ## [0.9.2](https://github.com/KazeFreeze/zync/compare/zync-v0.9.1...zync-v0.9.2) (2026-08-04)
 
 
