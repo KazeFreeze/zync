@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.5](https://github.com/KazeFreeze/zync/compare/zync-v0.9.4...zync-v0.9.5) (2026-08-05)
+
+
+### Performance Improvements
+
+* **config:** stop re-reading unchanged config files at startup and every 30s ([5533116](https://github.com/KazeFreeze/zync/commit/5533116bcd59498f2844906e6c873b82ae02f2f5))
+
 ## [0.9.4](https://github.com/KazeFreeze/zync/compare/zync-v0.9.3...zync-v0.9.4) (2026-08-05)
 
 
