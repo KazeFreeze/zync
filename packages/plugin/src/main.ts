@@ -38,6 +38,7 @@ import { notify, updateNotice, notifyInfo, notifyWarning, notifyError } from "./
 import { explainNotifyProps, type NotifyAction, type NotifyOptions } from "./notify-model.js";
 import { arrivingSegment, arrivingNotice, type ArrivingInputs } from "./arriving-view.js";
 import { syncedPluginsGate } from "./synced-plugins-gate.js";
+import { catchupNotice } from "./catchup-notice.js";
 
 /**
  * Zync plugin — M1 desktop walking skeleton (M1-T5 wiring).
@@ -173,6 +174,10 @@ export default class ZyncPlugin extends Plugin {
   private readonly readinessListeners = new Set<() => void>();
   /** Re-entrancy guard for {@link notifyReadiness}. */
   private notifyingReadiness = false;
+  /** Mobile "catching up" sticky. SEPARATE from stickyNotice, which ConnectionAlert owns. */
+  private catchupSticky: Notice | null = null;
+  /** When this device became connected-but-unsynced; null when it is neither. */
+  private catchupSince: number | null = null;
   private lastConflictCount = 0;
   /** True only AFTER engine.start() completes. Gates status-bar reads of blobProgress()/inbox —
    *  both are undefined until start() finishes, and onStatus can drive renderStatus mid-start. */
@@ -551,6 +556,11 @@ export default class ZyncPlugin extends Plugin {
     }
     this.stickyNotice?.hide();
     this.stickyNotice = null;
+    // Same teardown as the offline sticky: a notice that outlives the engine describing it is
+    // stale by construction, and on unload there is nothing left to clear it.
+    this.catchupSticky?.hide();
+    this.catchupSticky = null;
+    this.catchupSince = null;
     this.alert = null;
     if (this.statusTimer !== null) {
       window.clearInterval(this.statusTimer);
@@ -640,6 +650,7 @@ export default class ZyncPlugin extends Plugin {
     // every call — including the push-driven onStatus calls — so a connection change is reflected
     // at once, even while an expensive scan below is in-flight (or skipped).
     this.renderStatus(this.lastCounts);
+    this.refreshCatchupNotice();
     // Skip the EXPENSIVE O(n) syncSnapshot() scan if a previous one is still running — prevents
     // unbounded pileup during a large first-sync where a single scan can exceed the poll interval.
     if (this.statusRefreshInFlight) return;
@@ -878,6 +889,58 @@ export default class ZyncPlugin extends Plugin {
   }
 
   /** Execute a ConnectionAlert command as Obsidian Notices/timers (mobile only). */
+  /**
+   * Mobile only: warn when the socket is back but the shared index has NOT arrived yet.
+   *
+   * Android freezes a backgrounded app, so a phone genuinely cannot stay synced while away — that
+   * part is unfixable from a plugin. What IS fixable is the window after resume where you can edit
+   * against state this device never received, which is where the conflicts come from. This makes
+   * the window visible and deliberately does NOT block the edit.
+   *
+   * Evaluated from refreshStatus, so it is driven by both the transport's status pushes and the
+   * status poll. A consequence worth knowing: with the poll at 8s and the grace at 3s, a catch-up
+   * that finishes quickly is never announced at all — which is the intent, since the measured
+   * healthy case is ~2.5s and a notice that routinely self-resolves is one you learn to ignore.
+   */
+  private refreshCatchupNotice(): void {
+    if (!Platform.isMobile) return;
+
+    const connected = this.connText === "connected";
+    const synced = this.engine !== null && this.isIndexSynced();
+    if (connected && !synced) this.catchupSince ??= Date.now();
+    else this.catchupSince = null;
+
+    const view = catchupNotice({
+      isMobile: true,
+      started: this.engine !== null,
+      connected,
+      indexSynced: synced,
+      waitingMs: this.catchupSince === null ? 0 : Date.now() - this.catchupSince,
+      showing: this.catchupSticky !== null,
+    });
+
+    if (view === null) {
+      this.catchupSticky?.hide();
+      this.catchupSticky = null;
+      return;
+    }
+    if (this.catchupSticky !== null) return; // already up — never re-create, that would flicker
+
+    const n = notify({
+      kind: "info",
+      icon: "refresh-cw",
+      title: "Catching up",
+      detail: view.text,
+      durationMs: 0, // sticky: it must outlast the catch-up it describes
+    });
+    // Tap to dismiss, like the offline sticky. It is informational, so letting it go is fine.
+    n.noticeEl.addEventListener("click", () => {
+      this.catchupSticky?.hide();
+      this.catchupSticky = null;
+    });
+    this.catchupSticky = n;
+  }
+
   private execAlert(cmd: AlertCommand): void {
     switch (cmd.kind) {
       case "showSticky": {
