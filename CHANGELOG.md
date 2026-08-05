@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/KazeFreeze/zync/compare/zync-v0.9.6...zync-v0.10.0) (2026-08-05)
+
+
+### Features
+
+* **conflicts:** record and show where each conflict actually came from ([458e5e3](https://github.com/KazeFreeze/zync/commit/458e5e31f89a2c0af6762ead3da28705ca086fa8))
+
 ## [0.9.6](https://github.com/KazeFreeze/zync/compare/zync-v0.9.5...zync-v0.9.6) (2026-08-05)
 
 
