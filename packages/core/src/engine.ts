@@ -692,6 +692,8 @@ export class SyncEngine {
    * after {@link stop} has destroyed them. See {@link isIndexReadable}.
    */
   private indexSurfaceReady = false;
+  /** One-shot subscribers for {@link onIndexReadable}. Cleared as soon as they are notified. */
+  private indexReadableListeners = new Set<() => void>();
   /**
    * Whether this session has already taken the leading-edge index save. Reset on every
    * {@link start} — see {@link scheduleIndexPersist} for why the first update is not debounced.
@@ -805,6 +807,11 @@ export class SyncEngine {
     // never before: the hydrated latch is already true at this point (loadPersistedIndex sets it
     // and then awaits back to here), so a UI gating on that alone could read an undefined index.
     this.indexSurfaceReady = true;
+    // Notify one-shot readiness subscribers, then drop them: this fires at most once per session.
+    // Snapshot-and-clear first so a listener that re-subscribes cannot be notified twice.
+    const readableCbs = [...this.indexReadableListeners];
+    this.indexReadableListeners.clear();
+    for (const cb of readableCbs) cb();
     this.indexAttached = transport.attach(indexDoc);
     // Await the FIRST index sync when the transport is reachable ("connected" or
     // "connecting" — the production socket is still handshaking when status is
@@ -1735,6 +1742,25 @@ export class SyncEngine {
    */
   isIndexReadable(): boolean {
     return this.indexSurfaceReady && this.isIndexHydrated();
+  }
+
+  /**
+   * Fire ONCE when {@link isIndexReadable} becomes true — or on a microtask if it already is.
+   *
+   * Exists so a UI can render the instant real state is in hand without POLLING for it. The first
+   * version of the settings readiness gate polled every 400ms and re-rendered the whole tab, which
+   * flickered visibly on Android and, when the engine never became ready (offline), never stopped.
+   * A one-shot signal costs one render instead of one every tick.
+   */
+  onIndexReadable(cb: () => void): Unsubscribe {
+    if (this.isIndexReadable()) {
+      // Microtask, not synchronous: a subscribe() that re-enters the caller before it has returned
+      // is a footgun, and callers expect to hold the unsubscribe handle by the time cb runs.
+      queueMicrotask(cb);
+      return () => undefined;
+    }
+    this.indexReadableListeners.add(cb);
+    return () => this.indexReadableListeners.delete(cb);
   }
 
   listPluginOptIn(): { id: string; optIn: boolean; isDesktopOnly: boolean }[] {

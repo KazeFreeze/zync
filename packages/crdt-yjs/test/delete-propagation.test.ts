@@ -803,3 +803,59 @@ describe("SyncEngine index-persist crash window", () => {
     expect(paths).toContain(NOTE3);
   });
 });
+
+/**
+ * `onIndexReadable` — a ONE-SHOT signal that the index-backed surface became readable.
+ *
+ * Exists so a UI can render the moment real state is in hand WITHOUT polling. The first version of
+ * the settings readiness gate polled `isIndexReadable()` every 400ms and re-rendered the whole tab,
+ * which flickered on Android — and, when the engine never became ready (offline), polled forever.
+ */
+describe("SyncEngine.onIndexReadable", () => {
+  it("fires once when the index becomes readable during start()", async () => {
+    const durA = newDurable(true);
+    const a = makeEngine(new InProcessBus(), durA, "device-a", "relay-R");
+    open.push(a.engine);
+
+    let fired = 0;
+    a.engine.onIndexReadable(() => {
+      fired += 1;
+    });
+    expect(fired).toBe(0);
+
+    await a.engine.start();
+    expect(fired).toBe(1);
+
+    // One-shot: later index activity must not re-fire it.
+    await durA.vault.writeAtomic(p("notes/after-readable.md"), utf8(CONTENT));
+    await a.engine.waitConverged();
+    expect(fired).toBe(1);
+  });
+
+  it("fires immediately when subscribing after the index is already readable", async () => {
+    const a = makeEngine(new InProcessBus(), newDurable(true), "device-a", "relay-R");
+    open.push(a.engine);
+    await a.engine.start();
+
+    let fired = 0;
+    a.engine.onIndexReadable(() => {
+      fired += 1;
+    });
+    await Promise.resolve();
+    expect(fired).toBe(1);
+  });
+
+  it("does not fire after unsubscribing", async () => {
+    const a = makeEngine(new InProcessBus(), newDurable(true), "device-a", "relay-R");
+    open.push(a.engine);
+
+    let fired = 0;
+    const off = a.engine.onIndexReadable(() => {
+      fired += 1;
+    });
+    off();
+
+    await a.engine.start();
+    expect(fired).toBe(0);
+  });
+});

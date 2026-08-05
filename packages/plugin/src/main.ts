@@ -96,9 +96,6 @@ const MAX_PROSE_BYTES = 1_000_000;
  */
 const STATUS_POLL_INTERVAL_MS = 8_000;
 
-/** How often the settings tab re-checks whether the engine has caught up. See armReadinessRefresh. */
-const READINESS_POLL_MS = 400;
-
 /** The DISPLAY counts, straight from engine.syncSnapshot(). Never derived by subtraction in the
  *  plugin: a subtraction double-counted the stuck/arriving overlap in design review. These four
  *  are a disjoint partition — arriving + sending + stuck === pending. */
@@ -172,6 +169,8 @@ export default class ZyncPlugin extends Plugin {
   private lastStatusKey: string | null = null;
   private readonly unsubs: (() => void)[] = [];
   private connText = "offline";
+  /** Subscribers to index-readable / engine-ready transitions. See {@link onReadinessChange}. */
+  private readonly readinessListeners = new Set<() => void>();
   private lastConflictCount = 0;
   /** True only AFTER engine.start() completes. Gates status-bar reads of blobProgress()/inbox —
    *  both are undefined until start() finishes, and onStatus can drive renderStatus mid-start. */
@@ -437,6 +436,9 @@ export default class ZyncPlugin extends Plugin {
 
       await engine.start();
       this.engineReady = true; // blobProgress()/inbox are now valid to read from renderStatus
+      // Second and final readiness transition: surfaces that were read-only while starting (the
+      // synced-plugins rows) can now accept writes, so let them re-render exactly once.
+      this.notifyReadiness();
 
       // Slice 2b: wire the live apply reconciler. Fires on any change to the desired-active set
       // (enabled/optIn/meta/suppress maps), then does a single diff-and-apply pass. The
@@ -1181,6 +1183,30 @@ export default class ZyncPlugin extends Plugin {
     return this.engineReady && this.engine !== null;
   }
 
+  /**
+   * Fires when index-readability or engine-readiness changes — i.e. when a surface gated on either
+   * would now render differently. At most twice per session, so a subscriber can simply re-render.
+   *
+   * Exists so the settings tab does not POLL. Polling meant rebuilding the whole tab on a timer,
+   * which flickered on Android and never stopped while the engine stayed unready (offline).
+   */
+  onReadinessChange(cb: () => void): () => void {
+    this.readinessListeners.add(cb);
+    // The engine's own one-shot signal covers the "index became readable" half; the engineReady
+    // half is emitted directly by start() below. Both funnel through notifyReadiness.
+    const off = this.engine?.onIndexReadable(() => {
+      this.notifyReadiness();
+    });
+    return () => {
+      this.readinessListeners.delete(cb);
+      off?.();
+    };
+  }
+
+  private notifyReadiness(): void {
+    for (const cb of [...this.readinessListeners]) cb();
+  }
+
   /** The transport reports a live connection. */
   isConnected(): boolean {
     return this.connText === "connected";
@@ -1289,8 +1315,8 @@ class ZyncSettingTab extends PluginSettingTab {
    * display() for the same reason as the expanded set: we re-render on every change.
    */
   private readonly inFlightOptIn = new Set<string>();
-  /** Pending re-render while the engine catches up. See {@link armReadinessRefresh}. */
-  private readinessTimer: number | null = null;
+  /** Live subscription while the engine catches up. See {@link armReadinessRefresh}. */
+  private readinessUnsub: (() => void) | null = null;
 
   constructor(app: App, plugin: ZyncPlugin) {
     super(app, plugin);
@@ -1300,12 +1326,9 @@ class ZyncSettingTab extends PluginSettingTab {
   override display(): void {
     const { containerEl } = this;
     containerEl.empty();
-    // Drop any pending readiness poll: this render re-decides whether one is still needed, so a
-    // stale timer would fire a redundant re-render after the section had already gone live.
-    if (this.readinessTimer !== null) {
-      window.clearTimeout(this.readinessTimer);
-      this.readinessTimer = null;
-    }
+    // Drop any pending readiness watch: this render re-decides whether one is still needed, so a
+    // stale subscription would fire a redundant re-render after the section had already gone live.
+    this.clearReadinessWatch();
 
     if (
       this.plugin.startedSyncConfig !== null &&
@@ -1521,28 +1544,32 @@ class ZyncSettingTab extends PluginSettingTab {
   }
 
   /**
-   * Re-render once the engine catches up. Without this the section is not merely slow, it is STUCK:
-   * display() only ever runs from user interaction, so the "Loading…" row stayed on screen
+   * Re-render ONCE when the engine catches up. Without this the section is not merely slow, it is
+   * STUCK: display() only ever runs from user interaction, so the "Loading…" row stayed on screen
    * indefinitely after the engine was ready — until you pressed "Check again" or reopened Settings.
-   * That, more than the wait itself, is what made it look like it never finished.
    *
-   * A poll rather than an engine event: the index becoming readable is not a change to any observed
-   * map (the snapshot is applied to a fresh doc BEFORE observers are wired, deliberately), so there
-   * is nothing to subscribe to. The check is two booleans, and {@link hide} disarms it.
+   * EVENT-DRIVEN, deliberately not a poll. The first version polled every 400ms and called
+   * display(), which does containerEl.empty() and rebuilds the WHOLE tab. On Android that flickered
+   * visibly, and when the engine never became ready (offline) it never stopped. One subscription
+   * costs one re-render per real state change instead of one every tick.
    */
   private armReadinessRefresh(): void {
-    if (this.readinessTimer !== null) return;
-    this.readinessTimer = window.setTimeout(() => {
-      this.readinessTimer = null;
+    if (this.readinessUnsub !== null) return; // already waiting
+    this.readinessUnsub = this.plugin.onReadinessChange(() => {
+      this.clearReadinessWatch();
       this.display();
-    }, READINESS_POLL_MS);
+    });
+  }
+
+  private clearReadinessWatch(): void {
+    if (this.readinessUnsub !== null) {
+      this.readinessUnsub();
+      this.readinessUnsub = null;
+    }
   }
 
   override hide(): void {
-    if (this.readinessTimer !== null) {
-      window.clearTimeout(this.readinessTimer);
-      this.readinessTimer = null;
-    }
+    this.clearReadinessWatch();
     super.hide();
   }
 
