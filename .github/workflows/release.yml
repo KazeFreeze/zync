@@ -47,12 +47,29 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # release-please tags releases as `zync-v1.2.3`. docker/metadata-action's `type=semver`
+      # cannot parse that prefix, so it silently emitted NO version tag and the image only ever
+      # got `:latest`. That left no way to pin a deployment to an exact build - which matters,
+      # because a floating tag is precisely what let production sit two weeks behind while
+      # deploys reported success. Strip the prefix explicitly rather than relying on pattern
+      # matching that fails quietly.
+      - id: ver
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          v="${TAG#zync-}"
+          case "$v" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "unexpected tag shape: $TAG" >&2; exit 1 ;;
+          esac
+          echo "v=$v" >> "$GITHUB_OUTPUT"
       - uses: docker/metadata-action@v5
         id: meta
         with:
           images: ghcr.io/${{ github.repository }}-server
           tags: |
-            type=semver,pattern=v{{version}},value=${{ needs.release-please.outputs.tag_name }}
+            type=raw,value=${{ steps.ver.outputs.v }}
             type=raw,value=latest
       - uses: docker/build-push-action@v6
         with:
