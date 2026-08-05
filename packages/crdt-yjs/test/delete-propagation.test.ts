@@ -859,3 +859,30 @@ describe("SyncEngine.onIndexReadable", () => {
     expect(fired).toBe(0);
   });
 });
+
+/**
+ * Unsubscribing must cancel the already-readable notification too.
+ *
+ * The already-readable path returned a no-op unsubscribe, so a subscriber that unsubscribed before
+ * the queued microtask ran was still called. That is how a caller that re-subscribes on every
+ * render turns into an unbounded microtask loop, which starves the event loop outright — it froze
+ * Obsidian on Android hard enough that the whole app stopped responding.
+ */
+describe("SyncEngine.onIndexReadable — cancellation", () => {
+  it("does not fire when unsubscribed before the already-readable microtask runs", async () => {
+    const a = makeEngine(new InProcessBus(), newDurable(true), "device-a", "relay-R");
+    open.push(a.engine);
+    await a.engine.start();
+    expect(a.engine.isIndexReadable()).toBe(true);
+
+    let fired = 0;
+    const off = a.engine.onIndexReadable(() => {
+      fired += 1;
+    });
+    off(); // same tick, before the microtask drains
+
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(fired).toBe(0);
+  });
+});

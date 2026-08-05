@@ -171,6 +171,8 @@ export default class ZyncPlugin extends Plugin {
   private connText = "offline";
   /** Subscribers to index-readable / engine-ready transitions. See {@link onReadinessChange}. */
   private readonly readinessListeners = new Set<() => void>();
+  /** Re-entrancy guard for {@link notifyReadiness}. */
+  private notifyingReadiness = false;
   private lastConflictCount = 0;
   /** True only AFTER engine.start() completes. Gates status-bar reads of blobProgress()/inbox —
    *  both are undefined until start() finishes, and onStatus can drive renderStatus mid-start. */
@@ -426,6 +428,13 @@ export default class ZyncPlugin extends Plugin {
           pending: () => this.lastCounts.pending,
         });
       }
+      // ONE engine subscription for the whole session, wired before start(). Deliberately not
+      // per-subscriber: see onReadinessChange.
+      this.unsubs.push(
+        engine.onIndexReadable(() => {
+          this.notifyReadiness();
+        }),
+      );
       this.unsubs.push(
         transport.onStatus((s) => {
           this.connText = s;
@@ -1191,20 +1200,30 @@ export default class ZyncPlugin extends Plugin {
    * which flickered on Android and never stopped while the engine stayed unready (offline).
    */
   onReadinessChange(cb: () => void): () => void {
+    // PURE add/remove. It must NOT wire anything to the engine.
+    //
+    // It used to call `engine.onIndexReadable()` per subscriber, which froze Obsidian on Android:
+    // when the index was ALREADY readable that fires a microtask immediately, the settings tab's
+    // handler re-rendered, the render re-subscribed, and the cycle repeated with no task boundary
+    // in between. Microtasks starve the event loop, so the app wedged completely and `engineReady`
+    // could never arrive to break it. The engine subscription now happens ONCE, at engine
+    // construction, so re-subscribing here can never re-trigger anything.
     this.readinessListeners.add(cb);
-    // The engine's own one-shot signal covers the "index became readable" half; the engineReady
-    // half is emitted directly by start() below. Both funnel through notifyReadiness.
-    const off = this.engine?.onIndexReadable(() => {
-      this.notifyReadiness();
-    });
     return () => {
       this.readinessListeners.delete(cb);
-      off?.();
     };
   }
 
+  /** Fan out a readiness transition. Re-entrancy-guarded: a listener that re-renders (and so
+   *  re-subscribes) must never be able to drive this recursively. */
   private notifyReadiness(): void {
-    for (const cb of [...this.readinessListeners]) cb();
+    if (this.notifyingReadiness) return;
+    this.notifyingReadiness = true;
+    try {
+      for (const cb of [...this.readinessListeners]) cb();
+    } finally {
+      this.notifyingReadiness = false;
+    }
   }
 
   /** The transport reports a live connection. */

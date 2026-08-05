@@ -1756,8 +1756,17 @@ export class SyncEngine {
     if (this.isIndexReadable()) {
       // Microtask, not synchronous: a subscribe() that re-enters the caller before it has returned
       // is a footgun, and callers expect to hold the unsubscribe handle by the time cb runs.
-      queueMicrotask(cb);
-      return () => undefined;
+      //
+      // CANCELLABLE. Returning a no-op here meant a subscriber that unsubscribed in the same tick
+      // was still called, so a caller that re-subscribes on every render became an unbounded
+      // microtask loop — which starves the event loop outright rather than merely being wasteful.
+      let live = true;
+      queueMicrotask(() => {
+        if (live) cb();
+      });
+      return () => {
+        live = false;
+      };
     }
     this.indexReadableListeners.add(cb);
     return () => this.indexReadableListeners.delete(cb);
