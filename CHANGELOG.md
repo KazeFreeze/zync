@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.6](https://github.com/KazeFreeze/zync/compare/zync-v0.9.5...zync-v0.9.6) (2026-08-05)
+
+
+### Bug Fixes
+
+* **plugin:** stop a microtask loop that froze Obsidian on opening settings ([cf43486](https://github.com/KazeFreeze/zync/commit/cf434861ff393260cdb1eef3390ab53eec11db00))
+
 ## [0.9.5](https://github.com/KazeFreeze/zync/compare/zync-v0.9.4...zync-v0.9.5) (2026-08-05)
 
 
