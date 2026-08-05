@@ -276,3 +276,50 @@ describe("FsEngineStateStore — index snapshot", () => {
     expect(await fsp.readFile(filePath, "utf8")).toBe(before);
   });
 });
+
+/**
+ * The config stat cache — bootstrap's "has this file changed since we published it?" filter.
+ *
+ * Sidecar file for the same reason as the index snapshot: it is written ONCE per bootstrap but the
+ * hot state file is rewritten on every synced-stamp write, and this map carries an entry per
+ * config-zone file (every synced plugin bundle, the theme CSS).
+ */
+describe("FsEngineStateStore — config stats", () => {
+  it("absent by default", async () => {
+    const { store } = await makeTmpState();
+    expect(await store.getConfigStats()).toEqual({});
+  });
+
+  it("round-trips through a real reopen", async () => {
+    const { store, filePath } = await makeTmpState();
+    await store.setConfigStats({
+      ".obsidian/snippets/a.css": { size: 10, mtime: 555 },
+      ".obsidian/themes/t/theme.css": { size: 99, mtime: 1 },
+    });
+
+    const reopened = await FsEngineStateStore.open(filePath);
+    expect(await reopened.getConfigStats()).toEqual({
+      ".obsidian/snippets/a.css": { size: 10, mtime: 555 },
+      ".obsidian/themes/t/theme.css": { size: 99, mtime: 1 },
+    });
+  });
+
+  it("a later save REPLACES the set, so deleted paths drop out", async () => {
+    const { store, filePath } = await makeTmpState();
+    await store.setConfigStats({ a: { size: 1, mtime: 1 }, b: { size: 2, mtime: 2 } });
+    await store.setConfigStats({ a: { size: 1, mtime: 1 } });
+
+    const reopened = await FsEngineStateStore.open(filePath);
+    expect(await reopened.getConfigStats()).toEqual({ a: { size: 1, mtime: 1 } });
+  });
+
+  it("does not rewrite the hot state file", async () => {
+    const { store, filePath } = await makeTmpState();
+    await store.setSyncedStamp(id("d1"), "abc:dev-1");
+    const before = await fsp.readFile(filePath, "utf8");
+
+    await store.setConfigStats({ a: { size: 1, mtime: 1 } });
+
+    expect(await fsp.readFile(filePath, "utf8")).toBe(before);
+  });
+});

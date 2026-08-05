@@ -83,6 +83,7 @@ function makeChannel(
     snippets: true,
   },
   gate?: { allows(path: string): boolean },
+  engineState?: unknown,
 ) {
   const config = memMap<ConfigEntry>();
 
@@ -137,6 +138,7 @@ function makeChannel(
     enabledCategories,
     now: () => 0,
     ...(gate !== undefined ? { gate } : {}),
+    ...(engineState !== undefined ? { engineState: engineState as never } : {}),
   });
   return {
     ch,
@@ -626,5 +628,116 @@ describe("ConfigChannel", () => {
         expect(config.get(themePath)?.deleted).toBe(true);
       });
     });
+  });
+});
+
+/**
+ * Bootstrap must not re-read and re-hash config files that have not changed since last run.
+ *
+ * It used to read EVERY config-zone file on every start and hash it, only for `publish()` to
+ * discover the sha was identical and return. The zone holds each synced plugin's whole bundle plus
+ * theme CSS, so that is tens of megabytes of pointless IO and CPU on every launch — measured at
+ * ~27s on a real Android device, and it blocks `start()`.
+ *
+ * The stat pair (size, mtime) is the cheap filter, persisted across restarts. Same technique as
+ * git's index and rsync's quick check.
+ */
+describe("ConfigChannel — bootstrap stat cache", () => {
+  const PATH = ".obsidian/snippets/big.css";
+
+  function statStore(initial: Record<string, { size: number; mtime: number }>) {
+    const saved: Record<string, { size: number; mtime: number }>[] = [];
+    return {
+      saved,
+      store: {
+        getConfigStats: () => Promise.resolve(initial),
+        setConfigStats: (s: Record<string, { size: number; mtime: number }>) => {
+          saved.push(s);
+          return Promise.resolve();
+        },
+      },
+    };
+  }
+
+  it("skips the read entirely when size and mtime match and the entry is already published", async () => {
+    const { store } = statStore({ [PATH]: { size: 10, mtime: 555 } });
+    const { ch, config, configList, configRead } = makeChannel(
+      { themes: true, snippets: true },
+      undefined,
+      store,
+    );
+    config.set(PATH, { sha256: "abc", size: 10, category: "snippets", deviceId: "d" } as never);
+    configList.mockResolvedValue([{ path: PATH, size: 10, mtime: 555 }] as never);
+
+    await ch.bootstrap();
+
+    expect(configRead).not.toHaveBeenCalled();
+  });
+
+  it("reads when mtime moved, even though size is the same", async () => {
+    const { store } = statStore({ [PATH]: { size: 10, mtime: 555 } });
+    const { ch, config, configList, configRead } = makeChannel(
+      { themes: true, snippets: true },
+      undefined,
+      store,
+    );
+    config.set(PATH, { sha256: "abc", size: 10, category: "snippets", deviceId: "d" } as never);
+    configList.mockResolvedValue([{ path: PATH, size: 10, mtime: 999 }] as never);
+    configRead.mockResolvedValue(new Uint8Array([1, 2, 3]));
+
+    await ch.bootstrap();
+
+    expect(configRead).toHaveBeenCalledWith(PATH);
+  });
+
+  it("reads on a first run, when there is no cached stat", async () => {
+    const { store } = statStore({});
+    const { ch, configList, configRead } = makeChannel(
+      { themes: true, snippets: true },
+      undefined,
+      store,
+    );
+    configList.mockResolvedValue([{ path: PATH, size: 10, mtime: 555 }] as never);
+    configRead.mockResolvedValue(new Uint8Array([1, 2, 3]));
+
+    await ch.bootstrap();
+
+    expect(configRead).toHaveBeenCalledWith(PATH);
+  });
+
+  /**
+   * SAFETY: the cache says "unchanged since we published it", which is only meaningful if that
+   * published entry is actually in hand. If the index did not hydrate (first run against a new
+   * relay, discarded snapshot), skipping would leave the file unpublished forever.
+   */
+  it("reads when the stat matches but the shared entry is absent", async () => {
+    const { store } = statStore({ [PATH]: { size: 10, mtime: 555 } });
+    const { ch, configList, configRead } = makeChannel(
+      { themes: true, snippets: true },
+      undefined,
+      store,
+    );
+    configList.mockResolvedValue([{ path: PATH, size: 10, mtime: 555 }] as never);
+    configRead.mockResolvedValue(new Uint8Array([1, 2, 3]));
+
+    await ch.bootstrap();
+
+    expect(configRead).toHaveBeenCalledWith(PATH);
+  });
+
+  it("persists the fresh stat set so the NEXT start can skip", async () => {
+    const { store, saved } = statStore({});
+    const { ch, configList, configRead } = makeChannel(
+      { themes: true, snippets: true },
+      undefined,
+      store,
+    );
+    configList.mockResolvedValue([{ path: PATH, size: 10, mtime: 555 }] as never);
+    configRead.mockResolvedValue(new Uint8Array([1, 2, 3]));
+
+    await ch.bootstrap();
+
+    expect(saved).toHaveLength(1);
+    expect(saved[0]?.[PATH]).toEqual({ size: 10, mtime: 555 });
   });
 });

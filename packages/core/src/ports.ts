@@ -32,6 +32,12 @@ export interface IndexSnapshotRecord {
   snapshot: Uint8Array;
 }
 
+/** Cheap change-detection pair for a config-zone file. See {@link EngineStateStore.getConfigStats}. */
+export interface ConfigStat {
+  size: number;
+  mtime: number;
+}
+
 export interface TextEdit {
   at: number;
   delete: number;
@@ -104,8 +110,15 @@ export interface ConfigPort {
   read(path: VaultPath): Promise<Uint8Array | null>;
   writeAtomic(path: VaultPath, data: Uint8Array): Promise<void>;
   remove(path: VaultPath): Promise<void>;
-  /** List config-zone files (recursively) under the two allow-listed prefixes. */
-  list(): Promise<{ path: VaultPath; size: number }[]>;
+  /**
+   * List config-zone files (recursively) under the two allow-listed prefixes.
+   *
+   * `mtime` is REQUIRED: together with `size` it is the cheap change filter that lets callers skip
+   * reading and hashing a file that has not moved. Both adapters already stat every entry, so this
+   * costs nothing to provide — and without it, bootstrap and the periodic rescan re-hash the whole
+   * zone (every synced plugin bundle, the theme CSS) on every pass.
+   */
+  list(): Promise<{ path: VaultPath; size: number; mtime: number }[]>;
   /** Fires on any config-zone change (best-effort watcher + periodic rescan). */
   onChange(cb: (path: VaultPath) => void): Unsubscribe;
   /** Force an immediate rescan (the manual `Zync: rescan config` command). */
@@ -237,6 +250,22 @@ export interface EngineStateStore {
    */
   getIndexSnapshot?(): Promise<IndexSnapshotRecord | null>;
   setIndexSnapshot?(rec: IndexSnapshotRecord): Promise<void>;
+
+  /**
+   * Per-path (size, mtime) of the config zone as of the last bootstrap — the cheap "has this file
+   * changed since we published it?" filter.
+   *
+   * Bootstrap otherwise reads and hashes EVERY config file on every start, and that zone holds each
+   * synced plugin's whole bundle plus theme CSS: tens of megabytes of IO and CPU, measured at ~27s
+   * on a real Android device, blocking `start()` the entire time.
+   *
+   * BULK on purpose, read once and written once per bootstrap. A per-path setter would rewrite the
+   * durable state N times during the very pass it is meant to make cheap.
+   *
+   * OPTIONAL so existing adapters stay valid; absent ⇒ nothing is skipped, exactly as before.
+   */
+  getConfigStats?(): Promise<Record<string, ConfigStat>>;
+  setConfigStats?(stats: Record<string, ConfigStat>): Promise<void>;
 }
 /**
  * Slice 2b: narrow wrapper around the undocumented `app.plugins` runtime API. Confined to the

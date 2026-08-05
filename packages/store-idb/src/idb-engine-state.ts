@@ -14,7 +14,7 @@
  */
 import type { DocId, EngineStateStore, Sha256, Stamp, VaultPath } from "@zync/core";
 import { ENGINE_STATE_STORE, META_STORE, type EngineStateRecord, type ZyncDb } from "./idb-open.js";
-import type { IndexSnapshotRecord } from "@zync/core";
+import type { ConfigStat, IndexSnapshotRecord } from "@zync/core";
 
 function emptyRecord(): EngineStateRecord {
   return { syncedStamp: null, dirty: false };
@@ -145,6 +145,16 @@ export class IdbEngineState implements EngineStateStore {
    *  the previous snapshot rather than a torn one. Never split this across records. */
   async setIndexSnapshot(rec: IndexSnapshotRecord): Promise<void> {
     await this.db.put(META_STORE, rec, "indexSnapshot");
+  }
+
+  async getConfigStats(): Promise<Record<string, ConfigStat>> {
+    const raw = await this.db.get(META_STORE, "configStats");
+    return (raw as Record<string, ConfigStat> | undefined) ?? {};
+  }
+
+  /** ONE put, whole-set replace — see the FsEngineStateStore counterpart for the reasoning. */
+  async setConfigStats(stats: Record<string, ConfigStat>): Promise<void> {
+    await this.db.put(META_STORE, stats, "configStats");
   }
 
   /**

@@ -9,9 +9,11 @@
  *     Obsidian types but present in every desktop/mobile build). Filtered to config zone paths
  *     only; self-exclusion guards `.obsidian/zync/**` and `.obsidian/plugins/zync/**` so the
  *     engine's own writes do not re-trigger it.
- *  2. A 30-second periodic rescan (`setInterval`) that diffs current zone file sha256s against
- *     the last-known shas, firing onChange for any changed (including deleted) paths. Catches
- *     changes missed by the watcher (e.g. external tool writes).
+ *  2. A 30-second periodic rescan (`setInterval`) that firing onChange for any changed (including
+ *     deleted) paths, catching changes the watcher misses (e.g. external tool writes). It filters
+ *     on (size, mtime) FIRST and only reads + hashes files whose stat moved — the zone holds every
+ *     synced plugin's bundle and the theme CSS, so hashing all of it twice a minute was tens of
+ *     megabytes of pointless main-thread work on mobile.
  *
  * Design ratified by the Phase-9 plan. On-device correctness (real `"raw"` event firing, real
  * DataAdapter behaviour) is the manual gate — unit tests run against the mock only.
@@ -76,8 +78,12 @@ export class ObsidianConfigPort implements ConfigPort {
   private readonly listeners = new Set<(path: VaultPath) => void>();
   private readonly eventRefs: EventRef[] = [];
   private rescanTimer: ReturnType<typeof setInterval> | null = null;
-  /** sha256hex snapshot from the last rescan, keyed by vault-relative path. */
-  private lastShas = new Map<string, string>();
+  /**
+   * Last-known (size, mtime, sha) per config-zone path. The stat pair is the CHEAP change filter:
+   * matching it means "unchanged", so the file is never read or hashed. Only the sha decides
+   * whether to fire, so a touch that leaves content identical still stays silent.
+   */
+  private lastStats = new Map<string, { size: number; mtime: number; sha: string }>();
 
   constructor(vault: Vault) {
     this.vault = vault;
@@ -128,8 +134,8 @@ export class ObsidianConfigPort implements ConfigPort {
   }
 
   /** List all config-zone files (recursively) under the two allow-listed prefixes. */
-  async list(): Promise<{ path: VaultPath; size: number }[]> {
-    const result: { path: VaultPath; size: number }[] = [];
+  async list(): Promise<{ path: VaultPath; size: number; mtime: number }[]> {
+    const result: { path: VaultPath; size: number; mtime: number }[] = [];
     for (const prefix of CONFIG_ZONE_PREFIXES) {
       // Strip the trailing slash for adapter.list (it lists the directory itself).
       await this.collectFiles(prefix.slice(0, -1), result);
@@ -187,7 +193,10 @@ export class ObsidianConfigPort implements ConfigPort {
    * Recursively collect all files under `dir` into `out`, skipping self-excluded paths.
    * Uses `adapter.list` (which lists immediate children) then recurses into sub-folders.
    */
-  private async collectFiles(dir: string, out: { path: VaultPath; size: number }[]): Promise<void> {
+  private async collectFiles(
+    dir: string,
+    out: { path: VaultPath; size: number; mtime: number }[],
+  ): Promise<void> {
     let listed: { files: string[]; folders: string[] };
     try {
       listed = await this.vault.adapter.list(dir);
@@ -199,7 +208,9 @@ export class ObsidianConfigPort implements ConfigPort {
       if (!isConfigZone(filePath as VaultPath)) continue;
       const stat = await this.vault.adapter.stat(filePath);
       if (stat !== null && stat.type === "file") {
-        out.push({ path: filePath as VaultPath, size: stat.size });
+        // mtime comes free with the stat we already do — it is the whole basis of the rescan's
+        // change filter, so keep it rather than discarding it as this used to.
+        out.push({ path: filePath as VaultPath, size: stat.size, mtime: stat.mtime });
       }
     }
     for (const folderPath of listed.folders) {
@@ -213,15 +224,30 @@ export class ObsidianConfigPort implements ConfigPort {
    */
   private async doRescan(): Promise<void> {
     const allFiles = await this.list();
-    const newShas = new Map<string, string>();
+    const next = new Map<string, { size: number; mtime: number; sha: string }>();
 
-    for (const { path } of allFiles) {
+    for (const { path, size, mtime } of allFiles) {
+      const prev = this.lastStats.get(path);
+      // STAT FILTER: unchanged size AND mtime ⇒ skip the read and the hash entirely. This runs
+      // every 30s over a zone holding every synced plugin's bundle and the theme CSS, so without
+      // it the steady state re-reads and re-hashes tens of megabytes twice a minute on the phone's
+      // main thread — for files that almost never change. Same technique as git's index and
+      // rsync's quick check.
+      //
+      // The tradeoff is the one git accepts: a write that preserves BOTH size and mtime is missed
+      // here. Obsidian's own raw watcher still fires for live edits, and `rescan()` is exposed as
+      // the manual command for the pathological case.
+      if (prev?.size === size && prev.mtime === mtime) {
+        next.set(path, prev);
+        continue;
+      }
       try {
         const buf = await this.vault.adapter.readBinary(path);
         const sha = await sha256hex(new Uint8Array(buf));
-        newShas.set(path, sha);
-        const prev = this.lastShas.get(path);
-        if (prev === undefined || prev !== sha) {
+        next.set(path, { size, mtime, sha });
+        // Still gated on the SHA, not the stat: a touch that leaves content identical must stay
+        // silent, exactly as before.
+        if (prev?.sha !== sha) {
           this.fire(path);
         }
       } catch {
@@ -230,12 +256,12 @@ export class ObsidianConfigPort implements ConfigPort {
     }
 
     // Fire for paths that existed last scan but are now gone (deleted externally).
-    for (const [path] of this.lastShas) {
-      if (!newShas.has(path)) {
+    for (const [path] of this.lastStats) {
+      if (!next.has(path)) {
         this.fire(path as VaultPath);
       }
     }
 
-    this.lastShas = newShas;
+    this.lastStats = next;
   }
 }

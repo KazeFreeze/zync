@@ -34,7 +34,7 @@ function makeConfigPort(): ConfigPort {
       files.delete(p);
       return Promise.resolve();
     },
-    list: (): Promise<{ path: VaultPath; size: number }[]> => Promise.resolve([]),
+    list: (): Promise<{ path: VaultPath; size: number; mtime: number }[]> => Promise.resolve([]),
     onChange: (): Unsubscribe => () => undefined,
     rescan: (): Promise<void> => Promise.resolve(),
     close: (): void => undefined,

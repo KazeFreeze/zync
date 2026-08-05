@@ -1,4 +1,5 @@
 import type {
+  ConfigStat,
   DocId,
   EngineStateStore,
   IndexSnapshotRecord,
@@ -138,6 +139,7 @@ export class MemEngineState implements EngineStateStore {
   }
 
   private indexSnapshot: IndexSnapshotRecord | null = null;
+  private configStats: Record<string, ConfigStat> = {};
 
   getIndexSnapshot(): Promise<IndexSnapshotRecord | null> {
     return Promise.resolve(this.indexSnapshot);
@@ -145,6 +147,16 @@ export class MemEngineState implements EngineStateStore {
 
   setIndexSnapshot(rec: IndexSnapshotRecord): Promise<void> {
     this.indexSnapshot = rec;
+    return Promise.resolve();
+  }
+
+  getConfigStats(): Promise<Record<string, ConfigStat>> {
+    return Promise.resolve({ ...this.configStats });
+  }
+
+  /** Whole-set replace, matching the durable adapters: vanished paths must drop out. */
+  setConfigStats(stats: Record<string, ConfigStat>): Promise<void> {
+    this.configStats = { ...stats };
     return Promise.resolve();
   }
 }

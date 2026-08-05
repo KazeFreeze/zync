@@ -250,3 +250,62 @@ describe("ObsidianConfigPort", () => {
     });
   });
 });
+
+/**
+ * The 30s rescan must not re-hash files that have not changed.
+ *
+ * `doRescan` read and SHA-256'd EVERY config-zone file on every tick. The config zone holds each
+ * synced plugin's whole bundle (main.js, styles.css, manifest.json) plus theme CSS, so on a real
+ * vault that is tens of megabytes re-read and re-hashed twice a minute, on the phone's main thread,
+ * forever — for a set of files that almost never changes.
+ *
+ * `collectFiles` already calls `adapter.stat()` per file, which carries `mtime`. Comparing
+ * (size, mtime) first — the technique git's index and rsync's quick-check both use — turns the
+ * steady state into a stat sweep and reads only what actually changed.
+ */
+describe("ObsidianConfigPort — rescan skips unchanged files", () => {
+  it("does not re-read a file whose size and mtime are unchanged", async () => {
+    const mock = createMockVault();
+    const p = new ObsidianConfigPort(mock.vault);
+    try {
+      await p.writeAtomic(vp(".obsidian/themes/big/theme.css"), enc("body{}"));
+      await p.writeAtomic(vp(".obsidian/snippets/a.css"), enc(".a{}"));
+
+      // First rescan establishes the baseline; it must read to learn each file's hash.
+      await p.rescan();
+
+      const reads: string[] = [];
+      const realRead = mock.vault.adapter.readBinary.bind(mock.vault.adapter);
+      mock.vault.adapter.readBinary = (path: string): Promise<ArrayBuffer> => {
+        reads.push(path);
+        return realRead(path);
+      };
+
+      await p.rescan();
+
+      expect(reads).toEqual([]);
+    } finally {
+      p.close();
+    }
+  });
+
+  it("still detects a real change, and fires onChange for it", async () => {
+    const mock = createMockVault();
+    const p = new ObsidianConfigPort(mock.vault);
+    try {
+      const target = vp(".obsidian/snippets/a.css");
+      await p.writeAtomic(target, enc(".a{}"));
+      await p.rescan();
+
+      const fired: string[] = [];
+      p.onChange((path) => fired.push(path));
+
+      await p.writeAtomic(target, enc(".a{color:red}")); // new size AND new mtime
+      await p.rescan();
+
+      expect(fired).toContain(target);
+    } finally {
+      p.close();
+    }
+  });
+});

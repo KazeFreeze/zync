@@ -11,14 +11,17 @@
  * An in-memory copy is kept for synchronous reads — all public methods are
  * async to satisfy the EngineStateStore port interface.
  *
- * ONE facet lives outside that file: the index snapshot, in an `index-snapshot.json` SIDECAR
- * next to it. See {@link FsEngineStateStore.setIndexSnapshot} for why.
+ * TWO facets live outside that file, each in its own SIDECAR next to it: the index snapshot
+ * (`index-snapshot.json`) and the config stat cache (`config-stats.json`). Both are large and
+ * written rarely, while the state file is small and rewritten constantly — see
+ * {@link FsEngineStateStore.setIndexSnapshot} and {@link FsEngineStateStore.setConfigStats}.
  */
 
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
 import type {
+  ConfigStat,
   DocId,
   EngineStateStore,
   IndexSnapshotRecord,
@@ -62,6 +65,7 @@ interface SerializedIndexSnapshot {
 export class FsEngineStateStore implements EngineStateStore {
   private readonly filePath: string;
   private readonly indexSnapshotPath: string;
+  private readonly configStatsPath: string;
   private syncedStamps: Map<DocId, Stamp>;
   private dirty: Set<DocId>;
   private lastLive: Map<DocId, VaultPath>;
@@ -84,6 +88,7 @@ export class FsEngineStateStore implements EngineStateStore {
   ) {
     this.filePath = filePath;
     this.indexSnapshotPath = path.join(path.dirname(filePath), "index-snapshot.json");
+    this.configStatsPath = path.join(path.dirname(filePath), "config-stats.json");
     this.syncedStamps = syncedStamps;
     this.dirty = dirty;
     this.lastLive = lastLive;
@@ -305,6 +310,33 @@ export class FsEngineStateStore implements EngineStateStore {
       this.indexSnapshotPath,
       new TextEncoder().encode(JSON.stringify(payload)),
     );
+  }
+
+  /** The config-zone stat cache from the last bootstrap, or `{}` when there is none. */
+  async getConfigStats(): Promise<Record<string, ConfigStat>> {
+    try {
+      const raw = await fsp.readFile(this.configStatsPath, "utf8");
+      return JSON.parse(raw) as Record<string, ConfigStat>;
+    } catch (err) {
+      if (isEnoent(err)) return {};
+      throw err;
+    }
+  }
+
+  /**
+   * Replace the whole cache in ONE atomic write, to a SIDECAR rather than the main state file.
+   *
+   * Same reasoning as the index snapshot: this is written once per bootstrap, but the state file is
+   * rewritten on every synced-stamp write, and this map holds an entry per config-zone file (every
+   * synced plugin bundle, the theme CSS). Embedding it would re-serialize all of that thousands of
+   * times per scenario.
+   *
+   * Whole-set replace, not merge: paths that vanished (deleted, or newly gated off) must drop out,
+   * or the cache would grow forever and keep asserting things about files that no longer exist.
+   */
+  async setConfigStats(stats: Record<string, ConfigStat>): Promise<void> {
+    await fsp.mkdir(path.dirname(this.configStatsPath), { recursive: true });
+    await atomicWriteBytes(this.configStatsPath, new TextEncoder().encode(JSON.stringify(stats)));
   }
 
   // ---------------------------------------------------------------------------

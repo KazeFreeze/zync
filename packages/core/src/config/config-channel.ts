@@ -1,5 +1,6 @@
 import type {
   BlobStorePort,
+  ConfigStat,
   CrdtMap,
   ConfigPort,
   IdentityPort,
@@ -35,6 +36,9 @@ export interface ConfigChannelDeps {
     setConfigLocalVersion(path: VaultPath, version: number): Promise<void>;
     getConfigNormalizedSha(path: VaultPath): Promise<Sha256 | null>;
     setConfigNormalizedSha(path: VaultPath, sha256: Sha256 | null): Promise<void>;
+    /** Bootstrap's stat cache. Optional on the port, so optional here — absent ⇒ nothing skipped. */
+    getConfigStats?(): Promise<Record<string, ConfigStat>>;
+    setConfigStats?(stats: Record<string, ConfigStat>): Promise<void>;
   };
   /** Which config categories this device syncs. Absent category = not published or materialized. */
   enabledCategories: {
@@ -137,13 +141,53 @@ export class ConfigChannel {
     };
   }
 
-  /** Seed the config map from local disk at engine start. */
+  /**
+   * Seed the config map from local disk at engine start.
+   *
+   * STAT-FILTERED. This used to read and hash EVERY config-zone file on every start, only for
+   * `publish()` to find the sha unchanged and return. The zone holds each synced plugin's whole
+   * bundle plus theme CSS, so that was tens of megabytes of IO and CPU per launch — ~27s measured
+   * on a real Android device, blocking `start()` throughout.
+   *
+   * A file is skipped only when BOTH hold:
+   *   - its (size, mtime) match what we recorded at the last bootstrap, AND
+   *   - the shared map already carries a live entry for it.
+   *
+   * The second condition is the safety one: the cache only means "unchanged since we published
+   * it", which is worthless if that published entry is not actually in hand (first run against a
+   * new relay, or a discarded index snapshot). Without it, a file could stay unpublished forever.
+   *
+   * Same technique as git's index and rsync's quick check, and the same tradeoff: a write that
+   * preserves BOTH size and mtime is missed here. The live watcher and the manual `rescan` command
+   * both still catch it.
+   */
   async bootstrap(): Promise<void> {
-    for (const { path } of await this.d.configPort.list()) {
+    const cached = (await this.d.engineState?.getConfigStats?.()) ?? {};
+    const fresh: Record<string, ConfigStat> = {};
+
+    for (const { path, size, mtime } of await this.d.configPort.list()) {
       if (!this.categoryEnabled(path) || !this.gateAllows(path)) continue; // skip disabled or gated
+      const prev = cached[path];
+      const entry = this.d.config.get(path);
+      if (
+        prev?.size === size &&
+        prev.mtime === mtime &&
+        entry !== undefined &&
+        entry.deleted !== true
+      ) {
+        fresh[path] = prev; // unchanged AND already published — no read, no hash
+        continue;
+      }
       const bytes = await this.d.configPort.read(path);
-      if (bytes !== null) await this.publish(path, bytes);
+      if (bytes !== null) {
+        await this.publish(path, bytes);
+        fresh[path] = { size, mtime };
+      }
     }
+
+    // ONE durable write for the whole pass. Paths absent from `fresh` (deleted, or newly gated
+    // off) drop out of the cache naturally, so it cannot accumulate stale entries.
+    await this.d.engineState?.setConfigStats?.(fresh);
   }
 
   private async onLocalChange(path: VaultPath): Promise<void> {

@@ -80,8 +80,8 @@ export class NodeFsConfig implements ConfigPort {
     }
   }
 
-  async list(): Promise<{ path: VaultPath; size: number }[]> {
-    const results: { path: VaultPath; size: number }[] = [];
+  async list(): Promise<{ path: VaultPath; size: number; mtime: number }[]> {
+    const results: { path: VaultPath; size: number; mtime: number }[] = [];
     for (const prefix of CONFIG_ZONE_PREFIXES) {
       const absDir = path.join(this.root, prefix);
       await this.walkDir(absDir, results);
@@ -162,7 +162,7 @@ export class NodeFsConfig implements ConfigPort {
    */
   private async walkDir(
     absDir: string,
-    results: { path: VaultPath; size: number }[],
+    results: { path: VaultPath; size: number; mtime: number }[],
   ): Promise<void> {
     let entries: fs.Dirent[];
     try {
@@ -180,7 +180,9 @@ export class NodeFsConfig implements ConfigPort {
         const stat = await fsp.stat(absEntry);
         const rel = path.relative(this.root, absEntry).split(path.sep).join("/") as VaultPath;
         if (!isConfigZone(rel)) continue;
-        results.push({ path: rel, size: stat.size });
+        // mtime comes free with the stat we already do; callers use (size, mtime) to skip
+        // reading and hashing files that have not moved.
+        results.push({ path: rel, size: stat.size, mtime: stat.mtimeMs });
       }
     }
   }
