@@ -64,6 +64,14 @@
   gap: 6px;
 }
 
+/* Provenance: which device detected this and whether it could see the others. Muted — it is
+   context, not an action, and it sits above the action row. */
+.zync-row-prov {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-faint);
+  margin-top: 2px;
+}
+
 .zync-row-sub {
   color: var(--text-muted);
   font-size: var(--font-smaller);

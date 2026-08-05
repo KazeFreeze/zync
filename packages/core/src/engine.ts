@@ -802,7 +802,16 @@ export class SyncEngine {
     const indexDoc = (await this.loadPersistedIndex()) ?? crdt.createDoc(INDEX_DOC_ID);
     this.indexDoc = indexDoc;
     this.index = new IndexDoc(indexDoc.getMap("tree"), deviceId);
-    this.inbox = new Inbox(indexDoc.getMap("inbox"));
+    // Provenance stamper. Captures WHO detected the conflict and, critically, whether this device
+    // was connected and index-synced at that moment — the pair that separates a legitimate
+    // divergence from conflicting against state we had simply not received yet.
+    this.inbox = new Inbox(indexDoc.getMap("inbox"), () => ({
+      at: this.ports.clock.now(),
+      byDeviceId: deviceId,
+      byDeviceName: this.ports.identity.deviceName(),
+      connected: this.ports.transport.status() === "connected",
+      indexSynced: this.isIndexSynced(),
+    }));
     // The maps now EXIST — from here on reading them is safe. Set after the assignments above,
     // never before: the hydrated latch is already true at this point (loadPersistedIndex sets it
     // and then awaits back to here), so a UI gating on that alone could read an undefined index.

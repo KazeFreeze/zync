@@ -146,3 +146,35 @@ export function describeInboxEntry(e: InboxEntry, ctx: { artifactLocal: boolean 
     ],
   };
 }
+
+/**
+ * A human line explaining WHERE a conflict came from, or null when the entry predates provenance.
+ *
+ * Two things it must convey, because they are the ones people get wrong:
+ *
+ *  1. WHICH DEVICE detected it. The inbox is a SYNCED map, so a conflict created on a desktop
+ *     appears on the phone too. Without this, "my phone keeps conflicting" is indistinguishable
+ *     from "my desktop conflicts and my phone is showing me". On a real vault, 285 of 288 entries
+ *     turned out to come from one desktop; the phone had made two.
+ *  2. WHETHER THAT DEVICE COULD SEE THE OTHERS. A device that was offline, or whose index had not
+ *     synced, may have conflicted against state it simply had not received. That is a connectivity
+ *     problem wearing a conflict's clothes, and it needs a completely different fix.
+ */
+export function provenanceLine(e: InboxEntry): string | null {
+  if (e.byDeviceId === undefined && e.byDeviceName === undefined && e.at === undefined) return null;
+
+  const who = e.byDeviceName ?? e.byDeviceId ?? "an unknown device";
+  const when = e.at === undefined ? "" : ` on ${new Date(e.at).toLocaleString()}`;
+
+  // Only mention connectivity when it is EXCULPATORY for the merge logic — i.e. when this device
+  // could not have known about the other side. Saying "was online" on every healthy conflict is
+  // noise that trains people to ignore the line.
+  let caveat = "";
+  if (e.connected === false) {
+    caveat = " while it was offline, so it could not see other devices' changes";
+  } else if (e.indexSynced === false) {
+    caveat = " while it was still catching up, so it may not have received other devices' changes";
+  }
+
+  return `Detected by ${who}${when}${caveat}.`;
+}

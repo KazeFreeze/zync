@@ -1,6 +1,11 @@
 import { describe, it, expect } from "vitest";
 import type { InboxEntry } from "./inbox.js";
-import { describeInboxEntry, isActionableConflict, type EntryAction } from "./entry-view.js";
+import {
+  describeInboxEntry,
+  isActionableConflict,
+  provenanceLine,
+  type EntryAction,
+} from "./entry-view.js";
 
 const actions = (e: InboxEntry, artifactLocal: boolean): EntryAction[] =>
   describeInboxEntry(e, { artifactLocal }).actions.map((a) => a.action);
@@ -110,5 +115,38 @@ describe("isActionableConflict", () => {
     expect(
       isActionableConflict({ id: "config-file:x:aa", kind: "config-file", path: "x" as never }),
     ).toBe(true);
+  });
+});
+
+/**
+ * Provenance as a human line. Raw fields in a CRDT map are useless to someone staring at a
+ * conflict on a phone wondering why it happened.
+ */
+describe("provenanceLine", () => {
+  it("is null without provenance, so old entries render exactly as before", () => {
+    expect(provenanceLine(base({}))).toBeNull();
+  });
+
+  it("names the device that detected it, because the inbox is SHARED across devices", () => {
+    const line = provenanceLine(base({ byDeviceName: "bernard-pc", at: 1_700_000_000_000 }));
+    expect(line).toContain("bernard-pc");
+  });
+
+  /** The load-bearing case: this is a conflict we created against state we had not received. */
+  it("calls out that the device was OFFLINE when it decided there was a conflict", () => {
+    const line = provenanceLine(base({ byDeviceName: "tab-s8", connected: false }));
+    expect(line).toMatch(/offline/i);
+  });
+
+  it("calls out an unsynced index, which is the other way a stale base happens", () => {
+    const line = provenanceLine(
+      base({ byDeviceName: "tab-s8", connected: true, indexSynced: false }),
+    );
+    expect(line).toMatch(/not.*synced|catching up/i);
+  });
+
+  it("stays quiet about connectivity when the device was online and synced", () => {
+    const line = provenanceLine(base({ byDeviceName: "pc", connected: true, indexSynced: true }));
+    expect(line).not.toMatch(/offline/i);
   });
 });

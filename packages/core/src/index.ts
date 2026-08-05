@@ -69,11 +69,15 @@ export { runStructuralReconcile } from "./protocol/structural-reconcile.js";
 export type { StructuralReconcileDeps } from "./protocol/structural-reconcile.js";
 export { conflictArtifactPath, writeConflictArtifact } from "./conflicts/artifact.js";
 export { Inbox } from "./conflicts/inbox.js";
-export type { InboxEntry, InboxKind } from "./conflicts/inbox.js";
+export type { InboxEntry, InboxProvenance, InboxKind } from "./conflicts/inbox.js";
 export { supervisedImport } from "./conflicts/supervised-import.js";
 export { ArtifactNotLocalError } from "./conflicts/resolve.js";
 export type { ResolveAction, ResolveConfigAction } from "./conflicts/resolve.js";
-export { describeInboxEntry, isActionableConflict } from "./conflicts/entry-view.js";
+export {
+  describeInboxEntry,
+  isActionableConflict,
+  provenanceLine,
+} from "./conflicts/entry-view.js";
 export type { EntryView, EntryAction, EntryActionSpec } from "./conflicts/entry-view.js";
 export {
   SyncEngine,

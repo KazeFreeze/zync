@@ -886,3 +886,45 @@ describe("SyncEngine.onIndexReadable — cancellation", () => {
     expect(fired).toBe(0);
   });
 });
+
+/**
+ * The engine's provenance stamper, verified against the REAL ports rather than a stub.
+ *
+ * The unit tests in inbox.test.ts prove `add()` merges a stamp; what they cannot prove is that the
+ * ENGINE hands it the right predicates. That wiring is the actual risk — a stamper that always
+ * reports "connected" is worse than no provenance, because it would exonerate exactly the case it
+ * exists to catch.
+ *
+ * NOTE on reachability: a conflict normally REQUIRES the remote side to be known, so detection
+ * usually happens while connected. The genuinely diagnostic field for the incidents seen so far is
+ * `indexSynced` — a device acting on an index it had not yet received. Both are asserted here.
+ */
+describe("SyncEngine — inbox provenance wiring", () => {
+  const NOTE4 = p("notes/prov.md");
+
+  it("stamps the real device id, a timestamp, and connected=true while online", async () => {
+    const a = makeEngine(new InProcessBus(), newDurable(true), "device-a", "relay-R");
+    open.push(a.engine);
+    await a.engine.start();
+
+    a.engine.inbox.add({ id: "prov-1", kind: "conflict", path: NOTE4 });
+
+    const e = a.engine.inbox.list()[0];
+    expect(e?.byDeviceId).toBe("device-a");
+    expect(typeof e?.at).toBe("number");
+    expect(e?.connected).toBe(true);
+    expect(e?.indexSynced).toBe(true);
+  });
+
+  /** The exculpatory case: this device could NOT see other devices when it decided. */
+  it("stamps connected=false when the transport is down at detection", async () => {
+    const a = makeEngine(new InProcessBus(), newDurable(true), "device-a", "relay-R");
+    open.push(a.engine);
+    await a.engine.start();
+
+    a.transport.goOffline();
+    a.engine.inbox.add({ id: "prov-2", kind: "conflict", path: NOTE4 });
+
+    expect(a.engine.inbox.list()[0]?.connected).toBe(false);
+  });
+});

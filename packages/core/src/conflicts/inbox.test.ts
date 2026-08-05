@@ -96,3 +96,59 @@ describe("Inbox (synced over a CrdtMap<InboxEntry>, per-entry LWW)", () => {
     });
   });
 });
+
+/**
+ * PROVENANCE. A conflict that cannot say when it formed, on which device, or whether that device
+ * was even online and caught up at the time is close to undiagnosable.
+ *
+ * Reading a real vault's inbox proved the point: 288 entries, and answering "which device made
+ * these, and when" took an hour of reverse-engineering millisecond timestamps out of generated
+ * FILENAMES. Every one of those questions is answerable at the moment of creation, for free.
+ *
+ * Stamped in `add()` rather than at the ~7 call sites deliberately: a conflict must not be able to
+ * exist WITHOUT provenance, and the one that slips through is exactly the one you will need.
+ */
+describe("Inbox — provenance stamping", () => {
+  const stamp = () => ({
+    at: 1_700_000_000_000,
+    byDeviceId: "dev-a",
+    byDeviceName: "tab-s8",
+    connected: false,
+    indexSynced: true,
+  });
+
+  it("stamps when, which device, and the connectivity at detection", () => {
+    const inbox = new Inbox(new FakeCrdtMap<InboxEntry>(), stamp);
+    inbox.add(entry());
+
+    const [e] = inbox.list();
+    expect(e?.at).toBe(1_700_000_000_000);
+    expect(e?.byDeviceId).toBe("dev-a");
+    expect(e?.byDeviceName).toBe("tab-s8");
+    expect(e?.connected).toBe(false);
+    expect(e?.indexSynced).toBe(true);
+  });
+
+  /** The distinguishing question: was this a legitimate divergence, or did we conflict against
+   *  state we simply had not received yet? */
+  it("records connected=false, which is what separates a real divergence from a stale base", () => {
+    const inbox = new Inbox(new FakeCrdtMap<InboxEntry>(), stamp);
+    inbox.add(entry());
+    expect(inbox.list()[0]?.connected).toBe(false);
+  });
+
+  it("never overwrites a field the caller set explicitly", () => {
+    const inbox = new Inbox(new FakeCrdtMap<InboxEntry>(), stamp);
+    inbox.add(entry({ at: 42, byDeviceId: "explicit" }));
+
+    const [e] = inbox.list();
+    expect(e?.at).toBe(42);
+    expect(e?.byDeviceId).toBe("explicit");
+  });
+
+  it("works without a stamper, so existing callers stay valid", () => {
+    const inbox = new Inbox(new FakeCrdtMap<InboxEntry>());
+    inbox.add(entry());
+    expect(inbox.list()[0]?.at).toBeUndefined();
+  });
+});

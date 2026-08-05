@@ -28,6 +28,37 @@ export interface InboxEntry {
   remoteSha?: Sha256;
   localSize?: number;
   remoteSize?: number;
+
+  // ── PROVENANCE (stamped in Inbox.add; see InboxProvenance) ──────────────────────────────────
+  /** ms epoch at which this entry was created. */
+  at?: number;
+  /** The device that DETECTED this — conflicts are detected locally, then synced to everyone. */
+  byDeviceId?: string;
+  byDeviceName?: string;
+  /** Was that device's transport connected at detection? */
+  connected?: boolean;
+  /** Had the shared index actually synced at detection, or were we deciding against a stale view? */
+  indexSynced?: boolean;
+}
+
+/**
+ * Context captured at the moment an entry is created.
+ *
+ * WHY: the inbox is SYNCED, so an entry created on one device shows up on all of them. Without
+ * this, "conflicts on my phone" is indistinguishable from "conflicts my desktop made, displayed on
+ * my phone" — a distinction that took an hour of reverse-engineering timestamps out of generated
+ * filenames to establish on a real vault.
+ *
+ * `connected` and `indexSynced` are the load-bearing pair: they separate a LEGITIMATE divergence
+ * (two devices genuinely edited the same base) from conflicting against state we had simply not
+ * received yet.
+ */
+export interface InboxProvenance {
+  at: number;
+  byDeviceId: string;
+  byDeviceName?: string;
+  connected?: boolean;
+  indexSynced?: boolean;
 }
 
 /**
@@ -38,11 +69,32 @@ export interface InboxEntry {
  * single-replica `FakeCrdtMap` cannot prove convergence).
  */
 export class Inbox {
-  constructor(private readonly map: CrdtMap<InboxEntry>) {}
+  constructor(
+    private readonly map: CrdtMap<InboxEntry>,
+    /** Supplies {@link InboxProvenance} at creation time. Optional so existing callers stay valid. */
+    private readonly stamp?: () => InboxProvenance,
+  ) {}
 
-  /** Add (or LWW-replace) an entry. `entry.id` being deterministic keeps it idempotent. */
+  /**
+   * Add (or LWW-replace) an entry. `entry.id` being deterministic keeps it idempotent.
+   *
+   * Provenance is stamped HERE rather than at the ~7 call sites, so an entry cannot be created
+   * without it. Explicit caller-set fields always win — the stamp only fills what is missing.
+   */
   add(entry: InboxEntry): void {
-    this.map.set(entry.id, entry);
+    const p = this.stamp?.();
+    const stamped: InboxEntry =
+      p === undefined
+        ? entry
+        : {
+            at: p.at,
+            byDeviceId: p.byDeviceId,
+            ...(p.byDeviceName !== undefined ? { byDeviceName: p.byDeviceName } : {}),
+            ...(p.connected !== undefined ? { connected: p.connected } : {}),
+            ...(p.indexSynced !== undefined ? { indexSynced: p.indexSynced } : {}),
+            ...entry, // caller-set fields win
+          };
+    this.map.set(entry.id, stamped);
   }
 
   /** Live entries: everything minus tombstones (`deleted !== true`). */

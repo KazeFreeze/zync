@@ -4,6 +4,7 @@ import { stuckCopy, TAG_NEVER_ARRIVED } from "./stuck-copy.js";
 import {
   SyncEngine,
   describeInboxEntry,
+  provenanceLine,
   ArtifactNotLocalError,
   type EntryAction,
   type EntryView,
@@ -256,6 +257,13 @@ export class ConflictInboxModal extends Modal {
     name.title = entry.path;
 
     const act = main.createDiv({ cls: "zync-row-act" });
+
+    // WHERE it came from, before WHAT to do about it. The inbox is shared across devices, so
+    // "which device detected this, and could it see the others at the time" is often the whole
+    // answer — especially for a conflict formed while that device was offline.
+    const prov = provenanceLine(entry);
+    if (prov !== null) row.createDiv({ cls: "zync-row-prov", text: prov });
+
     const sub = row.createDiv({ cls: "zync-row-sub" });
 
     if (isContentConflict(view)) {
