@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.0](https://github.com/KazeFreeze/zync/compare/zync-v0.10.0...zync-v0.11.0) (2026-08-05)
+
+
+### Features
+
+* **server:** log disconnects and expose live connections + reconnect storms ([a0bbe98](https://github.com/KazeFreeze/zync/commit/a0bbe98e49044c5c4e40a35295c514d55213bf33))
+
 ## [0.10.0](https://github.com/KazeFreeze/zync/compare/zync-v0.9.6...zync-v0.10.0) (2026-08-05)
 
 
