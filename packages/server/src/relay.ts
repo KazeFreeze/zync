@@ -18,6 +18,7 @@
 import { Hocuspocus } from "@hocuspocus/server";
 import { Logger } from "@hocuspocus/extension-logger";
 import { SnapshotStore, makeSnapshotHooks } from "./snapshot.js";
+import { ConnectionTracker } from "./connection-tracker.js";
 
 export interface RelayConfig {
   /** WebSocket listen port. */
@@ -34,6 +35,13 @@ export interface RelayConfig {
 
 export interface RelayHandle {
   hocuspocus: Hocuspocus;
+  /**
+   * Live connection state and reconnect-storm detection. Exposed so the admin console can answer
+   * "is that device actually connected right now?" from the SERVER side — independently of whether
+   * the device's own UI is telling the truth, which is exactly the case that matters when a phone
+   * looks fine but keeps dropping its socket.
+   */
+  connections: ConnectionTracker;
   /** Gracefully shut down the relay (closes WS server + all connections). */
   close(): Promise<void>;
 }
@@ -66,6 +74,11 @@ export function authDecision(
 export function createRelay(config: RelayConfig): RelayHandle {
   const store = new SnapshotStore(config.snapshotDir);
   const hooks = makeSnapshotHooks(store);
+  const connections = new ConnectionTracker();
+  // One socket serves one document connection, but key on both so a client holding several docs is
+  // tracked per connection rather than collapsing into one session.
+  const sessionKey = (socketId: string, documentName: string): string =>
+    `${socketId}:${documentName}`;
 
   const hocuspocus = new Hocuspocus({
     port: config.port,
@@ -80,14 +93,31 @@ export function createRelay(config: RelayConfig): RelayHandle {
 
     // Auth is per-device tokens (see token-registry.ts). Transport encryption is
     // provided by the deployment (Tailscale/WireGuard); see deploy/.
-    async onAuthenticate({ token, documentName }) {
+    async onAuthenticate({ token, documentName, socketId }) {
       const ctx = authDecision(token, {
         ...(config.verifyToken !== undefined ? { verifyToken: config.verifyToken } : {}),
         ...(config.token !== undefined ? { staticToken: config.token } : {}),
         ...(config.getDevice !== undefined ? { getDevice: config.getDevice } : {}),
       });
-      console.log(`[zync-relay] authed ${ctx.user} for doc: ${documentName}`);
+      connections.connect(sessionKey(socketId, documentName), ctx.user, documentName);
+      console.log(`[zync-relay] +conn ${ctx.user} ${documentName}`);
       return ctx;
+    },
+
+    // Disconnect logging with SESSION DURATION. Without it a reconnect storm - a socket that opens
+    // and closes every few seconds, so the initial sync never completes - was invisible unless
+    // someone happened to be reading the log live. A device that cannot hold a connection edits
+    // against state it has not received, which reaches the user as CONFLICTS rather than as a
+    // connectivity fault, so this is what tells those two apart.
+    onDisconnect({ documentName, socketId, context }) {
+      connections.disconnect(sessionKey(socketId, documentName));
+      const last = connections.recent().at(-1);
+      const ms = last?.kind === "disconnect" ? last.sessionMs : undefined;
+      const who = (context as { user?: string } | undefined)?.user ?? last?.device ?? "unknown";
+      console.log(
+        `[zync-relay] -conn ${who} ${documentName}${ms === undefined ? "" : ` (${String(Math.round(ms / 1000))}s)`}`,
+      );
+      return Promise.resolve();
     },
 
     // Snapshot persistence — content-blind: bytes in, bytes out.
@@ -102,6 +132,7 @@ export function createRelay(config: RelayConfig): RelayHandle {
 
   return {
     hocuspocus,
+    connections,
     async close() {
       await hocuspocus.destroy();
     },

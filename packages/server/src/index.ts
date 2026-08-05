@@ -102,6 +102,8 @@ export async function createServer(config: ServerConfig): Promise<ServerHandle> 
         blobBackend: config.blobBackend,
         snapshotDir: config.snapshotDir,
         startedAt: Date.now(),
+        // Live per-device connection state + reconnect-storm detection, straight from the relay.
+        connections: relay.connections,
       });
       const adminHandler = createAdminHandler({
         registry,

@@ -17,7 +17,18 @@ On-box state lives in two volumes: `zync-snapshots` → `/data/snapshots` (CRDT 
 ## Prerequisites
 
 - Dokploy running on the host; Tailscale up on the host (note its tailnet IP, e.g. `100.81.186.62`, and MagicDNS `.ts.net` name).
-- The `KazeFreeze/zync` repo reachable by the Dokploy GitHub App (`dokploy-bernardtapiru`), with `deploy/dokploy-compose.yml` present on the deployed branch (`main`).
+- A **separate deploy repo** reachable by the Dokploy GitHub App (`dokploy-bernardtapiru`), holding `dokploy-compose.yml` on the deployed branch (`main`). Dokploy is wired to that repo, NOT to `KazeFreeze/zync`, and the compose PULLS the prebuilt image rather than building from source.
+
+### How a server change actually reaches production
+
+Dokploy never builds this repo. The image is published by `.github/workflows/release.yml`, whose `docker` job runs **only when a release is created** (`release_created == 'true'`), not on every push to `main`. So a server change takes four steps:
+
+1. Publish the server code to `origin/main`.
+2. Merge the release-please PR — this is what creates the release.
+3. That release triggers the docker job, which pushes `ghcr.io/kazefreeze/zync-server:v<version>` and `:latest`.
+4. Redeploy the Dokploy compose so it pulls the new `latest`.
+
+Skipping step 2 is the trap: the code is on `main`, the deploy "succeeds", and the server keeps running the previous image. Verify against the admin console (`GET /api/status`) rather than assuming the roll happened. Step 4 restarts the relay, so every device briefly drops and reconnects; snapshots live on a volume, so no state is lost.
 - A Backblaze B2 account.
 
 ## Environment variables (set in Dokploy → the compose's Environment)

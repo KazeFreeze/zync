@@ -44,6 +44,17 @@ export interface AdminStatus {
   blobStoreOk: boolean;
   /** Number of *.bin snapshot files in the configured snapshot directory. */
   snapshotCount: number;
+  /**
+   * Devices connected RIGHT NOW, per document. Answers "is that device actually connected?" from
+   * the server side, independently of whether the device's own UI is telling the truth.
+   */
+  liveConnections?: { device: string; doc: string; since: number }[];
+  /**
+   * Devices reconnecting pathologically often. A device that cannot hold a connection long enough
+   * to finish syncing will edit against state it never received, and that reaches the user as
+   * CONFLICTS rather than as a connectivity fault — so this is the signal that tells them apart.
+   */
+  reconnectStorms?: { device: string; doc: string; count: number }[];
 }
 
 /**
@@ -278,6 +289,11 @@ export function buildStatusProvider(opts: {
   snapshotDir: string;
   startedAt: number;
   now?: () => number;
+  /** Optional so existing callers (and tests) stay valid; absent ⇒ the fields are simply omitted. */
+  connections?: {
+    live(): { device: string; doc: string; since: number }[];
+    storms(): { device: string; doc: string; count: number }[];
+  };
 }): AdminStatusProvider {
   const now = opts.now ?? (() => Date.now());
 
@@ -301,6 +317,12 @@ export function buildStatusProvider(opts: {
     }
 
     return {
+      ...(opts.connections !== undefined
+        ? {
+            liveConnections: opts.connections.live(),
+            reconnectStorms: opts.connections.storms(),
+          }
+        : {}),
       uptimeSec: Math.max(0, Math.floor((now() - opts.startedAt) / 1000)),
       deviceCount: opts.registry.deviceCount,
       blobStoreOk,
