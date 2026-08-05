@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.4](https://github.com/KazeFreeze/zync/compare/zync-v0.9.3...zync-v0.9.4) (2026-08-05)
+
+
+### Bug Fixes
+
+* **plugin:** stop the settings tab flickering while the engine starts ([e5ae0b9](https://github.com/KazeFreeze/zync/commit/e5ae0b99f233a9c7c897c637fc312ad37a928724))
+
 ## [0.9.3](https://github.com/KazeFreeze/zync/compare/zync-v0.9.2...zync-v0.9.3) (2026-08-04)
 
 
