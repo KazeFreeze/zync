@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.1](https://github.com/KazeFreeze/zync/compare/zync-v0.12.0...zync-v0.12.1) (2026-08-05)
+
+
+### Bug Fixes
+
+* **ci:** publish a version tag for the server image, and fail loudly if we cannot ([2cb72e9](https://github.com/KazeFreeze/zync/commit/2cb72e9abb9fb3caf5318461d3dcfbf3da6985e2))
+
 ## [0.12.0](https://github.com/KazeFreeze/zync/compare/zync-v0.11.0...zync-v0.12.0) (2026-08-05)
 
 
