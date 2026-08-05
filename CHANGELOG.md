@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/KazeFreeze/zync/compare/zync-v0.11.0...zync-v0.12.0) (2026-08-05)
+
+
+### Features
+
+* **plugin:** warn on mobile when the socket is back but the index is not ([edb2b40](https://github.com/KazeFreeze/zync/commit/edb2b40c71c186c37264104b1bd09e2a27cbfa06))
+
 ## [0.11.0](https://github.com/KazeFreeze/zync/compare/zync-v0.10.0...zync-v0.11.0) (2026-08-05)
 
 
