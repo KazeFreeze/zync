@@ -18,6 +18,7 @@ import type {
   VaultEvent,
   VaultPath,
   ConfigPort,
+  IndexSnapshotRecord,
 } from "./ports.js";
 import { INDEX_DOC_ID } from "./ports.js";
 import { ConfigChannel } from "./config/config-channel.js";
@@ -167,6 +168,11 @@ export interface EngineConfig {
    */
   indexSyncStartBudgetMs?: number;
   /**
+   * Max ms a reconnected session may report "not caught up" before {@link SyncEngine.isIndexCaughtUp}
+   * re-arms itself. Default {@link DEFAULT_INDEX_CAUGHT_UP_FALLBACK_MS}. Tests inject a small value.
+   */
+  indexCaughtUpFallbackMs?: number;
+  /**
    * Identifies the vault/relay this device syncs with, used to bind the persisted index snapshot
    * ({@link IndexSnapshotRecord}). OMITTED ⇒ the index is NOT persisted and every start begins
    * empty, exactly as before. Fail-safe by design: without a way to prove a snapshot belongs to
@@ -299,10 +305,25 @@ export const SELFHEAL_MAX_PASSES = 50;
 export const DEFAULT_RECONNECT_HEAL_JITTER_MAX_MS = 15_000;
 /** Default {@link EngineConfig.indexSyncStartBudgetMs} — long enough a healthy link always wins. */
 export const DEFAULT_INDEX_SYNC_START_BUDGET_MS = 10_000;
+/**
+ * How long a reconnected session may report "not caught up" before it re-arms on its own.
+ *
+ * A quiet vault completes its state-vector exchange and sends NOTHING back, so "no update has
+ * arrived" cannot be distinguished from "the exchange has not happened yet". Without this ceiling
+ * {@link SyncEngine.isIndexCaughtUp} would stay false for the rest of the session on an idle vault
+ * and any UI gated on it would stick on screen permanently — a worse version of the flicker the
+ * catch-up notice's grace period exists to prevent. A measured healthy catch-up is ~2.5s, so this
+ * only fires when something is genuinely slow.
+ */
+export const DEFAULT_INDEX_CAUGHT_UP_FALLBACK_MS = 5_000;
 /** Trailing debounce before persisting the index doc after an update. */
 export const INDEX_PERSIST_DEBOUNCE_MS = 2_000;
 /** Max time an index persist may be deferred by a continuous update storm (first sync). */
 export const INDEX_PERSIST_MAX_WAIT_MS = 20_000;
+/** A snapshot this large is established state; a later near-empty encoding must not replace it. */
+const INDEX_SNAPSHOT_SUBSTANTIAL_BYTES = 128;
+const INDEX_SNAPSHOT_MIN_BYTES = 64;
+const INDEX_SNAPSHOT_MIN_RETAINED_RATIO = 0.25;
 
 /** A pending debounced bump: its settle promise is tracked by {@link SyncEngine.whenIdle}. */
 interface PendingBump {
@@ -336,6 +357,9 @@ export class SyncEngine {
 
   // ── shared loop-breaker + per-note base store ───────────────────────────
   readonly echo = new EchoLedger();
+  /** Serializes lifecycle transitions so a queued restart cannot overlap teardown. */
+  private lifecycleTail: Promise<void> = Promise.resolve();
+  private lifecycleState: "stopped" | "starting" | "running" | "stopping" = "stopped";
   /**
    * Local rename TRANSACTION (0b-3, GPT-5.5 root cause): quarantines the ASYNC,
    * possibly-REORDERED watcher `delete`/`modify` fallout (incl. a `delete(new)`) a real
@@ -415,6 +439,15 @@ export class SyncEngine {
   private readonly pluginDataMatCbs = new Set<(id: string) => void>();
   /** H3-v2: callbacks notified (with the path) when ConfigChannel's loop-breaker trips. */
   private readonly configLoopCbs = new Set<(path: VaultPath) => void>();
+  /**
+   * Callbacks notified when projecting the enabled set to `community-plugins.json` fails.
+   *
+   * That file is the RESTART FLOOR: when the live enable/disable API is unavailable or refuses,
+   * writing it is the only thing that still makes a synced toggle take effect on next launch. A
+   * failure here used to vanish into a fire-and-forget `void project()`, so the toggle read as
+   * applied while neither path had landed. A dropped write must be reportable.
+   */
+  private readonly pluginProjectionErrorCbs = new Set<(err: unknown) => void>();
 
   // ── subscriptions to unwind on stop() ───────────────────────────────────
   private vaultUnsub: Unsubscribe | null = null;
@@ -434,6 +467,12 @@ export class SyncEngine {
    * needs a fresh full pass to re-push offline-accumulated dirty docs).
    */
   private startupDone = false;
+  /** Prevent delayed first-seen seeding from overlapping startup's full convergence pass. */
+  private initialConvergenceDone = false;
+  /** Coalesces Android-resume and reconnect catch-up requests into one active-bound-safe pass. */
+  private resumeCatchUpRequested = false;
+  private resumeCatchUpInFlight: Promise<void> | null = null;
+  private manualReverifyInFlight: Promise<void> | null = null;
 
   // ── per-note bookkeeping ────────────────────────────────────────────────
   private readonly attached = new Map<DocId, CrdtDoc>();
@@ -683,6 +722,28 @@ export class SyncEngine {
    * See {@link isIndexSynced} — `start()` can complete WITHOUT this when the sync budget expires.
    */
   private indexSyncedOnce = false;
+  /** True only when the reachable first-index await exhausted its startup budget this session. */
+  private firstIndexSyncTimedOut = false;
+  /** New disk paths held back until a slow first handshake proves whether the relay owns them. */
+  private readonly deferredFirstSeenSeedPaths = new Set<VaultPath>();
+  /**
+   * True when the shared index is believed CURRENT with the relay *right now*.
+   *
+   * Unlike {@link indexSyncedOnce}, this CLEARS on disconnect and re-arms on reconnect. That
+   * distinction is the whole reason it exists: Android 14+ freezes a backgrounded app, and on
+   * resume the socket returns before the index does. An edit made in that window diverges against
+   * state this device never received, which surfaces as a conflict that blames the merge for what
+   * is really a connectivity artifact. The mobile catch-up notice was built for exactly that
+   * window but gated on the session latch, so after the first sync of a session it could never
+   * fire again — it could not warn about the one situation it exists for.
+   *
+   * NOT a readability signal. Index-backed maps stay safe to READ while stale, because a hydrated
+   * map is genuine local truth; use {@link isIndexHydrated} / {@link isIndexReadable} for that.
+   * This answers only "could the relay be ahead of me?".
+   */
+  private indexCaughtUp = false;
+  /** Re-arm timer for {@link indexCaughtUp}; see DEFAULT_INDEX_CAUGHT_UP_FALLBACK_MS. */
+  private indexCaughtUpTimer: ReturnType<typeof setTimeout> | null = null;
   /** True when this session started from a locally persisted index snapshot. */
   private indexHydratedFromSnapshot = false;
   /**
@@ -702,8 +763,14 @@ export class SyncEngine {
   /** Index-persist bookkeeping — see {@link scheduleIndexPersist}. */
   private indexPersistTimer: ReturnType<typeof setTimeout> | null = null;
   private indexPersistMaxTimer: ReturnType<typeof setTimeout> | null = null;
-  private indexPersistInFlight = false;
+  private indexPersistInFlight: Promise<void> | null = null;
   private indexPersistAgain = false;
+  private largestIndexSnapshotBytes = 0;
+  private indexPersistFailure: unknown = null;
+  private readonly indexPersistence: {
+    get(): Promise<IndexSnapshotRecord | null>;
+    set(rec: IndexSnapshotRecord): Promise<void>;
+  } | null;
 
   /**
    * The docIds the self-heal GAVE UP on for the current episode — the "needs attention" set behind
@@ -779,15 +846,88 @@ export class SyncEngine {
     this.renameWindowMs = config.renameWindowMs ?? DEFAULT_RENAME_WINDOW_MS;
     this.renameWindowCapMs = config.renameWindowCapMs ?? DEFAULT_RENAME_WINDOW_CAP_MS;
     this.base = new BaseStore(ports.vault, config.configDir);
+    if (config.indexIdentity !== undefined) {
+      const state = ports.engineState;
+      const get = state.getIndexSnapshot?.bind(state);
+      const set = state.setIndexSnapshot?.bind(state);
+      if (get === undefined || set === undefined) {
+        throw new Error(
+          "indexIdentity requires engineState.getIndexSnapshot and setIndexSnapshot persistence",
+        );
+      }
+      this.indexPersistence = { get, set };
+    } else {
+      this.indexPersistence = null;
+    }
   }
 
   // ──────────────────────────────────────────────────────────────────────────
   // start / stop
   // ──────────────────────────────────────────────────────────────────────────
 
-  async start(): Promise<void> {
+  start(): Promise<void> {
+    return this.enqueueLifecycle("start");
+  }
+
+  stop(): Promise<void> {
+    return this.enqueueLifecycle("stop");
+  }
+
+  /** Queue lifecycle work without poisoning later transitions when an earlier one rejects. */
+  private enqueueLifecycle(action: "start" | "stop"): Promise<void> {
+    const run = this.lifecycleTail.then(async () => {
+      if (action === "start") {
+        if (this.lifecycleState === "running") return;
+        this.lifecycleState = "starting";
+        try {
+          await this.startNow();
+          this.lifecycleState = "running";
+        } catch (error) {
+          // A start that threw PART-WAY has usually already armed timers, subscriptions and the
+          // index attachment. Jumping straight to "stopped" makes the caller's stop() an early
+          // return, so nothing is ever torn down: the blob-queue interval, the index-persist
+          // timers and the config retry timer keep firing on a dead engine. The plugin's failure
+          // path builds a NEW engine on retry, so the abandoned one is never reclaimed.
+          //
+          // stopNow() is safe on a partial start — every unsubscribe defaults to a no-op and the
+          // final checkpoint returns early without an index doc. Any secondary failure is
+          // swallowed so it cannot mask WHY start() failed, which is what the caller needs.
+          this.lifecycleState = "stopping";
+          try {
+            await this.stopNow();
+          } catch {
+            // Teardown is best-effort here; the original start failure is the real signal.
+          }
+          this.lifecycleState = "stopped";
+          throw error;
+        }
+        return;
+      }
+
+      if (this.lifecycleState === "stopped") return;
+      this.lifecycleState = "stopping";
+      try {
+        await this.stopNow();
+      } finally {
+        this.lifecycleState = "stopped";
+      }
+    });
+    this.lifecycleTail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async startNow(): Promise<void> {
     const { crdt, transport, identity } = this.ports;
     const deviceId = identity.deviceId();
+    this.startupDone = false;
+    this.initialConvergenceDone = false;
+    this.resumeCatchUpRequested = false;
+    this.resumeCatchUpInFlight = null;
+    this.firstIndexSyncTimedOut = false;
+    this.deferredFirstSeenSeedPaths.clear();
 
     // 1. Index doc — ALWAYS attached. Its tree/inbox/blobs maps relay over the transport.
     //
@@ -846,9 +986,11 @@ export class SyncEngine {
     void this.indexAttached.synced().then(
       () => {
         this.indexSyncedOnce = true;
+        this.markIndexCaughtUp(); // first handshake: we are current by definition
         // Punctuation save: the freshest full state we will ever hold this session.
         this.clearIndexPersistTimers();
         this.persistIndexNow();
+        this.scheduleDeferredFirstSeenSeeds();
       },
       () => undefined, // close/detach — leave the latch false; a later attach re-arms it
     );
@@ -862,7 +1004,10 @@ export class SyncEngine {
       // start) still propagates out of awaitWithinBudget and aborts start(), as before.
       const budget = this.config.indexSyncStartBudgetMs ?? DEFAULT_INDEX_SYNC_START_BUDGET_MS;
       const synced = await awaitWithinBudget(this.indexAttached.synced(), budget);
-      if (!synced) this.swallowOfflineSynced(this.indexAttached);
+      if (!synced) {
+        this.firstIndexSyncTimedOut = true;
+        this.swallowOfflineSynced(this.indexAttached);
+      }
     } else {
       // OFFLINE/UNAUTHORIZED: we deliberately do NOT await synced() (it stays PENDING
       // during a partition). Reconnect auto-resyncs via index-observe.
@@ -892,6 +1037,9 @@ export class SyncEngine {
         port: this.ports.communityPlugins,
         isMobile: this.caps.isMobile,
         suppress: () => this.localSuppress,
+        onProjectionError: (err) => {
+          for (const cb of this.pluginProjectionErrorCbs) cb(err);
+        },
       });
       this.enabledUnsub = this.pluginEnabledChannel.start();
     }
@@ -934,6 +1082,9 @@ export class SyncEngine {
         onLoopDetected: (path) => {
           for (const cb of this.configLoopCbs) cb(path);
         },
+        onChangeFailure: (paths) => {
+          this.surfaceConfigFailures(paths);
+        },
       });
       this.configUnsub = this.configChannel.start();
       await this.configChannel.bootstrap();
@@ -973,6 +1124,10 @@ export class SyncEngine {
       retryTickMs: this.config.blobRetryTickMs ?? DEFAULT_BLOB_RETRY_TICK_MS,
       onBlobFailure: (paths) => {
         this.surfaceBlobFailures(paths);
+      },
+      onRetryTick: async () => {
+        await this.configChannel?.retryPendingUploads();
+        this.configChannel?.retryPendingChanges();
       },
       ...(configPort !== undefined
         ? {
@@ -1158,11 +1313,15 @@ export class SyncEngine {
     // doc pending with no content change to re-trigger convergence. One full pass re-pushes what it
     // can; if anything remains pending, requestSelfHeal drives the active-bound-safe self-heal loop
     // (backoff-spaced, bounded) until it drains — so recovery is automatic, no manual trigger needed.
-    this.track(
-      this.runFullConvergencePass().then(async () => {
-        if ((await this.durablePendingDocs()).length > 0) this.requestSelfHeal();
-      }),
-    );
+    const initialConvergence = this.runFullConvergencePass().then(async () => {
+      if ((await this.durablePendingDocs()).length > 0) this.requestSelfHeal(false);
+    });
+    this.track(initialConvergence);
+    const finishInitialConvergence = () => {
+      this.initialConvergenceDone = true;
+      this.scheduleDeferredFirstSeenSeeds();
+    };
+    void initialConvergence.then(finishInitialConvergence, finishInitialConvergence);
 
     // 10. F1 reconnect-backstop: subscribe to transport status changes and fire a
     //     reconnect catch-up on every genuine offline→connected RECONNECT (not the
@@ -1197,63 +1356,39 @@ export class SyncEngine {
     this.transportUnsub = transport.onStatus((s) => {
       if (s === "offline" || s === "unauthorized") {
         sawOfflineSinceConnected = true;
+        // The relay can move while we are away, so we are no longer current. Cleared HERE rather
+        // than on reconnect so the gap is reported from the moment it opens.
+        this.indexCaughtUp = false;
+        this.clearIndexCaughtUpTimer();
         return;
+      }
+      if (s === "connected" && !this.indexCaughtUp && this.indexCaughtUpTimer === null) {
+        // Self-re-arm ceiling. The authoritative re-arm is the catch-up completion below, but that
+        // path only runs behind `sawOfflineSinceConnected`; if the socket never emitted a clean
+        // offline edge this is what stops the flag latching false for the rest of the session.
+        this.indexCaughtUpTimer = setTimeout(() => {
+          this.indexCaughtUpTimer = null;
+          this.indexCaughtUp = true;
+        }, this.config.indexCaughtUpFallbackMs ?? DEFAULT_INDEX_CAUGHT_UP_FALLBACK_MS);
       }
       if (s === "connected" && sawOfflineSinceConnected && this.startupDone) {
         // Genuine RECONNECT (offline -> [connecting] -> connected, after startup). Re-push
         // all dirty docs via catch-up. EMPTY openDocIds: open docs are handled by CRDT
         // transport resync; including them would falsely advance their synced stamp (see
         // ACTIVE-BOUND SAFETY). Clear the latch so a later spurious "connected" does not re-fire.
-        //
-        // CATCH-UP-ONLY BY DESIGN: this does NOT run the full structural/settle/orphan chain (a
-        // full pass would force-select active-bound docs and false-latch them). It re-pushes the
-        // dirty content; a tombstone/rename that arrived during the partition is applied by the
-        // next index-observe scoped pass (the index auto-resyncs on reconnect) or, worst case, the
-        // S6c audit — bounded staleness, NOT loss.
         sawOfflineSinceConnected = false;
-        // F2 AUTO-HEAL (reconnect), pending-gated. After the reconnect catch-up settles, if pending is
-        // STILL non-empty (device-side synced-stamp loss the change-driven loop can't re-trigger), arm
-        // the FLAP-SAFE self-heal. The gate means ordinary reconnects (nothing pending after catch-up)
-        // never arm the self-heal or run the orphan sweep — zero behavior change on the common path.
-        // Uses armSelfHealOnReconnect (NOT requestSelfHeal) so a flapping network can't un-bound a
-        // running episode. The catch-up + pending-gate are tracked; a jitter-DELAYED arm is
-        // FIRE-AND-FORGET (via reconnectHealTimer) so whenIdle()/waitConverged() never block on the
-        // per-device stagger delay — the self-heal's own reconcile work is tracked when the arm fires.
-        this.track(
-          (async () => {
-            await this.lazyAttach.runCatchUp(new Set());
-            if ((await this.durablePendingDocs()).length === 0) return; // pending-gate
-            const jitter = reconnectHealJitterMs(
-              this.ports.identity.deviceId(),
-              this.config.reconnectHealJitterMaxMs ?? DEFAULT_RECONNECT_HEAL_JITTER_MAX_MS,
-            );
-            if (jitter === 0) {
-              this.armSelfHealOnReconnect(); // immediate; the reconcile it schedules is tracked
-              return;
-            }
-            // jitter > 0: schedule the arm fire-and-forget so convergence-waits don't block on the
-            // stagger. Clear any prior pending jitter timer (rapid re-reconnect) so it can't leak.
-            if (this.reconnectHealTimer !== null) clearTimeout(this.reconnectHealTimer);
-            this.reconnectHealTimer = setTimeout(() => {
-              this.reconnectHealTimer = null;
-              this.armSelfHealOnReconnect();
-            }, jitter);
-          })(),
-        );
+        this.requestResumeCatchUp();
+      }
+      if (s === "connected") {
+        if (this.resumeCatchUpRequested) this.startResumeCatchUp();
+        this.track(this.blobEngine.retryPendingUploads());
       }
     });
   }
 
-  async stop(): Promise<void> {
-    // Settle anything still in flight so stop() leaves no open work.
-    await this.whenIdle();
-
-    // Punctuation save (BEST-EFFORT ONLY): a clean stop is the ideal moment to checkpoint, but
-    // Obsidian unload and Android process death frequently skip it — which is exactly why the
-    // debounced save above is the load-bearing one, not this.
-    this.clearIndexPersistTimers();
-    await this.persistIndexFinal();
-
+  private async stopNow(): Promise<void> {
+    // Close every external admission point before draining. Leaving even one watcher attached can
+    // keep adding tracked work under a sustained event stream, preventing restart/unload forever.
     this.indexPersistUnsub?.();
     this.indexPersistUnsub = null;
     this.vaultUnsub?.();
@@ -1266,14 +1401,45 @@ export class SyncEngine {
     this.transportUnsub = null;
     this.configUnsub();
     this.configUnsub = () => undefined;
+    this.enabledUnsub();
+    this.enabledUnsub = () => undefined;
+
+    // These timers are also sources of new work. Existing rename/bump work remains admitted and is
+    // intentionally drained below; only independent background wakeups are cancelled here.
+    if (this.auditQuiescenceTimer !== null) {
+      clearTimeout(this.auditQuiescenceTimer);
+      this.auditQuiescenceTimer = null;
+    }
+    if (this.auditStaleTimer !== null) {
+      clearTimeout(this.auditStaleTimer);
+      this.auditStaleTimer = null;
+    }
+    if (this.configReconcileTimer !== null) {
+      clearTimeout(this.configReconcileTimer);
+      this.configReconcileTimer = null;
+    }
+    this.disarmSelfHeal();
+    this.clearIndexCaughtUpTimer();
+    if (this.reconnectHealTimer !== null) {
+      clearTimeout(this.reconnectHealTimer);
+      this.reconnectHealTimer = null;
+    }
+
+    // Drain only work admitted before the lifecycle entered `stopping`.
+    await this.whenIdle();
+
+    // Punctuation save (BEST-EFFORT ONLY): a clean stop is the ideal moment to checkpoint, but
+    // Obsidian unload and Android process death frequently skip it — which is exactly why the
+    // debounced save above is the load-bearing one, not this.
+    this.clearIndexPersistTimers();
+    await this.persistIndexFinal();
+
     this.configChannel = undefined;
     this.pluginsOptIn = null;
     this.pluginsMeta = null;
     this.pluginsEnabled = null;
     this.pluginsSettingsSync = null;
     // Slice 2b: stop the community-plugins channel and clear localSuppress cache.
-    this.enabledUnsub();
-    this.enabledUnsub = () => undefined;
     this.ports.communityPlugins?.close();
     this.pluginEnabledChannel = null;
     this.localSuppress.clear();
@@ -1292,28 +1458,15 @@ export class SyncEngine {
     }
     this.pendingBumps.clear();
 
-    // S6c: clear audit timers so no dangling timer fires after stop().
-    if (this.auditQuiescenceTimer !== null) {
-      clearTimeout(this.auditQuiescenceTimer);
-      this.auditQuiescenceTimer = null;
-    }
-    if (this.auditStaleTimer !== null) {
-      clearTimeout(this.auditStaleTimer);
-      this.auditStaleTimer = null;
-    }
-
-    // CONFIG RECONCILE BACKSTOP: clear the settle-debounce so no dangling drift re-scan fires after stop().
-    if (this.configReconcileTimer !== null) {
-      clearTimeout(this.configReconcileTimer);
-      this.configReconcileTimer = null;
-    }
-
-    // F2: cancel + reset the self-heal so no dangling backoff timer fires after stop().
-    this.disarmSelfHeal();
-    if (this.reconnectHealTimer !== null) {
-      clearTimeout(this.reconnectHealTimer);
-      this.reconnectHealTimer = null;
-    }
+    // The audit / config-reconcile / self-heal / reconnect-heal timers were already cancelled at the
+    // top of stopNow(), BEFORE the drain — cancelling a source of new work after waiting for the
+    // work to stop arriving would be too late to help. Only the flags they leave behind are reset
+    // here, once nothing can set them again.
+    this.indexCaughtUp = false;
+    this.startupDone = false;
+    this.initialConvergenceDone = false;
+    this.resumeCatchUpRequested = false;
+    this.resumeCatchUpInFlight = null;
 
     // M3: clear the live-rename debounce timer so no dangling drain fires after stop() (whenIdle above
     // already force-drained the buffer; this only releases an armed-but-not-yet-fired timer).
@@ -1733,8 +1886,102 @@ export class SyncEngine {
     return this.indexHydratedFromSnapshot || this.indexSyncedOnce;
   }
 
+  /** Last index checkpoint failure, retained so a later best-effort teardown cannot hide it. */
+  indexPersistenceFailure(): unknown {
+    return this.indexPersistFailure;
+  }
+
   isIndexSynced(): boolean {
     return this.indexSyncedOnce;
+  }
+
+  /**
+   * True when the index is believed current with the relay NOW. Re-arms across reconnects, so a
+   * surface can distinguish "the socket is back but the index has not arrived" from "we reached
+   * the relay at some point this session" ({@link isIndexSynced}, which never clears).
+   *
+   * Use for WARNING about a stale read, never for deciding whether a read is safe at all.
+   */
+  isIndexCaughtUp(): boolean {
+    return this.indexCaughtUp;
+  }
+
+  /**
+   * Re-arm the catch-up used after Android/process resume even if no offline status edge fired.
+   * Repeated calls coalesce, and the pass deliberately excludes the structural/settle/orphan chain
+   * because that chain can false-latch active-bound documents.
+   */
+  resumeCatchUp(): void {
+    if (!this.startupDone || this.resumeCatchUpInFlight !== null) return;
+    this.indexCaughtUp = false;
+    this.clearIndexCaughtUpTimer();
+    this.requestResumeCatchUp();
+    if (this.ports.transport.status() === "connected") {
+      this.indexCaughtUpTimer = setTimeout(() => {
+        this.indexCaughtUpTimer = null;
+        this.indexCaughtUp = true;
+      }, this.config.indexCaughtUpFallbackMs ?? DEFAULT_INDEX_CAUGHT_UP_FALLBACK_MS);
+      this.startResumeCatchUp();
+      this.track(this.blobEngine.retryPendingUploads());
+    }
+  }
+
+  private requestResumeCatchUp(): void {
+    if (this.resumeCatchUpInFlight !== null) return;
+    this.resumeCatchUpRequested = true;
+    if (this.startupDone && this.ports.transport.status() === "connected") {
+      this.startResumeCatchUp();
+    }
+  }
+
+  private startResumeCatchUp(): void {
+    if (
+      !this.startupDone ||
+      !this.resumeCatchUpRequested ||
+      this.resumeCatchUpInFlight !== null ||
+      this.ports.transport.status() !== "connected"
+    )
+      return;
+    this.resumeCatchUpRequested = false;
+    // CATCH-UP-ONLY BY DESIGN: re-push dirty content, but never run the full structural/settle/
+    // orphan chain whose force-selection can false-latch active-bound docs.
+    const pass = (async () => {
+      await this.lazyAttach.runCatchUp(new Set());
+      this.markIndexCaughtUp(); // same authoritative re-arm as a clean reconnect
+      if ((await this.durablePendingDocs()).length === 0) return;
+      const jitter = reconnectHealJitterMs(
+        this.ports.identity.deviceId(),
+        this.config.reconnectHealJitterMaxMs ?? DEFAULT_RECONNECT_HEAL_JITTER_MAX_MS,
+      );
+      if (jitter === 0) {
+        this.armSelfHealOnReconnect();
+        return;
+      }
+      if (this.reconnectHealTimer !== null) clearTimeout(this.reconnectHealTimer);
+      this.reconnectHealTimer = setTimeout(() => {
+        this.reconnectHealTimer = null;
+        this.armSelfHealOnReconnect();
+      }, jitter);
+    })();
+    this.resumeCatchUpInFlight = pass;
+    this.track(pass);
+    const clear = () => {
+      if (this.resumeCatchUpInFlight === pass) this.resumeCatchUpInFlight = null;
+    };
+    void pass.then(clear, clear);
+  }
+
+  /** Mark the index current and drop any pending self-re-arm. */
+  private markIndexCaughtUp(): void {
+    this.clearIndexCaughtUpTimer();
+    this.indexCaughtUp = true;
+  }
+
+  private clearIndexCaughtUpTimer(): void {
+    if (this.indexCaughtUpTimer !== null) {
+      clearTimeout(this.indexCaughtUpTimer);
+      this.indexCaughtUpTimer = null;
+    }
   }
 
   /**
@@ -2001,6 +2248,18 @@ export class SyncEngine {
   onConfigLoopDetected(cb: (path: VaultPath) => void): Unsubscribe {
     this.configLoopCbs.add(cb);
     return () => this.configLoopCbs.delete(cb);
+  }
+
+  /**
+   * Subscribe to failures projecting the enabled set onto `community-plugins.json`.
+   *
+   * A host that also wraps `communityPlugins.writeAtomic` will see the same failure twice; that is
+   * intended. The wrap catches what this device attempted, while this fires for projections the
+   * engine drives on its own (a peer's toggle arriving over the relay), which the host never sees.
+   */
+  onPluginProjectionError(cb: (err: unknown) => void): Unsubscribe {
+    this.pluginProjectionErrorCbs.add(cb);
+    return () => this.pluginProjectionErrorCbs.delete(cb);
   }
 
   /**
@@ -2299,6 +2558,22 @@ export class SyncEngine {
       kind: "conflict",
       path: first,
       detail: `${String(paths.length)} file(s) could not sync (e.g. ${sample}). Will retry.`,
+    });
+  }
+
+  /** Keep exhausted config watcher deliveries visible until a later retry succeeds. */
+  private surfaceConfigFailures(paths: VaultPath[]): void {
+    const [first] = paths;
+    if (first === undefined) {
+      this.inbox.resolve("config:sync-failed");
+      return;
+    }
+    const sample = paths.slice(0, 3).join(", ");
+    this.inbox.add({
+      id: "config:sync-failed",
+      kind: "conflict",
+      path: first,
+      detail: `${String(paths.length)} config file(s) could not publish (e.g. ${sample}). Will retry.`,
     });
   }
 
@@ -3104,9 +3379,13 @@ export class SyncEngine {
   /** Add a fire-and-forget promise to the inflight set; auto-remove on settle. */
   private track(p: Promise<unknown>): void {
     this.inflight.add(p);
-    void p.finally(() => {
+    const remove = () => {
       this.inflight.delete(p);
-    });
+    };
+    // `.finally(remove)` creates a second rejecting promise; discarding it raises an unhandled
+    // rejection in Node and can terminate the headless daemon. Both `then` arms consume only the
+    // cleanup branch while `whenIdle()` continues to observe the original promise in `inflight`.
+    void p.then(remove, remove);
   }
 
   /**
@@ -3591,13 +3870,18 @@ export class SyncEngine {
    */
   private async loadPersistedIndex(): Promise<CrdtDoc | null> {
     const identity = this.config.indexIdentity;
-    if (identity === undefined) return null;
+    const persistence = this.indexPersistence;
+    if (identity === undefined || persistence === null) return null;
     try {
-      const rec = await this.ports.engineState.getIndexSnapshot?.();
-      if (rec === undefined || rec === null) return null;
+      const rec = await persistence.get();
+      if (rec === null) return null;
       if (rec.version !== SyncEngine.INDEX_SNAPSHOT_VERSION) return null;
       if (rec.identity !== identity) return null;
       if (rec.substrate !== this.substrate) return null;
+      this.largestIndexSnapshotBytes = Math.max(
+        this.largestIndexSnapshotBytes,
+        rec.snapshot.byteLength,
+      );
       const doc = this.ports.crdt.loadDoc(INDEX_DOC_ID, rec.snapshot);
       this.indexHydratedFromSnapshot = true;
       return doc;
@@ -3614,33 +3898,65 @@ export class SyncEngine {
    * structural pre-pass already handles).
    */
   private persistIndexNow(): void {
-    if (this.indexPersistInFlight) {
+    if (this.indexPersistInFlight !== null) {
       this.indexPersistAgain = true;
       return;
     }
-    const identity = this.config.indexIdentity;
-    const doc = this.indexDoc;
-    if (identity === undefined || doc === null) return;
-    this.indexPersistInFlight = true;
-    // NOTE: two engine instances over the same store (a second window, or a plugin reload mid-BRAT
-    // update) can race this key. Last write wins, and BOTH are valid states of the same history, so
-    // the loser's delta simply re-merges via the relay. Do not "fix" this with a lock.
-    void Promise.resolve(
-      this.ports.engineState.setIndexSnapshot?.({
-        version: SyncEngine.INDEX_SNAPSHOT_VERSION,
-        identity,
-        substrate: this.substrate,
-        snapshot: doc.encodeSnapshot(),
-      }),
-    )
-      .catch(() => undefined)
-      .finally(() => {
-        this.indexPersistInFlight = false;
+    if (this.config.indexIdentity === undefined || this.indexDoc === null) return;
+    const flight = this.writeFreshIndexSnapshot().finally(() => {
+      if (this.indexPersistInFlight === flight) {
+        this.indexPersistInFlight = null;
         if (this.indexPersistAgain) {
           this.indexPersistAgain = false;
           this.persistIndexNow();
         }
+      }
+    });
+    this.indexPersistInFlight = flight;
+    void flight;
+  }
+
+  /** Encode at write time and refuse the empty-over-established regression before touching disk. */
+  private async writeFreshIndexSnapshot(): Promise<void> {
+    const identity = this.config.indexIdentity;
+    const doc = this.indexDoc;
+    const persistence = this.indexPersistence;
+    if (identity === undefined || doc === null || persistence === null) return;
+    const snapshot = doc.encodeSnapshot();
+    const floor = Math.max(
+      INDEX_SNAPSHOT_MIN_BYTES,
+      Math.floor(this.largestIndexSnapshotBytes * INDEX_SNAPSHOT_MIN_RETAINED_RATIO),
+    );
+    if (
+      this.largestIndexSnapshotBytes >= INDEX_SNAPSHOT_SUBSTANTIAL_BYTES &&
+      snapshot.byteLength < floor
+    ) {
+      const error = new Error(
+        `refusing index snapshot regression (${String(snapshot.byteLength)} bytes below ` +
+          `${String(floor)}-byte floor; ${String(this.largestIndexSnapshotBytes)} bytes previously persisted)`,
+      );
+      this.recordIndexPersistFailure(error);
+      return;
+    }
+    try {
+      await persistence.set({
+        version: SyncEngine.INDEX_SNAPSHOT_VERSION,
+        identity,
+        substrate: this.substrate,
+        snapshot,
       });
+      this.largestIndexSnapshotBytes = Math.max(
+        this.largestIndexSnapshotBytes,
+        snapshot.byteLength,
+      );
+    } catch (error) {
+      this.recordIndexPersistFailure(error);
+    }
+  }
+
+  private recordIndexPersistFailure(error: unknown): void {
+    this.indexPersistFailure = error;
+    console.error("[zync] failed to persist the shared index snapshot", error);
   }
 
   /**
@@ -3689,19 +4005,10 @@ export class SyncEngine {
 
   /** Awaited teardown save, so stop() cannot race the write. Best-effort; never throws. */
   private async persistIndexFinal(): Promise<void> {
-    const identity = this.config.indexIdentity;
-    const doc = this.indexDoc;
-    if (identity === undefined || doc === null) return;
-    try {
-      await this.ports.engineState.setIndexSnapshot?.({
-        version: SyncEngine.INDEX_SNAPSHOT_VERSION,
-        identity,
-        substrate: this.substrate,
-        snapshot: doc.encodeSnapshot(),
-      });
-    } catch {
-      /* stale snapshot on next start is safe; never block teardown */
-    }
+    if (this.config.indexIdentity === undefined || this.indexDoc === null) return;
+    // Joining first prevents an older background write from completing after this freshest save.
+    while (this.indexPersistInFlight !== null) await this.indexPersistInFlight;
+    await this.writeFreshIndexSnapshot();
   }
 
   /** Stop both index-persist timers (teardown / after a punctuation save). */
@@ -3906,7 +4213,39 @@ export class SyncEngine {
    * FRESH trigger re-arms even after a prior episode gave up (a new reset deserves a new attempt).
    * Idempotent + cheap (no I/O): safe to call redundantly.
    */
-  requestSelfHeal(): void {
+  requestSelfHeal(reverifyLocal = true): void {
+    // Preserve the synchronous public contract: a fresh attempt retires the previous stuck surface
+    // immediately, while the expensive manual disk verification waits behind admitted work.
+    this.armSelfHealEpisode();
+    if (!reverifyLocal) return;
+    if (this.manualReverifyInFlight !== null) return;
+    const admitted = [...this.inflight];
+    const task = Promise.allSettled(admitted)
+      .then(() => this.reverifyLocalFiles())
+      .finally(() => {
+        if (this.manualReverifyInFlight === task) this.manualReverifyInFlight = null;
+      });
+    this.manualReverifyInFlight = task;
+    this.track(task);
+  }
+
+  /** Manual reflush re-reads local files and re-enters the normal local-write paths. */
+  private async reverifyLocalFiles(): Promise<void> {
+    this.blobEngine.resetLocalAdvertise();
+    for (const { path } of await this.ports.vault.list()) {
+      const bytes = await this.ports.vault.read(path);
+      if (bytes === null) continue;
+      const route = this.index.get(path)?.type ?? classify(path, bytes, this.caps).route;
+      if (route === "structured-blob" || route === "binary-blob") {
+        if (this.config.ingestDisabled === true) continue;
+        await this.blobEngine.onLocalBlobWrite(path, bytes);
+      } else if (route === "crdt-prose") {
+        await this.onWrite(path);
+      }
+    }
+  }
+
+  private armSelfHealEpisode(): void {
     // A fresh trigger re-opens a stopped episode (a new reset warrants a new bounded attempt) and
     // ACTIVATES the episode so evaluateSelfHeal's arm/progress/stop logic runs on the coming audit.
     this.selfHealActive = true;
@@ -4369,6 +4708,7 @@ export class SyncEngine {
     lostByHash: Map<string, DeferredLost | typeof AMBIGUOUS>;
     livePresentHashes: Set<string>;
     confirmedLiveProseCount: number;
+    diskList: { path: VaultPath; size: number; mtime: number }[];
   }> {
     // M2: backstop the durable lastLivePath from the converged index, so displacement detection has a
     // baseline even for bindings created before this device upgraded or missed by a runtime update. A
@@ -4421,6 +4761,7 @@ export class SyncEngine {
         lostByHash: new Map(),
         livePresentHashes,
         confirmedLiveProseCount: liveProseCount, // no lost ⇒ all live prose is present/confirmed
+        diskList,
       };
 
     const emptyHash = await sha256OfText("");
@@ -4474,7 +4815,7 @@ export class SyncEngine {
     // those WITHOUT a materializedHash are the never-confirmed ones to exclude. A smaller denominator only
     // makes a mass wipe MORE likely to be caught — consistent with the err-toward-holding bias.
     const confirmedLiveProseCount = liveProseCount - (lost.length - materializedByDocId.size);
-    return { deferred, lostByHash, livePresentHashes, confirmedLiveProseCount };
+    return { deferred, lostByHash, livePresentHashes, confirmedLiveProseCount, diskList };
   }
 
   /**
@@ -4687,6 +5028,34 @@ export class SyncEngine {
     return this.durableBindings.get(path);
   }
 
+  private hasDurableBindingHistory(): boolean {
+    return this.durableBindings !== null && this.durableBindings.size > 0;
+  }
+
+  /** Seed only the disk paths that remain unbound after the delayed first index finally arrives. */
+  private scheduleDeferredFirstSeenSeeds(): void {
+    if (
+      !this.startupDone ||
+      !this.initialConvergenceDone ||
+      !this.indexSyncedOnce ||
+      this.deferredFirstSeenSeedPaths.size === 0
+    )
+      return;
+    const paths = [...this.deferredFirstSeenSeedPaths];
+    this.deferredFirstSeenSeedPaths.clear();
+    this.track(
+      (async () => {
+        for (const path of paths) {
+          // A relay binding wins: the initial/full index convergence owns adoption/materialization.
+          // Only a path still absent after the handshake is genuinely local and safe to seed.
+          if (this.index.get(path) !== undefined) continue;
+          if ((await this.ports.vault.read(path)) === null) continue;
+          await this.onWrite(path);
+        }
+      })(),
+    );
+  }
+
   private async bootstrap(): Promise<void> {
     // One bounded blob-store attempt per bootstrap, not one per blob (see resetLocalAdvertise).
     this.blobEngine.resetLocalAdvertise();
@@ -4695,14 +5064,14 @@ export class SyncEngine {
     // M1a: offline rename re-key happens INLINE; the unmatched-lost set is DEFERRED past the seed loop
     // (applyDeferredLost). The seed loop now CONSUMES an in-place collision first (an external mv onto an
     // occupied live path): `lostByHash`/`livePresentHashes` are the detection inputs for that.
-    const { deferred, lostByHash, livePresentHashes, confirmedLiveProseCount } =
+    const { deferred, lostByHash, livePresentHashes, confirmedLiveProseCount, diskList } =
       await this.reconcileOfflineStructural();
     const emptyHash = await sha256OfText("");
-    for (const { path } of await this.ports.vault.list()) {
+    for (const { path } of diskList) {
+      const existing = this.index.get(path);
       const bytes = await this.ports.vault.read(path);
       if (bytes === null) continue;
 
-      const existing = this.index.get(path);
       // Sticky route: a bound path keeps its index route; an unbound path classifies fresh.
       const route = existing?.type ?? classify(path, bytes, this.caps).route;
       // BLOB at bootstrap (0b-3 Fix 3, sub-gap): a binary/structured blob already on disk
@@ -4716,16 +5085,13 @@ export class SyncEngine {
       // bootstrap blob-publish must honour the same gate (skip publishing in projector mode).
       if (route === "structured-blob" || route === "binary-blob") {
         if (this.config.ingestDisabled === true) continue;
-        // ROBUSTNESS: a transient blob-store outage (S3/MinIO down -> 500) must NOT abort engine
-        // start -- the prose engine must come up regardless. Swallow + continue; the blob stays
-        // unpublished THIS session and re-publishes on the next start (bootstrap re-runs
-        // onLocalBlobWrite for every on-disk blob, and blobStore.has() returns false while the
-        // store was down, so a later successful start re-puts it). Prose sync is unaffected --
-        // blob publish touches only the blob store + manifest, never the vault/prose path.
+        // ROBUSTNESS: a transient blob-store outage must not abort engine start. BlobEngine keeps
+        // the path+sha unadvertised as bounded pending work and retries it on the heal/connectivity
+        // tick (or the next bootstrap), so peers never park on bytes that were not uploaded.
         try {
           await this.blobEngine.onLocalBlobWrite(path, bytes);
         } catch {
-          // transient blob-store failure -- self-heals on the next start (see above).
+          // Hash/adapter failures outside the isolated store call remain best-effort at bootstrap.
         }
         continue;
       }
@@ -4782,7 +5148,22 @@ export class SyncEngine {
       // ~190 docIds minted inside ~2 seconds. So consult DURABLE local state first — a path this
       // device already materialized has a lastLivePath binding — and REUSE that docId. Genuinely
       // new files are absent from the map and still mint.
-      const docId = existing?.docId ?? (await this.durableDocIdFor(path)) ?? this.mintDocId();
+      const durableDocId = existing === undefined ? await this.durableDocIdFor(path) : undefined;
+      const reachable = this.ports.transport.status();
+      if (
+        existing === undefined &&
+        durableDocId === undefined &&
+        this.firstIndexSyncTimedOut &&
+        (reachable === "connected" || reachable === "connecting") &&
+        !this.hasDurableBindingHistory()
+      ) {
+        // A pre-populated clone has no trusted path history, so an empty timed-out index is not
+        // evidence that every note is new. Defer until the handshake resolves; the genuinely
+        // offline rail is excluded above and therefore keeps its exact offline-first seed path.
+        this.deferredFirstSeenSeedPaths.add(path);
+        continue;
+      }
+      const docId = existing?.docId ?? durableDocId ?? this.mintDocId();
       const result = await applyBootstrap(
         {
           base: this.base,
@@ -5121,10 +5502,11 @@ export class SyncEngine {
       this.armRenameWindow();
     })();
     this.renameBuf.pendingSources.add(pen);
-    void pen.finally(() => {
+    const remove = () => {
       this.renameBuf.pendingSources.delete(pen);
       this.renameBuf.pendingSourcePaths.delete(path);
-    });
+    };
+    void pen.then(remove, remove);
     return pen;
   }
   /** Buffer a write to an UNBOUND path as a rename TARGET (read + hashed at drain). */

@@ -269,16 +269,20 @@ export interface EngineStateStore {
 }
 /**
  * Slice 2b: narrow wrapper around the undocumented `app.plugins` runtime API. Confined to the
- * vault-obsidian package (ObsidianPluginRuntime) — no `any` sprinkled elsewhere. Every call
- * wraps the underlying API in a .catch(() => undefined) so a missing/failed internal degrades
- * gracefully to "reload to apply" rather than throwing.
+ * vault-obsidian package (ObsidianPluginRuntime) — no `any` sprinkled elsewhere.
+ *
+ * `enable`/`disable` REJECT when the internal API is absent or the plugin does not actually change
+ * state. They used to swallow everything into a resolved promise, which made "applied live",
+ * "will apply on restart" and "did not happen at all" indistinguishable to the caller — so a
+ * toggle could show the desired state while nothing had been applied and no restart floor had been
+ * written. Callers decide what a failure means; the port no longer decides for them.
  */
 export interface PluginRuntimePort {
   /** The set of currently-active plugin ids. */
   enabledIds(): string[];
-  /** Attempt to enable a plugin via app.plugins — degrades silently on failure. */
+  /** Enable a plugin via app.plugins. REJECTS if the API is missing or the id does not go active. */
   enable(id: string): Promise<void>;
-  /** Attempt to disable a plugin via app.plugins — degrades silently on failure. */
+  /** Disable a plugin via app.plugins. REJECTS if the API is missing or the id stays active. */
   disable(id: string): Promise<void>;
   /** Ask the running plugin to re-read its data.json LIVE via Obsidian's onExternalSettingsChange
    *  (API >=1.5.7). Returns true if the hook existed and was invoked; false if unsupported (caller

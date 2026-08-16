@@ -251,4 +251,85 @@ describe("PluginEnabledChannel", () => {
     });
     expect(enabled.get("dv")).toBe(true); // shared bit unchanged (no leak)
   });
+
+  /**
+   * Fire-and-forget `void project()` discarded write failures and allowed concurrent reprojections
+   * to race. A failed write must surface; concurrent calls must serialize.
+   */
+  it("surfaces a projection write failure via onProjectionError", async () => {
+    const errors: unknown[] = [];
+    const arr: string[] = [];
+    const port: CommunityPluginsPort = {
+      read: () => Promise.resolve(arr),
+      writeAtomic: () => Promise.reject(new Error("disk full")),
+      onChange: () => () => undefined,
+      close: () => undefined,
+    };
+    const optIn = new FakeCrdtMap<boolean>();
+    const enabled = new FakeCrdtMap<boolean>();
+    const meta = new FakeCrdtMap<PluginMeta>();
+    const ch = new PluginEnabledChannel({
+      optIn,
+      enabled,
+      meta,
+      port,
+      isMobile: false,
+      suppress: () => new Set(),
+      onProjectionError: (err) => {
+        errors.push(err);
+      },
+    });
+    optIn.set("dv", true);
+    enabled.set("dv", true);
+    ch.start(); // reproject → writeAtomic rejects
+    await poll(() => {
+      expect(errors.length).toBeGreaterThan(0);
+    });
+    expect(String(errors[0])).toMatch(/disk full/);
+  });
+
+  it("serializes concurrent reproject so a later write sees the earlier result", async () => {
+    let arr: string[] = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const release: (() => void)[] = [];
+    const port: CommunityPluginsPort = {
+      read: () => Promise.resolve(arr),
+      writeAtomic: (ids) =>
+        new Promise((resolve) => {
+          inFlight++;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          release.push(() => {
+            arr = [...ids];
+            inFlight--;
+            resolve();
+          });
+        }),
+      onChange: () => () => undefined,
+      close: () => undefined,
+    };
+    const optIn = new FakeCrdtMap<boolean>();
+    const enabled = new FakeCrdtMap<boolean>();
+    const meta = new FakeCrdtMap<PluginMeta>();
+    const ch = new PluginEnabledChannel({
+      optIn,
+      enabled,
+      meta,
+      port,
+      isMobile: false,
+      suppress: () => new Set(),
+    });
+    optIn.set("a", true);
+    enabled.set("a", true);
+    ch.start(); // first project enqueued
+    optIn.set("b", true);
+    enabled.set("b", true); // second reproject while first write held
+    // Let both enqueue, then release writes in order.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(maxInFlight).toBe(1); // serialized — never two writes at once
+    for (const fn of release.splice(0)) fn();
+    await poll(() => {
+      expect(arr.sort()).toEqual(["a", "b"]);
+    });
+  });
 });

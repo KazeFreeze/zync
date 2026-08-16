@@ -76,12 +76,11 @@ describe("BlobEngine.onLocalBlobWrite (content-address → manifest + store)", (
     expect(await h.blobStore.get(sha)).toEqual(PNG);
   });
 
-  it("does NOT throw when the blob store is unreachable, and still publishes the manifest entry", async () => {
+  it("does NOT throw when the blob store is unreachable and does not advertise unavailable bytes", async () => {
     // THE BUG THIS PINS: bootstrap() awaits onLocalBlobWrite for EVERY on-disk blob. With an
     // unreachable relay the store call fails, and if that propagates it takes bootstrap -> start()
     // down with it, leaving engineReady false forever and the UI stuck on "Loading". The manifest
-    // set is pure local CRDT and is safe offline, so it must still happen; the byte upload is
-    // best-effort and heals on a later start or via the fetch queue's retry tick.
+    // byte upload is best-effort, but peers must not receive a manifest entry until it succeeds.
     const h = makeEngine("eager");
     const sha = await sha256OfBytes(PNG);
     h.blobStore.has = () =>
@@ -90,12 +89,12 @@ describe("BlobEngine.onLocalBlobWrite (content-address → manifest + store)", (
       Promise.reject(new BlobTransientError({ sha, cause: "PUT network: unreachable" }));
 
     await expect(h.engine.onLocalBlobWrite(path("img.png"), PNG)).resolves.toBeUndefined();
-    expect(h.manifest.get("img.png")).toEqual({ sha256: sha, size: PNG.length, deviceId: DEV_A });
+    expect(h.manifest.get("img.png")).toBeUndefined();
   });
 
   it("stops retrying the unreachable store for the rest of the pass (one timeout, not N)", async () => {
     // 320 blobs x a 15s timeout is 80 minutes of wedge. After the first transient failure the
-    // pass must stop calling the store, while still publishing every manifest entry.
+    // pass must stop calling the store, while retaining each path for a later retry batch.
     const h = makeEngine("eager");
     let calls = 0;
     const sha = await sha256OfBytes(PNG);
@@ -107,7 +106,28 @@ describe("BlobEngine.onLocalBlobWrite (content-address → manifest + store)", (
       await h.engine.onLocalBlobWrite(path(`img-${String(i)}.png`), PNG);
     }
     expect(calls).toBe(1);
-    expect(h.manifest.get("img-24.png")).toBeDefined();
+    expect(h.manifest.get("img-24.png")).toBeUndefined();
+  });
+
+  it("retries failed origin uploads as one re-armed batch and advertises only after bytes exist", async () => {
+    const h = makeEngine("lazy");
+    const sha = await sha256OfBytes(PNG);
+    h.blobStore.has = () => Promise.reject(new Error("store offline"));
+
+    await h.vault.writeAtomic(path("img.png"), PNG);
+    await h.engine.onLocalBlobWrite(path("img.png"), PNG);
+    expect(h.manifest.get("img.png")).toBeUndefined();
+
+    const stored = new Map<Sha256, Uint8Array>();
+    h.blobStore.has = (candidate) => Promise.resolve(stored.has(candidate));
+    h.blobStore.put = (candidate, bytes) => {
+      stored.set(candidate, bytes);
+      return Promise.resolve();
+    };
+    await h.engine.retryPendingUploads();
+
+    expect(stored.get(sha)).toEqual(PNG);
+    expect(h.manifest.get("img.png")).toEqual({ sha256: sha, size: PNG.length, deviceId: DEV_A });
   });
 
   it("keep-old-versions: a new write under a new sha does NOT delete the old blob", async () => {

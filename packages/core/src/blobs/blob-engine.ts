@@ -51,6 +51,8 @@ export interface BlobEngineDeps {
   retryTickMs: number;
   /** Aggregate failure surface: called with the CURRENT full failed-path set whenever it changes. */
   onBlobFailure: (failedPaths: VaultPath[]) => void;
+  /** Origin-side config uploads share the queue's retry/connectivity tick. */
+  onRetryTick?: () => void | Promise<void>;
   /**
    * Optional divergence hook (config channel injects it). Called when the on-disk file EXISTS and
    * its content differs from the manifest's expected sha. Returning true means "handled out of band
@@ -81,6 +83,9 @@ export interface BlobEngineDeps {
 export class BlobEngine {
   /** Set when the blob store proved unreachable this pass; re-armed by {@link resetLocalAdvertise}. */
   #localAdvertiseBlocked = false;
+  /** Failed origin uploads are path+generation work, bounded so a hostile tree cannot grow memory. */
+  readonly #pendingUploads = new Map<VaultPath, Sha256>();
+  static readonly #MAX_PENDING_UPLOADS = 1_024;
 
   readonly #deps: BlobEngineDeps;
   readonly #queue: BlobFetchQueue;
@@ -96,6 +101,7 @@ export class BlobEngine {
       maxInFlightBytes: deps.maxInFlightBytes,
       maxRetries: deps.maxRetries,
       retryTickMs: deps.retryTickMs,
+      onRetryTick: () => this.retryPendingUploads(),
     });
   }
 
@@ -107,24 +113,27 @@ export class BlobEngine {
   async onLocalBlobWrite(path: VaultPath, bytes: Uint8Array): Promise<void> {
     const d = this.#deps;
     const sha = await sha256OfBytes(bytes);
-    // OFFLINE-SAFE: uploading the bytes is BEST-EFFORT; publishing the manifest entry is not.
-    // bootstrap() awaits this for EVERY on-disk blob, so letting a store failure propagate takes
-    // bootstrap -> start() down with it and leaves `engineReady` false forever — the UI then sits
-    // on "Loading" with no way out, and every restart repeats it. The manifest set below is pure
-    // local CRDT and is correct offline, so it must still happen. A missing upload heals on a
-    // later start or via the fetch queue's retry tick.
+    // OFFLINE-SAFE: uploading the bytes is BEST-EFFORT, but the manifest must not claim bytes that
+    // peers cannot fetch. bootstrap() awaits this for EVERY on-disk blob, so letting a store failure
+    // propagate takes bootstrap -> start() down with it and leaves `engineReady` false forever.
+    // Retain the path+sha as bounded pending work; the existing queue tick (and reconnect path)
+    // retries it from disk. `materialize()` cannot heal this on the origin because matching disk
+    // bytes return "already" before any store request.
     //
     // The latch matters as much as the catch: a large vault has hundreds of blobs, and retrying an
     // unreachable store once per blob turns a bounded timeout into an unbounded stall. One attempt
-    // per pass; `resetLocalAdvertise()` re-arms it at the start of each bootstrap.
-    if (!this.#localAdvertiseBlocked) {
-      try {
-        if (!(await d.blobStore.has(sha))) {
-          await d.blobStore.put(sha, bytes);
-        }
-      } catch {
-        this.#localAdvertiseBlocked = true;
-      }
+    // per pass; each retry batch re-arms it.
+    if (this.#localAdvertiseBlocked) {
+      this.#rememberPendingUpload(path, sha);
+      return;
+    }
+    try {
+      if (!(await d.blobStore.has(sha))) await d.blobStore.put(sha, bytes);
+      this.#pendingUploads.delete(path);
+    } catch {
+      this.#localAdvertiseBlocked = true;
+      this.#rememberPendingUpload(path, sha);
+      return;
     }
     // IDEMPOTENCY: skip the manifest write when this path already advertises this exact sha.
     // `YjsCrdtMap.set` wraps every set in a RELAYED "local-bridge" transaction, and `Y.Map.set`
@@ -145,6 +154,41 @@ export class BlobEngine {
    *  bounded attempt per pass rather than one per blob, and recovers on a later online start. */
   resetLocalAdvertise(): void {
     this.#localAdvertiseBlocked = false;
+  }
+
+  /** Retry origin uploads as one bounded batch; safe on reconnect and idempotent while healthy. */
+  async retryPendingUploads(): Promise<void> {
+    this.#localAdvertiseBlocked = false;
+    for (const [path, sha] of [...this.#pendingUploads]) {
+      const bytes = await this.#deps.vault.read(path).catch(() => null);
+      if (bytes === null || (await sha256OfBytes(bytes)) !== sha) {
+        this.#pendingUploads.delete(path); // deleted/superseded generations are no longer owed
+        continue;
+      }
+      try {
+        if (!(await this.#deps.blobStore.has(sha))) await this.#deps.blobStore.put(sha, bytes);
+      } catch {
+        this.#localAdvertiseBlocked = true;
+        break;
+      }
+      this.#pendingUploads.delete(path);
+      if (this.#deps.manifest.get(path)?.sha256 !== sha) {
+        this.#deps.manifest.set(path, {
+          sha256: sha,
+          size: bytes.length,
+          deviceId: this.#deps.identity.deviceId(),
+        });
+      }
+    }
+    await this.#deps.onRetryTick?.();
+  }
+
+  #rememberPendingUpload(path: VaultPath, sha: Sha256): void {
+    this.#pendingUploads.delete(path);
+    this.#pendingUploads.set(path, sha);
+    if (this.#pendingUploads.size <= BlobEngine.#MAX_PENDING_UPLOADS) return;
+    const oldest = this.#pendingUploads.keys().next().value;
+    if (oldest !== undefined) this.#pendingUploads.delete(oldest);
   }
 
   /**
@@ -230,8 +274,9 @@ export class BlobEngine {
    * materialize}.
    */
   start(): Unsubscribe {
+    // The queue tick also retries origin-side uploads, including under lazy fetch policy.
+    this.#queue.start();
     if (this.#deps.policy === "eager") {
-      this.#queue.start();
       for (const [p, e] of this.#deps.manifest.entries()) {
         this.#queue.enqueue(p as VaultPath, e.sha256, e.size);
       }

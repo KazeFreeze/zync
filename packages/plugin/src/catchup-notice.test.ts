@@ -5,7 +5,7 @@ const inputs = (over: Partial<CatchupInputs> = {}): CatchupInputs => ({
   isMobile: true,
   started: true,
   connected: true,
-  indexSynced: false,
+  indexCaughtUp: false,
   waitingMs: CATCHUP_GRACE_MS + 1,
   showing: false,
   ...over,
@@ -29,8 +29,27 @@ describe("catchupNotice", () => {
     expect(n?.text).toMatch(/catching up|up to date/i);
   });
 
-  it("clears once the index has synced", () => {
-    expect(catchupNotice(inputs({ indexSynced: true, showing: true }))).toBeNull();
+  it("clears once the index is caught up", () => {
+    expect(catchupNotice(inputs({ indexCaughtUp: true, showing: true }))).toBeNull();
+  });
+
+  /**
+   * The regression that made this notice worthless: `isIndexSynced()` is a session latch that
+   * never clears, so after the first handshake the notice stayed permanently dead — including
+   * across the Android freeze disconnect/reconnect this module exists for. Feeding
+   * `isIndexCaughtUp()` (clears on disconnect, re-arms on reconnect) must allow a SECOND warn.
+   */
+  it("can fire a second time after a disconnect/reconnect cycle", () => {
+    // First catch-up completes.
+    expect(catchupNotice(inputs({ indexCaughtUp: true, showing: true }))).toBeNull();
+    // Disconnect clears the catch-up latch (offline sticky owns that window).
+    expect(catchupNotice(inputs({ connected: false, indexCaughtUp: false }))).toBeNull();
+    // Reconnect with the index not yet current again — the notice must be able to return.
+    const again = catchupNotice(
+      inputs({ connected: true, indexCaughtUp: false, waitingMs: CATCHUP_GRACE_MS + 1 }),
+    );
+    expect(again).not.toBeNull();
+    expect(again?.text).toMatch(/catching up/i);
   });
 
   /**

@@ -177,12 +177,17 @@ export class NodeFsConfig implements ConfigPort {
       if (entry.isDirectory()) {
         await this.walkDir(absEntry, results);
       } else if (entry.isFile()) {
-        const stat = await fsp.stat(absEntry);
-        const rel = path.relative(this.root, absEntry).split(path.sep).join("/") as VaultPath;
-        if (!isConfigZone(rel)) continue;
-        // mtime comes free with the stat we already do; callers use (size, mtime) to skip
-        // reading and hashing files that have not moved.
-        results.push({ path: rel, size: stat.size, mtime: stat.mtimeMs });
+        try {
+          const stat = await fsp.stat(absEntry);
+          const rel = path.relative(this.root, absEntry).split(path.sep).join("/") as VaultPath;
+          if (!isConfigZone(rel)) continue;
+          // mtime comes free with the stat we already do; callers use (size, mtime) to skip
+          // reading and hashing files that have not moved.
+          results.push({ path: rel, size: stat.size, mtime: stat.mtimeMs });
+        } catch (err) {
+          if (!isEnoent(err)) throw err;
+          // File disappeared between readdir and stat — ignore so a plugin rewrite cannot abort start.
+        }
       }
     }
   }

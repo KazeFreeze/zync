@@ -17,11 +17,24 @@ export interface PluginEnabledChannelDeps {
   port: CommunityPluginsPort;
   isMobile: boolean;
   suppress: () => Set<string>;
+  /**
+   * Optional: projection write failed. Without this, a failed community-plugins.json write was
+   * discarded with the fire-and-forget `void this.project()` — the restart floor vanished silently.
+   * Engine wiring is optional; callers that wrap `port.writeAtomic` can also observe failures.
+   */
+  onProjectionError?: (err: unknown) => void;
 }
 
 /** Bidirectional projection between the shared `pluginsEnabled` map and `community-plugins.json`. */
 export class PluginEnabledChannel {
   private lastProjected: string[] | null = null;
+  /**
+   * Single-flight chain for outbound projection. Concurrent reproject() used to race two reads
+   * then two writes and could leave the file on a stale loser; serialize so each run sees the
+   * prior write's result.
+   */
+  private projectChain: Promise<void> = Promise.resolve();
+
   constructor(private readonly d: PluginEnabledChannelDeps) {}
 
   /** Ids with a `true` opt-in entry (shared consent). */
@@ -58,9 +71,14 @@ export class PluginEnabledChannel {
     return managedSet(this.optInSet(), this.desktopOnlySet(), new Set(), this.d.isMobile);
   }
 
-  /** Outbound: recompute + write the array if it changed. */
+  /** Outbound: enqueue a serialized recompute + write. Errors surface via onProjectionError. */
   reproject(): void {
-    void this.project();
+    this.projectChain = this.projectChain
+      .then(() => this.project())
+      .catch((err: unknown) => {
+        // Keep the chain alive for the next reproject after a failed write.
+        this.d.onProjectionError?.(err);
+      });
   }
 
   private async project(): Promise<void> {

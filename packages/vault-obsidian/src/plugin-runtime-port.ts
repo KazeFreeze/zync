@@ -4,9 +4,11 @@
  *
  * UNDOCUMENTED API POLICY (Slice 2b discipline):
  * - The entire `app.plugins` cast is CONFINED HERE. No `any` leaks to other packages.
- * - Every `enablePlugin`/`disablePlugin` call uses `.catch(() => undefined)` so a missing or
- *   failed internal never throws — degrading silently to "reload to apply" (the restart floor
- *   provided by the community-plugins.json projection is always the guaranteed fallback).
+ * - enable/disable REJECT when the internal is missing or the call fails. Swallowing used to
+ *   report success while nothing ran, so the reconciler exited after five "successful" rounds
+ *   with the plugin still wrong and the user told nothing. The restart floor
+ *   (community-plugins.json) is still the fallback — callers must surface it when live apply
+ *   fails, not pretend the apply worked.
  * - `enabledIds()` is read-only and safe to call at any time.
  */
 
@@ -36,11 +38,27 @@ export class ObsidianPluginRuntime implements PluginRuntimePort {
   }
 
   async enable(id: string): Promise<void> {
-    await this.pm?.enablePlugin(id).catch(() => undefined);
+    const pm = this.pm;
+    if (pm === undefined || typeof pm.enablePlugin !== "function") {
+      throw new Error("Obsidian plugin API unavailable (enablePlugin)");
+    }
+    await pm.enablePlugin(id);
+    // Optional-chaining used to resolve `undefined` as success. Verify the set flipped, so a
+    // no-op "success" cannot look like an apply to the reconciler.
+    if (!pm.enabledPlugins.has(id)) {
+      throw new Error(`enablePlugin(${id}) did not activate the plugin`);
+    }
   }
 
   async disable(id: string): Promise<void> {
-    await this.pm?.disablePlugin(id).catch(() => undefined);
+    const pm = this.pm;
+    if (pm === undefined || typeof pm.disablePlugin !== "function") {
+      throw new Error("Obsidian plugin API unavailable (disablePlugin)");
+    }
+    await pm.disablePlugin(id);
+    if (pm.enabledPlugins.has(id)) {
+      throw new Error(`disablePlugin(${id}) did not deactivate the plugin`);
+    }
   }
 
   async applyExternalSettings(id: string): Promise<boolean> {

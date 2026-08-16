@@ -35,9 +35,14 @@ export interface CatchupInputs {
   started: boolean;
   /** Transport reports a live connection. */
   connected: boolean;
-  /** `engine.isIndexSynced()` — the shared index has actually arrived from the relay. */
-  indexSynced: boolean;
-  /** How long we have been connected-but-unsynced. */
+  /**
+   * `engine.isIndexCaughtUp()` — the index is believed current with the relay RIGHT NOW.
+   * Must NOT be `isIndexSynced()`: that is a session latch that never clears, so after the first
+   * handshake this notice would stay permanently dead — including across the Android freeze this
+   * module exists to cover.
+   */
+  indexCaughtUp: boolean;
+  /** How long we have been connected-but-not-caught-up. */
   waitingMs: number;
   /** Whether the notice is on screen right now; drives the no-retract rule. */
   showing: boolean;
@@ -54,7 +59,7 @@ export function catchupNotice(i: CatchupInputs): CatchupNotice | null {
   // Disconnected is the offline sticky's job. Two notices about one problem is noise, and the
   // offline one is the more actionable of the two.
   if (!i.connected) return null;
-  if (i.indexSynced) return null;
+  if (i.indexCaughtUp) return null;
   // Grace period, unless it is already up — once shown it stays until genuinely caught up, so it
   // cannot flicker on and off while the catch-up drags.
   if (!i.showing && i.waitingMs < CATCHUP_GRACE_MS) return null;

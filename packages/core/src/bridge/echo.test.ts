@@ -33,4 +33,36 @@ describe("EchoLedger", () => {
     led.recordWrite("a.md", sha("x"));
     expect(led.isEcho("b.md", sha("x"))).toBe(false);
   });
+
+  it("does not suppress a genuine later edit when its watcher token has expired", () => {
+    let now = 1_000;
+    const led = new EchoLedger({ now: () => now, ttlMs: 100 });
+    led.recordWrite("a.md", sha("old-content"));
+
+    now += 101; // The watcher missed the engine write; the user later restores those exact bytes.
+    expect(led.isEcho("a.md", sha("old-content"))).toBe(false);
+  });
+
+  it("caps missed watcher tokens per path without weakening recent echo suppression", () => {
+    const led = new EchoLedger({ maxPerPath: 2, maxTotal: 10 });
+    led.recordWrite("a.md", sha("v1"));
+    led.recordWrite("a.md", sha("v2"));
+    led.recordWrite("a.md", sha("v3"));
+
+    expect(led.isEcho("a.md", sha("v1"))).toBe(false);
+    expect(led.isEcho("a.md", sha("v2"))).toBe(true);
+    expect(led.isEcho("a.md", sha("v3"))).toBe(true);
+  });
+
+  it("caps missed watcher tokens globally on the write path", () => {
+    let now = 0;
+    const led = new EchoLedger({ now: () => ++now, maxPerPath: 10, maxTotal: 2 });
+    led.recordWrite("a.md", sha("a"));
+    led.recordWrite("b.md", sha("b"));
+    led.recordWrite("c.md", sha("c"));
+
+    expect(led.isEcho("a.md", sha("a"))).toBe(false);
+    expect(led.isEcho("b.md", sha("b"))).toBe(true);
+    expect(led.isEcho("c.md", sha("c"))).toBe(true);
+  });
 });

@@ -18,6 +18,8 @@ export interface BlobFetchQueueDeps {
   maxInFlightBytes: number;
   maxRetries: number;
   retryTickMs: number;
+  /** Re-arm origin-side uploads on the same low-frequency heal tick. */
+  onRetryTick?: () => void | Promise<void>;
 }
 
 interface Job {
@@ -62,6 +64,16 @@ export class BlobFetchQueue {
     this.#stopped = false;
     if (this.#tick !== null) return;
     this.#tick = setInterval(() => {
+      try {
+        const retry = this.#d.onRetryTick?.();
+        if (retry !== undefined)
+          void Promise.resolve(retry).then(
+            () => undefined,
+            () => undefined,
+          );
+      } catch {
+        // Retry work is background best-effort; a synchronous adapter failure must not stop the tick.
+      }
       if (this.#failed.size === 0) return;
       for (const path of [...this.#failed]) {
         const cur = this.#currentEntry(path);

@@ -84,6 +84,7 @@ function makeChannel(
   },
   gate?: { allows(path: string): boolean },
   engineState?: unknown,
+  onChangeFailure?: (paths: string[]) => void,
 ) {
   const config = memMap<ConfigEntry>();
 
@@ -139,6 +140,7 @@ function makeChannel(
     now: () => 0,
     ...(gate !== undefined ? { gate } : {}),
     ...(engineState !== undefined ? { engineState: engineState as never } : {}),
+    ...(onChangeFailure !== undefined ? { onChangeFailure } : {}),
   });
   return {
     ch,
@@ -158,6 +160,31 @@ function makeChannel(
 }
 
 describe("ConfigChannel", () => {
+  it("blob-store failure keeps bootstrap/publish alive, records the CRDT entry, and bounds the pass to one timeout", async () => {
+    const { ch, config, blobHas, blobPut } = makeChannel();
+    blobHas.mockRejectedValue(new Error("blob endpoint unavailable"));
+    const first = new Uint8Array([1, 2, 3]);
+    const second = new Uint8Array([4, 5, 6]);
+
+    // Config metadata remains valid offline, so a store outage must not reject engine.start().
+    await expect(
+      ch.publish(".obsidian/snippets/first.css" as never, first),
+    ).resolves.toBeUndefined();
+    await expect(
+      ch.publish(".obsidian/snippets/second.css" as never, second),
+    ).resolves.toBeUndefined();
+
+    expect(config.get(".obsidian/snippets/first.css")).toBeDefined();
+    expect(config.get(".obsidian/snippets/second.css")).toBeDefined();
+    expect(blobHas).toHaveBeenCalledTimes(1); // one failed request, not one timeout per file
+    expect(blobPut).not.toHaveBeenCalled();
+
+    // The pending state distinguishes advertised metadata from a completed upload and heals on tick.
+    blobHas.mockResolvedValue(false);
+    await ch.retryPendingUploads();
+    expect(blobPut).toHaveBeenCalledTimes(2);
+  });
+
   it("local add: onChange with bytes publishes entry and stores blob", async () => {
     const { ch, config, blobPut, configRead, echoIsEcho, fireOnChange } = makeChannel();
     const bytes = new Uint8Array([1, 2, 3]);
@@ -180,6 +207,42 @@ describe("ConfigChannel", () => {
       category: "snippets",
       deviceId: "d",
     });
+  });
+
+  it("retains a failed watcher delivery and retries it after the adapter baseline has advanced", async () => {
+    const { ch, config, configRead, fireOnChange } = makeChannel();
+    const bytes = new Uint8Array([9, 8, 7]);
+    configRead.mockRejectedValueOnce(new Error("transient read race")).mockResolvedValue(bytes);
+
+    const stop = ch.start();
+    fireOnChange(".obsidian/snippets/retry.css"); // only one adapter notification
+
+    await poll(() => {
+      expect(config.get(".obsidian/snippets/retry.css")).toBeDefined();
+    }, 1_500);
+    expect(configRead).toHaveBeenCalledTimes(2);
+    stop();
+  });
+
+  it("surfaces one persistent warning after bounded local-change retries are exhausted", async () => {
+    const onChangeFailure = vi.fn();
+    const { ch, configRead, fireOnChange } = makeChannel(
+      undefined,
+      undefined,
+      undefined,
+      onChangeFailure,
+    );
+    configRead.mockRejectedValue(new Error("persistent read failure"));
+
+    const stop = ch.start();
+    fireOnChange(".obsidian/snippets/stuck.css");
+
+    await poll(() => {
+      expect(onChangeFailure).toHaveBeenCalledTimes(1);
+    }, 1_500);
+    expect(onChangeFailure).toHaveBeenLastCalledWith([".obsidian/snippets/stuck.css"]);
+    expect(configRead).toHaveBeenCalledTimes(4);
+    stop();
   });
 
   it("echo skip: onChange for path whose bytes hash matches echo is ignored", async () => {

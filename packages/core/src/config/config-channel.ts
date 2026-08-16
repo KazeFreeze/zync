@@ -51,6 +51,8 @@ export interface ConfigChannelDeps {
   gate?: { allows(path: VaultPath): boolean };
   /** Called (once) when the loop-breaker trips for a config path — a runaway republish loop. */
   onLoopDetected?(path: VaultPath): void;
+  /** Surface config changes that remain undelivered after the bounded retry pass. */
+  onChangeFailure?(paths: VaultPath[]): void;
   /** Monotonic clock for the loop-breaker. */
   now(): number;
 }
@@ -63,6 +65,20 @@ export interface ConfigChannelDeps {
  */
 export class ConfigChannel {
   private readonly loopBreaker = new ConfigLoopBreaker({ now: () => this.d.now() });
+  /** One failed store request blocks the rest of this pass, preventing one timeout per config file. */
+  private localUploadBlocked = false;
+  /** Failed uploads retain their exact content because the config CRDT entry is still valid offline. */
+  private readonly pendingUploads = new Map<VaultPath, { sha256: Sha256; bytes: Uint8Array }>();
+
+  private static readonly MAX_PENDING_UPLOADS = 1_024;
+  private static readonly MAX_PENDING_CHANGES = 1_024;
+  private static readonly MAX_CHANGE_ATTEMPTS = 4;
+  private readonly pendingLocalChanges = new Map<VaultPath, number>();
+  private readonly failedLocalChanges = new Set<VaultPath>();
+  private readonly pendingRemoteChanges: string[][] = [];
+  private changeDrainRunning = false;
+  private changeRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private stopped = true;
 
   constructor(private readonly d: ConfigChannelDeps) {}
 
@@ -102,7 +118,20 @@ export class ConfigChannel {
     const sha256 = await sha256OfBytes(content);
     const cur = this.d.config.get(path);
     if (cur !== undefined && cur.deleted !== true && cur.sha256 === sha256) return; // canonical churn guard
-    if (!(await this.d.blobStore.has(sha256))) await this.d.blobStore.put(sha256, content);
+    let uploaded = false;
+    if (!this.localUploadBlocked) {
+      try {
+        if (!(await this.d.blobStore.has(sha256))) await this.d.blobStore.put(sha256, content);
+        uploaded = true;
+      } catch {
+        // The config map is valid offline, but propagating this failure aborts engine.start() and
+        // leaves all note sync behind engineReady forever. Latch the pass so a large config tree
+        // pays at most one store timeout, and retain the bytes for the shared retry tick.
+        this.localUploadBlocked = true;
+      }
+    }
+    if (uploaded) this.pendingUploads.delete(path);
+    else this.rememberPendingUpload(path, sha256, content);
     const id = isData ? pluginIdOf(path) : undefined;
     const version = id !== undefined ? await this.manifestVersion(id) : undefined;
     // plugin-data version-aware convergence: a plain publish is a NEW local edit, so bump the per-path
@@ -113,6 +142,12 @@ export class ConfigChannel {
     if (isData && this.d.engineState !== undefined) {
       newDataVersion = (await this.d.engineState.getConfigLocalVersion(path)) + 1;
     }
+    // Persist the plugin-data version before publishing the CRDT entry. If this durable write
+    // fails, the serialized watcher queue retries the whole path; setting the map first would make
+    // the retry hit the identical-sha churn guard and silently consume the failed engine-state write.
+    if (isData && newDataVersion !== undefined && this.d.engineState !== undefined) {
+      await this.d.engineState.setConfigLocalVersion(path, newDataVersion);
+    }
     this.d.config.set(path, {
       sha256,
       size: content.length,
@@ -121,24 +156,145 @@ export class ConfigChannel {
       ...(version !== undefined ? { version } : {}),
       ...(newDataVersion !== undefined ? { dataVersion: newDataVersion } : {}),
     });
-    if (isData && newDataVersion !== undefined && this.d.engineState !== undefined) {
-      await this.d.engineState.setConfigLocalVersion(path, newDataVersion);
-    }
     if (this.loopBreaker.record(path)) this.d.onLoopDetected?.(path);
+  }
+
+  /** Retry failed config uploads on the blob engine's existing retry/connectivity tick. */
+  async retryPendingUploads(): Promise<void> {
+    this.localUploadBlocked = false; // one bounded store attempt per retry batch
+    for (const [path, pending] of [...this.pendingUploads]) {
+      try {
+        if (!(await this.d.blobStore.has(pending.sha256))) {
+          await this.d.blobStore.put(pending.sha256, pending.bytes);
+        }
+        const current = this.d.config.get(path);
+        if (current?.deleted !== true && current?.sha256 === pending.sha256) {
+          this.pendingUploads.delete(path);
+        } else {
+          this.pendingUploads.delete(path); // the CRDT entry moved; these bytes are no longer owed
+        }
+      } catch {
+        this.localUploadBlocked = true;
+        break;
+      }
+    }
+  }
+
+  private rememberPendingUpload(path: VaultPath, sha256: Sha256, bytes: Uint8Array): void {
+    this.pendingUploads.delete(path); // refresh insertion order for the newest generation
+    this.pendingUploads.set(path, { sha256, bytes });
+    if (this.pendingUploads.size <= ConfigChannel.MAX_PENDING_UPLOADS) return;
+    const oldest = this.pendingUploads.keys().next().value;
+    if (oldest !== undefined) this.pendingUploads.delete(oldest);
+    // Bounded memory is preferable to retaining an unbounded plugin tree, but eviction must be
+    // visible because that path now needs a later disk rescan to upload its bytes.
+    this.d.onChangeFailure?.([...(oldest === undefined ? [] : [oldest])]);
   }
 
   /** Subscribe to local config-file changes AND remote config-map tombstones. */
   start(): Unsubscribe {
+    this.stopped = false;
     const u1 = this.d.configPort.onChange((path) => {
-      void this.onLocalChange(path);
+      this.enqueueLocalChange(path);
     });
     const u2 = this.d.config.observe((keys) => {
-      void this.onRemoteChange(keys);
+      this.pendingRemoteChanges.push(keys);
+      this.scheduleChangeDrain();
     });
+    this.scheduleChangeDrain(); // resume retained failures if the same engine instance restarts
     return () => {
+      this.stopped = true;
+      if (this.changeRetryTimer !== null) clearTimeout(this.changeRetryTimer);
+      this.changeRetryTimer = null;
       u1();
       u2();
     };
+  }
+
+  /** Re-arm exhausted local-change work on a connectivity/heal tick. */
+  retryPendingChanges(): void {
+    for (const path of this.pendingLocalChanges.keys()) this.pendingLocalChanges.set(path, 0);
+    this.scheduleChangeDrain();
+  }
+
+  private enqueueLocalChange(path: VaultPath): void {
+    if (!this.pendingLocalChanges.has(path)) {
+      if (this.pendingLocalChanges.size >= ConfigChannel.MAX_PENDING_CHANGES) {
+        // The queue must remain bounded under watcher storms; make the undelivered newest path
+        // persistently visible instead of silently growing memory or pretending it was handled.
+        this.failedLocalChanges.add(path);
+        this.d.onChangeFailure?.([...this.failedLocalChanges]);
+        return;
+      }
+      this.pendingLocalChanges.set(path, 0);
+    }
+    this.scheduleChangeDrain();
+  }
+
+  private scheduleChangeDrain(delayMs = 0): void {
+    if (this.stopped) return;
+    if (delayMs > 0) {
+      if (this.changeRetryTimer !== null) return;
+      this.changeRetryTimer = setTimeout(() => {
+        this.changeRetryTimer = null;
+        this.scheduleChangeDrain();
+      }, delayMs);
+      return;
+    }
+    if (this.changeDrainRunning) return;
+    void this.drainChanges().then(
+      () => undefined,
+      () => undefined,
+    );
+  }
+
+  private async drainChanges(): Promise<void> {
+    if (this.changeDrainRunning || this.stopped) return;
+    this.changeDrainRunning = true;
+    try {
+      // Remote removes and local reads/publishes share one executor so callbacks cannot race each
+      // other through echo/base state. Each local path gets one attempt per pass; failures stay
+      // queued because both filesystem adapters have already advanced their stat baselines.
+      while (this.pendingRemoteChanges.length > 0) {
+        const keys = this.pendingRemoteChanges.shift();
+        if (keys !== undefined) await this.onRemoteChange(keys);
+      }
+      let needsRetry = false;
+      for (const [path, attempts] of [...this.pendingLocalChanges]) {
+        if (attempts >= ConfigChannel.MAX_CHANGE_ATTEMPTS) continue;
+        try {
+          await this.onLocalChange(path);
+          this.pendingLocalChanges.delete(path); // delivery, not observation, consumes the change
+          if (this.failedLocalChanges.delete(path)) {
+            this.d.onChangeFailure?.([...this.failedLocalChanges]);
+          }
+        } catch {
+          const next = attempts + 1;
+          this.pendingLocalChanges.set(path, next);
+          if (next >= ConfigChannel.MAX_CHANGE_ATTEMPTS) {
+            if (!this.failedLocalChanges.has(path)) {
+              this.failedLocalChanges.add(path);
+              this.d.onChangeFailure?.([...this.failedLocalChanges]);
+            }
+          } else {
+            needsRetry = true;
+          }
+        }
+      }
+      if (needsRetry) this.scheduleChangeDrain(250);
+    } finally {
+      this.changeDrainRunning = false;
+      // Events that arrived after the snapshots above must get their own serialized pass.
+      if (
+        (this.pendingRemoteChanges.length > 0 ||
+          [...this.pendingLocalChanges.values()].some(
+            (attempts) => attempts < ConfigChannel.MAX_CHANGE_ATTEMPTS,
+          )) &&
+        this.changeRetryTimer === null
+      ) {
+        this.scheduleChangeDrain();
+      }
+    }
   }
 
   /**

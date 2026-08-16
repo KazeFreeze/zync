@@ -37,8 +37,11 @@ import { ConnectionAlert, type AlertCommand } from "./connection-alert.js";
 import { notify, updateNotice, notifyInfo, notifyWarning, notifyError } from "./notify.js";
 import { explainNotifyProps, type NotifyAction, type NotifyOptions } from "./notify-model.js";
 import { arrivingSegment, arrivingNotice, type ArrivingInputs } from "./arriving-view.js";
+import { blobStatusSegment } from "./blob-status-segment.js";
 import { syncedPluginsGate } from "./synced-plugins-gate.js";
 import { catchupNotice } from "./catchup-notice.js";
+import { pluginApplyFailureNotice } from "./plugin-apply-failure.js";
+import { canRunResumeCatchUp, detectedResumeGap } from "./resume-detector.js";
 
 /**
  * Zync plugin — M1 desktop walking skeleton (M1-T5 wiring).
@@ -96,6 +99,17 @@ const MAX_PROSE_BYTES = 1_000_000;
  * push-style via transport.onStatus and are unaffected by this constant.
  */
 const STATUS_POLL_INTERVAL_MS = 8_000;
+/**
+ * Require the existing status poll to be over a minute late before inferring suspension. The
+ * generous allowance prevents a busy vault or ordinary event-loop congestion from looking like a
+ * wake and needlessly restarting catch-up.
+ */
+const RESUME_GAP_THRESHOLD_MS = 60_000;
+/**
+ * Wake commonly emits visibility, online, and a late poll together. Coalesce that cluster for 30s
+ * so one resume cannot repeatedly kick the transport and restart catch-up work.
+ */
+const RESUME_REFIRE_INTERVAL_MS = 30_000;
 
 /** The DISPLAY counts, straight from engine.syncSnapshot(). Never derived by subtraction in the
  *  plugin: a subtraction double-counted the stuck/arriving overlap in design review. These four
@@ -155,8 +169,18 @@ export default class ZyncPlugin extends Plugin {
   private dbName: string | null = null;
   private statusBar: HTMLElement | null = null;
   private statusTimer: number | null = null;
+  /** Wall-clock sample owned by the existing status poll; null until that poll is installed. */
+  private lastStatusTickAt: number | null = null;
+  /** Last wake signal that actually ran kick + catch-up, used to coalesce one wake's event burst. */
+  private lastResumeCatchUpAt: number | null = null;
   /** Guards against concurrent syncSnapshot() scans when a poll takes longer than the interval. */
   private statusRefreshInFlight = false;
+  /**
+   * When a poll is skipped because one is in flight, re-run once after it finishes — same
+   * single-flight-plus-latch pattern as persistIndexNow. Without this, a scan that exceeds the
+   * 8s interval drops the next poll and counts lag 16s+ behind a live `connected` indicator.
+   */
+  private statusRefreshAgain = false;
   /** Last computed counts — rendered immediately on a connText push so a status change is
    *  reflected without waiting for the next (coarse, possibly skipped) expensive scan. */
   private lastCounts: StatusCounts = ZERO_COUNTS;
@@ -179,9 +203,18 @@ export default class ZyncPlugin extends Plugin {
   /** When this device became connected-but-unsynced; null when it is neither. */
   private catchupSince: number | null = null;
   private lastConflictCount = 0;
-  /** True only AFTER engine.start() completes. Gates status-bar reads of blobProgress()/inbox —
-   *  both are undefined until start() finishes, and onStatus can drive renderStatus mid-start. */
+  /**
+   * True only AFTER engine.start() completes. Gates WRITES (opt-in, suppress, …), not read-only
+   * status. Progress/inbox used to wait on this too, which left the bar dark for the whole of
+   * start() while the most expensive work of the session ran invisibly — same conflation
+   * synced-plugins-gate.ts already fixed for settings.
+   */
   private engineReady = false;
+  /**
+   * Last community-plugins.json write failure observed via the wrapped port. Cleared on a
+   * successful write. Used when live apply fails to decide whether the restart floor landed.
+   */
+  private communityPluginsFloorError: unknown = null;
   /** Per-session port timing (recreated each startEngine); dumped by "Zync: dump bootstrap profile". */
   private profiler: PortProfiler | null = null;
   /** Mobile-only connection-alert state machine + its single sticky Notice + debounce timer. */
@@ -303,15 +336,23 @@ export default class ZyncPlugin extends Plugin {
       this.registerEvent(this.app.workspace.on("editor-change", () => this.alert?.onEdit()));
     }
 
-    // Mobile: Android throttling drops the socket on background; force an immediate reconnect
-    // when the app returns to the foreground or the network comes back, instead of waiting out
-    // the backoff. kick() is null-safe before the transport exists.
-    if (Platform.isMobile) {
-      this.registerDomEvent(document, "visibilitychange", () => {
-        if (document.visibilityState === "visible") this.transport?.kick();
-      });
-      this.registerDomEvent(window, "online", () => this.transport?.kick());
-    }
+    // Android throttling and desktop suspend can both strand dirty docs behind a socket that never
+    // reported a clean disconnect. Force an immediate reconnect when the app becomes visible or
+    // the network comes back, instead of waiting out the backoff. Desktop visibilitychange covers
+    // minimise/restore and occlusion, not ordinary alt-tab, so this stays low-frequency.
+    // Reconnecting the socket is NOT sufficient on its own. The engine's reconnect catch-up only
+    // runs when a `connected` status follows an `offline` one, and `offline` is mapped solely from
+    // a clean WebSocket disconnect. A frozen Android process can resume holding a socket that
+    // never reported one, leaving dirty docs un-pushed and the pending-gated self-heal unarmed
+    // until a manual re-verify. resumeCatchUp() arms that path without needing the offline edge;
+    // it coalesces repeated calls and no-ops before startup, so firing it on every resume is safe.
+    this.registerDomEvent(document, "visibilitychange", () => {
+      if (document.visibilityState !== "visible") return;
+      this.runResumeCatchUp(Date.now());
+    });
+    this.registerDomEvent(window, "online", () => {
+      this.runResumeCatchUp(Date.now());
+    });
 
     // Gate engine start on layout-ready so Obsidian's startup file inventory doesn't flood ingest as
     // user creates (and so the editor binding doesn't bind before the engine exists).
@@ -391,8 +432,26 @@ export default class ZyncPlugin extends Plugin {
       // Gated the same way as configPort (registers a "raw" watcher; no cost when not needed).
       let communityPluginsPort: ObsidianCommunityPlugins | undefined;
       if (this.settings.syncConfig.plugins) {
-        communityPluginsPort = new ObsidianCommunityPlugins(this.app.vault);
-        this.communityPluginsPort = communityPluginsPort;
+        const rawPort = new ObsidianCommunityPlugins(this.app.vault);
+        this.communityPluginsPort = rawPort;
+        this.communityPluginsFloorError = null;
+        // Wrap writeAtomic so a failed restart-floor write is observable here. The engine builds
+        // PluginEnabledChannel without onProjectionError; this wrap is the plugin-side surface.
+        const plugin = this;
+        communityPluginsPort = {
+          read: () => rawPort.read(),
+          writeAtomic: async (ids: string[]) => {
+            try {
+              await rawPort.writeAtomic(ids);
+              plugin.communityPluginsFloorError = null;
+            } catch (err) {
+              plugin.communityPluginsFloorError = err;
+              throw err;
+            }
+          },
+          onChange: (cb) => rawPort.onChange(cb),
+          close: () => rawPort.close(),
+        } as ObsidianCommunityPlugins;
       }
 
       const engine = new SyncEngine(
@@ -434,10 +493,12 @@ export default class ZyncPlugin extends Plugin {
         });
       }
       // ONE engine subscription for the whole session, wired before start(). Deliberately not
-      // per-subscriber: see onReadinessChange.
+      // per-subscriber: see onReadinessChange. Also drives a status refresh when the index
+      // becomes readable mid-start — so inbox/progress are not dark for the whole of start().
       this.unsubs.push(
         engine.onIndexReadable(() => {
           this.notifyReadiness();
+          void this.refreshStatus();
         }),
       );
       this.unsubs.push(
@@ -463,8 +524,11 @@ export default class ZyncPlugin extends Plugin {
           desired: () => new Set(engine.desiredActivePlugins()),
           running: () => new Set(this.runtime?.enabledIds() ?? []),
           isManaged: (id) => engine.isManaged(id),
-          enable: (id) => this.runtime?.enable(id) ?? Promise.resolve(),
-          disable: (id) => this.runtime?.disable(id) ?? Promise.resolve(),
+          enable: (id) => this.runtime?.enable(id) ?? Promise.reject(new Error("no runtime")),
+          disable: (id) => this.runtime?.disable(id) ?? Promise.reject(new Error("no runtime")),
+          onApplyFailed: (id, wantEnabled, err) => {
+            void this.surfacePluginApplyFailure(id, wantEnabled, err);
+          },
         });
         this.reconcileUnsub = engine.onPluginsChanged(() => {
           this.reconcilePlugins();
@@ -522,10 +586,19 @@ export default class ZyncPlugin extends Plugin {
       // Poll pending count for the status bar. Tracked so stopEngine clears it — registerInterval
       // alone would leak one timer per restart. Coarse cadence (STATUS_POLL_INTERVAL_MS) because
       // syncSnapshot() is O(n) disk I/O; connection status arrives push-style via onStatus above.
-      this.statusTimer = window.setInterval(
-        () => void this.refreshStatus(),
-        STATUS_POLL_INTERVAL_MS,
-      );
+      this.lastStatusTickAt = Date.now();
+      this.statusTimer = window.setInterval(() => {
+        const now = Date.now();
+        const resumed = detectedResumeGap(
+          this.lastStatusTickAt,
+          now,
+          STATUS_POLL_INTERVAL_MS,
+          RESUME_GAP_THRESHOLD_MS,
+        );
+        this.lastStatusTickAt = now;
+        if (resumed) this.runResumeCatchUp(now);
+        void this.refreshStatus();
+      }, STATUS_POLL_INTERVAL_MS);
       void this.refreshStatus();
       console.log("[zync] engine started");
     } catch (err) {
@@ -566,8 +639,11 @@ export default class ZyncPlugin extends Plugin {
       window.clearInterval(this.statusTimer);
       this.statusTimer = null;
     }
+    this.lastStatusTickAt = null;
+    this.lastResumeCatchUpAt = null;
     // Reset the in-flight guard so a mid-poll stop doesn't permanently block polling after restart.
     this.statusRefreshInFlight = false;
+    this.statusRefreshAgain = false;
     // Reset the cached counts so a restart doesn't briefly render a stale number.
     this.lastCounts = ZERO_COUNTS;
     this.lastStuckIds = [];
@@ -645,6 +721,13 @@ export default class ZyncPlugin extends Plugin {
 
   // ── status + conflicts ───────────────────────────────────────────────────────
 
+  private runResumeCatchUp(now: number): void {
+    if (!canRunResumeCatchUp(this.lastResumeCatchUpAt, now, RESUME_REFIRE_INTERVAL_MS)) return;
+    this.lastResumeCatchUpAt = now;
+    this.transport?.kick();
+    this.engine?.resumeCatchUp();
+  }
+
   private async refreshStatus(): Promise<void> {
     // Render the CHEAP current state immediately (connText + last-known counts). This path runs on
     // every call — including the push-driven onStatus calls — so a connection change is reflected
@@ -653,7 +736,11 @@ export default class ZyncPlugin extends Plugin {
     this.refreshCatchupNotice();
     // Skip the EXPENSIVE O(n) syncSnapshot() scan if a previous one is still running — prevents
     // unbounded pileup during a large first-sync where a single scan can exceed the poll interval.
-    if (this.statusRefreshInFlight) return;
+    // Latch a follow-up: without it, a scan >8s drops the next interval and counts lag 16s+.
+    if (this.statusRefreshInFlight) {
+      this.statusRefreshAgain = true;
+      return;
+    }
     this.statusRefreshInFlight = true;
     try {
       if (this.engine !== null) {
@@ -675,6 +762,10 @@ export default class ZyncPlugin extends Plugin {
       this.renderStatus(this.lastCounts);
     } finally {
       this.statusRefreshInFlight = false;
+      if (this.statusRefreshAgain) {
+        this.statusRefreshAgain = false;
+        void this.refreshStatus();
+      }
     }
   }
 
@@ -682,12 +773,10 @@ export default class ZyncPlugin extends Plugin {
     const { pending, arriving, sending } = counts;
     const el = this.statusBar;
     if (el === null) return;
-    const engine = this.engineReady ? this.engine : null;
-    const b = engine?.blobProgress();
-    const files =
-      b && b.total > 0 && b.materialized < b.total
-        ? { done: Math.min(b.materialized, b.total), total: b.total, failed: b.failed }
-        : null;
+    // Read-only progress gates on index readability, NOT engineReady — same split as
+    // synced-plugins-gate. Writes stay on engineReady elsewhere.
+    const engine = this.statusReadEngine();
+    const filesSeg = this.blobFilesSegment(engine);
     const nConf = engine ? engine.inbox.list().filter(isActionableConflict).length : 0;
     const nUpdates = engine ? engine.pendingPluginUpdates().length : 0;
     // NEEDS-ATTENTION SPLIT: docs the bounded self-heal gave up on are still counted in `pending`
@@ -732,7 +821,7 @@ export default class ZyncPlugin extends Plugin {
       nStuck,
       nSyncing,
       arrivingSeg === null ? "" : `${arrivingSeg.icon}:${arrivingSeg.text}`,
-      files ? `${String(files.done)}/${String(files.total)}/${String(files.failed)}` : "",
+      filesSeg ? `${filesSeg.icon}:${filesSeg.text}` : "",
       nConf,
       nUpdates,
     ].join("|");
@@ -765,23 +854,57 @@ export default class ZyncPlugin extends Plugin {
     // with the conflict sticky's "Needs attention" wording or the bare conflict count beside it.
     if (nStuck > 0)
       seg("alert-triangle", `${String(nStuck)} stuck`, "zync-status--error", stuckSummary(nStuck));
-    if (files !== null)
-      seg(
-        "download",
-        `Files ${String(files.done)}/${String(files.total)}` +
-          (files.failed > 0 ? ` (${String(files.failed)} failed)` : ""),
-      );
+    if (filesSeg !== null) seg(filesSeg.icon, filesSeg.text);
     if (nConf > 0) seg("alert-triangle", String(nConf), "zync-status--error");
     if (nUpdates > 0) seg("refresh-cw", String(nUpdates));
+  }
+
+  /**
+   * Engine instance safe to READ for status (inbox, blob progress, stuck docs). Gates on index
+   * readability — not engineReady — so progress is visible during start(). Returns null when
+   * maps are not constructed yet (calling inbox/blobProgress then would throw).
+   */
+  private statusReadEngine(): SyncEngine | null {
+    if (this.engine === null || !this.indexReadable) return null;
+    return this.engine;
+  }
+
+  /**
+   * Desktop blob segment from live progress. Try/catch: blobEngine is assigned AFTER index
+   * readability during start(), so an early read must not throw mid-bootstrap.
+   */
+  private blobFilesSegment(engine: SyncEngine | null): ReturnType<typeof blobStatusSegment> {
+    if (engine === null) return null;
+    try {
+      const b = engine.blobProgress();
+      return blobStatusSegment({
+        total: b.total,
+        materialized: b.materialized,
+        failed: b.failed,
+        written: b.written,
+        settled: engine.blobsSettled(),
+      });
+    } catch {
+      return null; // blobEngine not constructed yet
+    }
   }
 
   /** The single place the arriving surfaces read their inputs, so the status bar and the mobile
    *  notice can never disagree about hydration, connection or counts. */
   private arrivingInputs(counts: StatusCounts): ArrivingInputs {
-    const engine = this.engineReady ? this.engine : null;
-    const b = engine?.blobProgress();
+    const engine = this.statusReadEngine();
+    let b: { total: number; materialized: number; failed: number; written: number } | undefined;
+    let settled = true;
+    if (engine !== null) {
+      try {
+        b = engine.blobProgress();
+        settled = engine.blobsSettled();
+      } catch {
+        b = undefined;
+      }
+    }
     return {
-      started: engine !== null,
+      started: this.engine !== null,
       connected: this.connText === "connected",
       hydrated: engine?.isIndexHydrated() ?? false,
       arriving: counts.arriving,
@@ -797,11 +920,8 @@ export default class ZyncPlugin extends Plugin {
       // merely re-verifying files already on disk — a sticky "Receiving N attachments" on every
       // launch. Same principle as the index-hydration gate: a count of "not yet checked" must not
       // be rendered as a count of "not here".
-      //
-      // Pre-existing limit, NOT fixed here: the desktop "Files x/y" status-bar segment (below, in
-      // renderStatus) reads blobProgress() directly and does not have this gate — out of scope.
       blobsOutstanding:
-        b && engine !== null && !engine.blobsSettled() && b.written > 0
+        b && engine !== null && !settled && b.written > 0
           ? Math.max(0, b.total - b.materialized - b.failed)
           : 0,
       showing: this.arrivingNoticeEl !== null,
@@ -832,7 +952,9 @@ export default class ZyncPlugin extends Plugin {
       notifyInfo("Open a file", "Open a file first, then run this.");
       return;
     }
-    if (!this.engineReady || this.engine === null) {
+    // Three-way: unconfigured vs still-starting vs ready. The old branch treated "not ready" as
+    // "no relay URL", so a correctly configured vault was told to set a URL during the long start().
+    if (this.engine === null || this.settings.serverWs === "") {
       notify({
         kind: "info",
         title: "Not running",
@@ -840,6 +962,10 @@ export default class ZyncPlugin extends Plugin {
         durationMs: 0,
         action: { label: "Open settings", run: () => this.openZyncSettings() },
       });
+      return;
+    }
+    if (!this.engineReady) {
+      notifyInfo("Still starting", "Zync is still starting. Try again in a moment.");
       return;
     }
     this.showExplanation(await this.engine.explain(file.path as VaultPath));
@@ -872,13 +998,9 @@ export default class ZyncPlugin extends Plugin {
 
   /** Full current status line from live state — for the on-demand "Zync: show status" command. */
   private currentStatusText(): string {
-    const engine = this.engineReady ? this.engine : null;
-    const b = engine?.blobProgress();
-    const files =
-      b && b.total > 0 && b.materialized < b.total
-        ? ` · Files ${String(Math.min(b.materialized, b.total))}/${String(b.total)}` +
-          (b.failed > 0 ? ` (${String(b.failed)} failed)` : "")
-        : "";
+    const engine = this.statusReadEngine();
+    const filesSeg = this.blobFilesSegment(engine);
+    const files = filesSeg !== null ? ` · ${filesSeg.text}` : "";
     const nConf = engine ? engine.inbox.list().filter(isActionableConflict).length : 0;
     const conf = nConf > 0 ? ` · ${String(nConf)} conflict${nConf === 1 ? "" : "s"}` : "";
     const nUpdates = engine ? engine.pendingPluginUpdates().length : 0;
@@ -906,15 +1028,17 @@ export default class ZyncPlugin extends Plugin {
     if (!Platform.isMobile) return;
 
     const connected = this.connText === "connected";
-    const synced = this.engine !== null && this.isIndexSynced();
-    if (connected && !synced) this.catchupSince ??= Date.now();
+    // isIndexCaughtUp clears on disconnect and re-arms on reconnect — isIndexSynced never clears,
+    // so feeding that made this notice permanently dead after the first handshake of a session.
+    const caughtUp = this.engine !== null && this.engine.isIndexCaughtUp();
+    if (connected && !caughtUp) this.catchupSince ??= Date.now();
     else this.catchupSince = null;
 
     const view = catchupNotice({
       isMobile: true,
       started: this.engine !== null,
       connected,
-      indexSynced: synced,
+      indexCaughtUp: caughtUp,
       waitingMs: this.catchupSince === null ? 0 : Date.now() - this.catchupSince,
       showing: this.catchupSticky !== null,
     });
@@ -1130,7 +1254,9 @@ export default class ZyncPlugin extends Plugin {
   }
 
   private openInbox(): void {
-    if (this.engine === null) {
+    // Read-only listing: allow once the index surface exists, even mid-start. Writes inside the
+    // modal still go through the engine and fail safely if start() is incomplete.
+    if (this.engine === null || !this.indexReadable) {
       notifyInfo("Not started", "Sync hasn't started yet.");
       return;
     }
@@ -1187,12 +1313,48 @@ export default class ZyncPlugin extends Plugin {
    * (what app.plugins currently has running). Enables anything desired-but-not-running, and disables
    * anything running-but-not-desired IF Zync manages it (never touch a user's local-only plugin).
    *
-   * Each call is fire-and-forget (void). Failures in enable/disable are caught inside
-   * ObsidianPluginRuntime and degrade silently — the community-plugins.json projection (floor) still
-   * ensures the plugin activates after the next Obsidian restart.
+   * Each call is fire-and-forget (void). Failures in enable/disable are reported via
+   * onApplyFailed → surfacePluginApplyFailure (live apply used to swallow and claim success).
    */
   private reconcilePlugins(): void {
     this.reconciler?.reconcile();
+  }
+
+  /**
+   * Live enable/disable did not take effect. Check whether the community-plugins.json restart
+   * floor holds the desired state; tell the user either "reload to finish" or "could not apply".
+   */
+  private async surfacePluginApplyFailure(
+    id: string,
+    wantEnabled: boolean,
+    err: unknown,
+  ): Promise<void> {
+    let floorHasId = false;
+    try {
+      const arr = (await this.communityPluginsPort?.read()) ?? [];
+      floorHasId = arr.includes(id);
+    } catch {
+      floorHasId = false;
+    }
+    // A recorded write error means the floor write itself failed — treat as floor miss even if
+    // a stale read still lists the id from a prior session.
+    if (this.communityPluginsFloorError !== null) {
+      floorHasId = wantEnabled ? false : true; // force floorOk=false in pluginApplyFailureNotice
+    }
+    const notice = pluginApplyFailureNotice(id, wantEnabled, floorHasId);
+    if (notice.kind !== "reload-needed") return;
+    const detail = notice.detail + (err instanceof Error && err.message ? ` (${err.message})` : "");
+    if (notice.floorOk) {
+      notifyWarning(notice.title, detail, {
+        label: "Reload Obsidian",
+        run: () => this.runCommand("app:reload"),
+      });
+    } else {
+      notifyError(notice.title, detail, {
+        label: "Reload Obsidian",
+        run: () => this.runCommand("app:reload"),
+      });
+    }
   }
 
   // ── settings ───────────────────────────────────────────────────────────────
@@ -1322,11 +1484,17 @@ export default class ZyncPlugin extends Plugin {
     return this.engine.listPluginSuppress();
   }
 
-  /** Durably suppress/unsuppress a plugin on this device. No-op when engine is not yet started. */
+  /** Durably suppress/unsuppress a plugin on this device.
+   *
+   * THROWS when the engine is not usable yet — same contract as setPluginOptIn. Swallowing used
+   * to look like a broken toggle: the click was discarded, the re-render read unchanged state,
+   * and the switch snapped back with no explanation.
+   */
   async setPluginSuppressed(id: string, suppressed: boolean): Promise<void> {
-    if (this.engineReady && this.engine !== null) {
-      await this.engine.setPluginSuppressed(id, suppressed);
+    if (!this.engineReady || this.engine === null) {
+      throw new Error("Zync is still starting. Try again in a moment.");
     }
+    await this.engine.setPluginSuppressed(id, suppressed);
   }
 
   /** All plugins with a shared enabled entry (shared CRDT state). Empty until index is readable. */
@@ -1749,7 +1917,14 @@ class ZyncSettingTab extends PluginSettingTab {
         )
         .addToggle((t) =>
           t.setValue(!state.suppressed).onChange(async (v) => {
-            await this.plugin.setPluginSuppressed(p.id, !v);
+            try {
+              await this.plugin.setPluginSuppressed(p.id, !v);
+            } catch (err) {
+              notifyWarning(
+                "Could not change device setting",
+                `${p.name}: ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
             this.display();
           }),
         );
@@ -1767,8 +1942,15 @@ class ZyncSettingTab extends PluginSettingTab {
       if (state.deviated) {
         new Setting(panel).addButton((b) =>
           b.setButtonText("Reset to defaults").onClick(async () => {
-            await this.plugin.setPluginSuppressed(p.id, false);
-            await this.plugin.setPluginSettingsSync(p.id, true);
+            try {
+              await this.plugin.setPluginSuppressed(p.id, false);
+              await this.plugin.setPluginSettingsSync(p.id, true);
+            } catch (err) {
+              notifyWarning(
+                "Could not reset",
+                `${p.name}: ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
             this.display();
           }),
         );

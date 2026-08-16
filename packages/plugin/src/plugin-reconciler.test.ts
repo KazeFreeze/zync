@@ -58,4 +58,45 @@ describe("PluginReconciler", () => {
     await flush();
     expect(h.running.has("a")).toBe(false); // converged to the latest desired
   });
+
+  /**
+   * enable that resolves without flipping `running` used to look like success for five rounds,
+   * then exit silently — the UI claimed the plugin was on when it was not.
+   */
+  it("reports when enable claims success but the plugin stays inactive", async () => {
+    const failures: { id: string; want: boolean }[] = [];
+    const deps: ReconcilerDeps = {
+      desired: () => new Set(["a"]),
+      running: () => new Set(), // never flips — the false-success path
+      isManaged: () => true,
+      enable: async () => undefined, // resolves, does nothing
+      disable: async () => undefined,
+      onApplyFailed: (id, wantEnabled) => {
+        failures.push({ id, want: wantEnabled });
+      },
+    };
+    new PluginReconciler(deps).reconcile();
+    await flush();
+    expect(failures).toEqual([{ id: "a", want: true }]);
+  });
+
+  it("reports when enable rejects instead of swallowing the error", async () => {
+    const failures: unknown[] = [];
+    const deps: ReconcilerDeps = {
+      desired: () => new Set(["a"]),
+      running: () => new Set(),
+      isManaged: () => true,
+      enable: async () => {
+        throw new Error("API missing");
+      },
+      disable: async () => undefined,
+      onApplyFailed: (_id, _want, err) => {
+        failures.push(err);
+      },
+    };
+    new PluginReconciler(deps).reconcile();
+    await flush();
+    expect(failures).toHaveLength(1);
+    expect(String(failures[0])).toMatch(/API missing/);
+  });
 });
