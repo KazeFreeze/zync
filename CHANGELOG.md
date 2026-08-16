@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.2](https://github.com/KazeFreeze/zync/compare/zync-v0.12.1...zync-v0.12.2) (2026-08-16)
+
+
+### Bug Fixes
+
+* harden startup, reconnect and failure reporting across the sync engine ([95f0892](https://github.com/KazeFreeze/zync/commit/95f0892039b71076e079c511b984cbc373f368db))
+
 ## [0.12.1](https://github.com/KazeFreeze/zync/compare/zync-v0.12.0...zync-v0.12.1) (2026-08-05)
 
 
