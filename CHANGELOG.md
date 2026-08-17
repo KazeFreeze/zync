@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/KazeFreeze/zync/compare/zync-v0.12.3...zync-v0.13.0) (2026-08-17)
+
+
+### Features
+
+* **config:** sync plugin settings per key instead of per file ([ae7754e](https://github.com/KazeFreeze/zync/commit/ae7754eb4544a3f60f70c1edccca46a8a28ed4de))
+
 ## [0.12.3](https://github.com/KazeFreeze/zync/compare/zync-v0.12.2...zync-v0.12.3) (2026-08-17)
 
 
