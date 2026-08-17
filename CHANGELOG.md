@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.3](https://github.com/KazeFreeze/zync/compare/zync-v0.12.2...zync-v0.12.3) (2026-08-17)
+
+
+### Bug Fixes
+
+* **config:** stop a plugin settings write from being discarded mid-flight ([0fce8ca](https://github.com/KazeFreeze/zync/commit/0fce8caa8ed20c4cb0cd7cd91097dfbc9917628a))
+
 ## [0.12.2](https://github.com/KazeFreeze/zync/compare/zync-v0.12.1...zync-v0.12.2) (2026-08-16)
 
 
