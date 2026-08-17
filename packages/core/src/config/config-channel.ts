@@ -19,6 +19,7 @@ import {
   type EchoDecision,
 } from "./plugin-data-classify.js";
 import { ConfigLoopBreaker } from "./loop-breaker.js";
+import { pluginSyncPolicy } from "./plugin-sync-policy.js";
 
 export interface ConfigChannelDeps {
   config: CrdtMap<ConfigEntry>;
@@ -388,13 +389,19 @@ export class ConfigChannel {
           ? tryParseJson(await this.d.blobStore.get(m))
           : undefined;
       const local = tryParseJson(bytes);
+      const id = pluginIdOf(path);
+      const policy = id === undefined ? undefined : pluginSyncPolicy(id);
+      const noisyKeys =
+        policy?.kind === "sync-except"
+          ? new Set([...NOISY_DATA_KEYS, ...policy.volatileKeys])
+          : NOISY_DATA_KEYS;
       const decision: EchoDecision = classifyPluginDataChange({
         s: sha256,
         m,
         r,
         materialized,
         local,
-        noisyKeys: NOISY_DATA_KEYS,
+        noisyKeys,
       });
       if (decision === "suppress") return;
       if (decision === "adopt-normalized") {

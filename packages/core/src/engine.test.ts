@@ -203,9 +203,11 @@ describe("SyncEngine tracked promise cleanup", () => {
 
 describe("SyncEngine config watcher generations", () => {
   it("publishes the newest same-path plugin-data write without letting its in-flight predecessor manufacture a conflict", async () => {
-    const dataPath = path(".obsidian/plugins/omnisearch/data.json");
-    const firstBytes = bytes(`{"useCache":false}`);
-    const secondBytes = bytes(`{"useCache":true}`);
+    // Use an ordinary setting: omnisearch.useCache is now intentionally volatile-only and should
+    // be suppressed, which is orthogonal to the watcher-generation behavior this test isolates.
+    const dataPath = path(".obsidian/plugins/dataview/data.json");
+    const firstBytes = bytes(`{"theme":"light"}`);
+    const secondBytes = bytes(`{"theme":"dark"}`);
     const firstSha = await sha256OfBytes(firstBytes);
     const secondSha = await sha256OfBytes(secondBytes);
     const listeners = new Set<(changed: VaultPath) => void>();
@@ -243,7 +245,7 @@ describe("SyncEngine config watcher generations", () => {
       },
     });
     await engine.start();
-    await engine.setPluginOptIn("omnisearch", true);
+    await engine.setPluginOptIn("dataview", true);
 
     let releaseFirst = (): void => undefined;
     const firstHeld = new Promise<void>((resolve) => {

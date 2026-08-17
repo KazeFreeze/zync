@@ -101,4 +101,15 @@ describe("settingsSyncOff() reader (Slice 3b)", () => {
     await engine.setPluginSettingsSync("dv", true);
     expect(engine.settingsSyncOff()).not.toContain("dv");
   });
+
+  it("keeps explicit values distinguishable from an absent built-in default", async () => {
+    engine = makeEngine();
+    await engine.start();
+
+    expect(engine.pluginSettingsSyncOverrides()).toEqual([]);
+    await engine.setPluginSettingsSync("dv", true);
+    expect(engine.pluginSettingsSyncOverrides()).toEqual([{ id: "dv", enabled: true }]);
+    await engine.resetPluginSettingsSync("dv");
+    expect(engine.pluginSettingsSyncOverrides()).toEqual([]);
+  });
 });

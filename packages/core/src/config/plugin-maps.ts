@@ -1,5 +1,6 @@
 import type { CrdtMap, Unsubscribe, VaultPath } from "../ports.js";
 import { pluginIdOf, isPluginDataPath } from "./config-entry.js";
+import { pluginSettingsSyncEnabled } from "./plugin-sync-policy.js";
 
 /** Shared per-plugin metadata, written by the opting-in device from its local manifest. */
 export interface PluginMeta {
@@ -12,7 +13,7 @@ export class PluginGate {
     private readonly optIn: CrdtMap<boolean>,
     private readonly meta: CrdtMap<PluginMeta>,
     private readonly isMobile: boolean,
-    /** Slice 3: per-plugin settings-sync toggle (default ON: absent = sync). Consulted only for data paths. */
+    /** Per-plugin settings-sync override. Absence defers to the built-in policy. */
     private readonly settingsSync?: CrdtMap<boolean>,
   ) {}
 
@@ -24,7 +25,8 @@ export class PluginGate {
   allows(path: VaultPath): boolean {
     const id = pluginIdOf(path);
     if (id === undefined) return true; // not a plugin path — gate is transparent
-    if (isPluginDataPath(path) && this.settingsSync?.get(id) === false) return false; // S3-2 off-switch
+    if (isPluginDataPath(path) && !pluginSettingsSyncEnabled(id, this.settingsSync?.get(id)))
+      return false;
     return this.optIn.get(id) === true && this.platformAllowed(id);
   }
 

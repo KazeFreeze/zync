@@ -14,6 +14,7 @@ export const NOISY_DATA_KEYS: ReadonlySet<string> = new Set([
   "lastSaved",
   "lastUpdated",
   "lastModified",
+  "lastShownVersion",
   "timestamp",
 ]);
 

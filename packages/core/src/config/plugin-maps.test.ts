@@ -67,4 +67,16 @@ describe("PluginGate — settingsSync (Slice 3)", () => {
   it("data path denied when not opted-in regardless of settingsSync", () => {
     expect(gateWithSettings([["dv", false]], [["dv", true]]).allows(data("dv"))).toBe(false);
   });
+  it("explicit true and false override the built-in policy default", () => {
+    const enabled = gateWithSettings(
+      [["future-local-plugin", true]],
+      [["future-local-plugin", true]],
+    );
+    const disabled = gateWithSettings(
+      [["future-local-plugin", true]],
+      [["future-local-plugin", false]],
+    );
+    expect(enabled.allows(data("future-local-plugin"))).toBe(true);
+    expect(disabled.allows(data("future-local-plugin"))).toBe(false);
+  });
 });

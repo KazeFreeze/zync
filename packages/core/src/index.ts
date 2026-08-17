@@ -28,6 +28,12 @@ export {
 } from "./config/config-entry.js";
 export type { ConfigEntry, ConfigCategory } from "./config/config-entry.js";
 export type { CommunityPluginsPort } from "./config/plugin-enabled-channel.js";
+export {
+  pluginSettingsSyncEnabled,
+  pluginSyncPolicy,
+  policySettingsSyncEnabled,
+} from "./config/plugin-sync-policy.js";
+export type { PluginSyncPolicy } from "./config/plugin-sync-policy.js";
 export { sha256OfBytes, sha256OfText } from "./hash.js";
 export { reconnectHealJitterMs } from "./reconnect-jitter.js";
 export { diffToEdits, merge3, applyEdits } from "./bridge/merge.js";

@@ -1505,14 +1505,19 @@ export default class ZyncPlugin extends Plugin {
 
   // ── Slice 3b: per-plugin settings-sync control ──────────────────────────────
 
-  /** Plugin ids excluded from settings (data.json) sync on this device. Empty when not started. */
-  listPluginSettingsSyncOff(): string[] {
-    return this.engine?.settingsSyncOff() ?? [];
+  /** Explicit per-plugin settings-sync values. Built-in defaults remain absent. */
+  listPluginSettingsSyncOverrides(): { id: string; enabled: boolean }[] {
+    return this.engine?.pluginSettingsSyncOverrides() ?? [];
   }
 
   /** Enable/disable data.json sync for a specific plugin. No-op when engine is not yet started. */
   async setPluginSettingsSync(id: string, on: boolean): Promise<void> {
     await this.engine?.setPluginSettingsSync(id, on);
+  }
+
+  /** Remove an explicit value and return to the built-in policy. */
+  async resetPluginSettingsSync(id: string): Promise<void> {
+    await this.engine?.resetPluginSettingsSync(id);
   }
 }
 
@@ -1780,7 +1785,9 @@ class ZyncSettingTab extends PluginSettingTab {
         .map((p) => p.id),
     );
     const suppressed = new Set(this.plugin.listPluginSuppress());
-    const settingsOff = new Set(this.plugin.listPluginSettingsSyncOff());
+    const settingsOverrides = new Map(
+      this.plugin.listPluginSettingsSyncOverrides().map(({ id, enabled }) => [id, enabled]),
+    );
 
     // `inert` folds the two read-only reasons into the one the row already understands: the master
     // toggle being off, and start() not having finished yet. Both mean "show the truth, take no
@@ -1789,7 +1796,7 @@ class ZyncSettingTab extends PluginSettingTab {
     const list = containerEl.createDiv({ cls: "zync-plugin-list" });
     if (inert) list.addClass("zync-disabled");
     for (const p of installedCommunityPlugins(this.app)) {
-      this.renderPluginRow(list, p, optedIn, suppressed, settingsOff, inert);
+      this.renderPluginRow(list, p, optedIn, suppressed, settingsOverrides, inert);
     }
   }
 
@@ -1829,11 +1836,11 @@ class ZyncSettingTab extends PluginSettingTab {
     p: InstalledPlugin,
     optedIn: ReadonlySet<string>,
     suppressed: ReadonlySet<string>,
-    settingsOff: ReadonlySet<string>,
+    settingsOverrides: ReadonlyMap<string, boolean>,
     disabled: boolean,
   ): void {
     const synced = optedIn.has(p.id);
-    const state = overrideState(p.id, suppressed, settingsOff);
+    const state = overrideState(p.id, suppressed, settingsOverrides);
     const expanded = this.expandedPluginIds.has(p.id);
 
     const toggleExpand = (): void => {
@@ -1843,7 +1850,9 @@ class ZyncSettingTab extends PluginSettingTab {
       this.display();
     };
 
-    const row = new Setting(containerEl).setName(p.name);
+    const row = new Setting(containerEl)
+      .setName(p.name)
+      .setDesc(`${state.settingsPolicy.summary}. ${state.settingsPolicy.reason}`);
 
     // Description line: deviation chips + optional desktop-only note; empty when
     // synced at defaults (the calm common case).
@@ -1852,8 +1861,8 @@ class ZyncSettingTab extends PluginSettingTab {
     // hidden, sub-panel not rendered), promising state the row can't clear.
     if (synced && state.suppressed)
       row.descEl.createSpan({ cls: "zync-override-chip", text: "off here" });
-    if (synced && state.settingsLocal)
-      row.descEl.createSpan({ cls: "zync-override-chip", text: "local settings" });
+    if (synced && state.settingsPolicy.overridden)
+      row.descEl.createSpan({ cls: "zync-override-chip", text: "settings override" });
     if (p.isDesktopOnly) row.descEl.createSpan({ cls: "zync-note", text: "Desktop only" });
 
     // Chevron (left of the toggle): reveals per-device options. Hidden until
@@ -1931,9 +1940,9 @@ class ZyncSettingTab extends PluginSettingTab {
 
       new Setting(panel)
         .setName("Sync settings")
-        .setDesc("Also sync this plugin's settings. Turn off to let each device keep its own.")
+        .setDesc(`${state.settingsPolicy.summary}. ${state.settingsPolicy.reason}`)
         .addToggle((t) =>
-          t.setValue(!state.settingsLocal).onChange(async (v) => {
+          t.setValue(state.settingsPolicy.enabled).onChange(async (v) => {
             await this.plugin.setPluginSettingsSync(p.id, v);
             this.display();
           }),
@@ -1944,7 +1953,7 @@ class ZyncSettingTab extends PluginSettingTab {
           b.setButtonText("Reset to defaults").onClick(async () => {
             try {
               await this.plugin.setPluginSuppressed(p.id, false);
-              await this.plugin.setPluginSettingsSync(p.id, true);
+              await this.plugin.resetPluginSettingsSync(p.id);
             } catch (err) {
               notifyWarning(
                 "Could not reset",

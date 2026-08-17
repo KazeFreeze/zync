@@ -43,3 +43,10 @@ describe("tryParseJson", () => {
     expect(tryParseJson(null)).toBeUndefined();
   });
 });
+
+describe("NOISY_DATA_KEYS", () => {
+  it("treats the shared release-notes marker as volatile but keeps schema versions", () => {
+    expect(NOISY_DATA_KEYS.has("lastShownVersion")).toBe(true);
+    expect(NOISY_DATA_KEYS.has("settingsVersion")).toBe(false);
+  });
+});

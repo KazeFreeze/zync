@@ -2,7 +2,15 @@ import { describe, it, expect, vi } from "vitest";
 import { ConfigChannel } from "./config-channel.js";
 import { sha256OfBytes } from "../hash.js";
 import { canonicalJsonBytes } from "./canonical.js";
-import type { CrdtMap, BlobStorePort, ConfigPort, IdentityPort, Unsubscribe } from "../ports.js";
+import type {
+  CrdtMap,
+  BlobStorePort,
+  ConfigPort,
+  IdentityPort,
+  Sha256,
+  Unsubscribe,
+  VaultPath,
+} from "../ports.js";
 import type { ConfigEntry } from "./config-entry.js";
 import type { EchoLedger } from "../bridge/echo.js";
 
@@ -508,7 +516,16 @@ describe("ConfigChannel", () => {
       `.obsidian/plugins/${id}/data.json` as Parameters<typeof ConfigChannel.prototype.publish>[0];
 
     /** Build a channel wired with a real in-memory blob store and configPort that can return manifest bytes. */
-    function makePluginDataChannel(manifestBytes: Uint8Array | null) {
+    function makePluginDataChannel(
+      manifestBytes: Uint8Array | null,
+      dataBytes: Uint8Array | null = null,
+      engineState?: {
+        getConfigLocalVersion(path: VaultPath): Promise<number>;
+        setConfigLocalVersion(path: VaultPath, version: number): Promise<void>;
+        getConfigNormalizedSha(path: VaultPath): Promise<Sha256 | null>;
+        setConfigNormalizedSha(path: VaultPath, sha256: Sha256 | null): Promise<void>;
+      },
+    ) {
       const configMap = memMap<ConfigEntry>();
       const blobStore = memBlobStore();
 
@@ -516,6 +533,7 @@ describe("ConfigChannel", () => {
         if (path.endsWith("/manifest.json") && manifestBytes !== null) {
           return Promise.resolve(manifestBytes);
         }
+        if (path.endsWith("/data.json")) return Promise.resolve(dataBytes);
         return Promise.resolve(null as Uint8Array | null);
       });
       const configPort: ConfigPort = {
@@ -547,10 +565,20 @@ describe("ConfigChannel", () => {
         echo,
         enabledCategories: { themes: true, snippets: true, plugins: true, "plugin-data": true },
         gate: stubGate(() => true),
+        ...(engineState === undefined ? {} : { engineState }),
         now: () => 0,
       });
 
       return { ch, configMap, blobStore };
+    }
+
+    function normalizationState() {
+      return {
+        getConfigLocalVersion: vi.fn(() => Promise.resolve(0)),
+        setConfigLocalVersion: vi.fn(() => Promise.resolve()),
+        getConfigNormalizedSha: vi.fn(() => Promise.resolve(null)),
+        setConfigNormalizedSha: vi.fn(() => Promise.resolve()),
+      };
     }
 
     it("plugin-data: publishes canonical bytes + stamps version from sibling manifest", async () => {
@@ -581,6 +609,76 @@ describe("ConfigChannel", () => {
       const second = configMap.get(dataPath("dv"));
       if (second === undefined) throw new Error("expected plugin-data entry");
       expect(second.sha256).toBe(sha1);
+    });
+
+    it("plugin-data: suppresses a TaskNotes change limited to its device-local calendar cache", async () => {
+      const path = dataPath("tasknotes");
+      const remote = enc(`{"fieldMapping":{"title":"title"},"googleCalendarEventIndex":{"a":1}}`);
+      const local = enc(`{"fieldMapping":{"title":"title"},"googleCalendarEventIndex":{"a":2}}`);
+      const state = normalizationState();
+      const { ch, configMap, blobStore } = makePluginDataChannel(null, local, state);
+      const remoteSha = await sha256OfBytes(canonicalJsonBytes(remote));
+      await blobStore.put(remoteSha, canonicalJsonBytes(remote));
+      configMap.set(path, {
+        sha256: remoteSha,
+        size: remote.length,
+        category: "plugin-data",
+        deviceId: "peer" as never,
+      });
+
+      await ch["onLocalChange"](path);
+
+      expect(configMap.get(path)?.sha256).toBe(remoteSha);
+      expect(state.setConfigNormalizedSha).toHaveBeenCalledWith(
+        path,
+        await sha256OfBytes(canonicalJsonBytes(local)),
+      );
+    });
+
+    it("plugin-data: publishes a real TaskNotes setting change with volatile data intact", async () => {
+      const path = dataPath("tasknotes");
+      const remote = enc(`{"fieldMapping":{"title":"title"},"googleCalendarEventIndex":{"a":1}}`);
+      const local = enc(`{"fieldMapping":{"title":"name"},"googleCalendarEventIndex":{"a":2}}`);
+      const state = normalizationState();
+      const { ch, configMap, blobStore } = makePluginDataChannel(null, local, state);
+      const remoteSha = await sha256OfBytes(canonicalJsonBytes(remote));
+      await blobStore.put(remoteSha, canonicalJsonBytes(remote));
+      configMap.set(path, {
+        sha256: remoteSha,
+        size: remote.length,
+        category: "plugin-data",
+        deviceId: "peer" as never,
+      });
+
+      await ch["onLocalChange"](path);
+
+      const published = configMap.get(path);
+      if (published === undefined) throw new Error("expected published plugin data");
+      expect(published.sha256).not.toBe(remoteSha);
+      expect(JSON.parse(new TextDecoder().decode(await blobStore.get(published.sha256)))).toEqual({
+        fieldMapping: { title: "name" },
+        googleCalendarEventIndex: { a: 2 },
+      });
+    });
+
+    it("plugin-data: does not treat another plugin's matching key name as volatile", async () => {
+      const path = dataPath("another-search-plugin");
+      const remote = enc(`{"useCache":false}`);
+      const local = enc(`{"useCache":true}`);
+      const state = normalizationState();
+      const { ch, configMap, blobStore } = makePluginDataChannel(null, local, state);
+      const remoteSha = await sha256OfBytes(canonicalJsonBytes(remote));
+      await blobStore.put(remoteSha, canonicalJsonBytes(remote));
+      configMap.set(path, {
+        sha256: remoteSha,
+        size: remote.length,
+        category: "plugin-data",
+        deviceId: "peer" as never,
+      });
+
+      await ch["onLocalChange"](path);
+
+      expect(configMap.get(path)?.sha256).not.toBe(remoteSha);
     });
 
     it("plugin-data: no manifest -> entry published without version field", async () => {

@@ -39,6 +39,7 @@ import {
   type ConfigEntry,
 } from "./config/config-entry.js";
 import { PluginGate, type PluginMeta } from "./config/plugin-maps.js";
+import { pluginSettingsSyncEnabled } from "./config/plugin-sync-policy.js";
 import { groupKeyOf, groupMembers } from "./config/config-group.js";
 import type { Route } from "./classify/classify.js";
 import { classify, type Caps } from "./classify/classify.js";
@@ -1790,14 +1791,14 @@ export class SyncEngine {
   /**
    * Publish a plugin's current data.json (settings) so peers get it on opt-in / settings-sync-on
    * (H1: the bundle publish never included data.json, so peers got code but not current settings).
-   * No-op when there's no config port/channel, or when this plugin's settings-sync is explicitly
+   * No-op when there's no config port/channel, or when this plugin's effective settings policy is
    * OFF. The ConfigChannel additionally gates publish by the plugin-data category, so this is a
    * further no-op when that category is disabled on this device.
    */
   private async publishPluginData(id: string): Promise<void> {
     const cfg = this.ports.config;
     if (cfg === undefined || this.configChannel === undefined) return;
-    if (this.pluginsSettingsSync?.get(id) === false) return; // settings-sync explicitly off for id
+    if (!pluginSettingsSyncEnabled(id, this.pluginsSettingsSync?.get(id))) return;
     const dataPath = `.obsidian/plugins/${id}/data.json` as VaultPath;
     const bytes = await cfg.read(dataPath);
     if (bytes !== null) await this.configChannel.publish(dataPath, bytes);
@@ -2059,7 +2060,22 @@ export class SyncEngine {
     if (on) await this.publishPluginData(id);
   }
 
-  /** Plugin ids whose settings-sync is explicitly OFF (default is ON = absent from the map). */
+  /** Remove a user's override so the built-in policy becomes effective again. */
+  async resetPluginSettingsSync(id: string): Promise<void> {
+    const map = this.pluginsSettingsSync;
+    if (map === null) throw new Error("resetPluginSettingsSync: engine not started");
+    map.delete(id);
+    if (pluginSettingsSyncEnabled(id, undefined)) await this.publishPluginData(id);
+  }
+
+  /** Explicit settings-sync overrides only; policy defaults are never written into this map. */
+  pluginSettingsSyncOverrides(): { id: string; enabled: boolean }[] {
+    return this.pluginsSettingsSync === null
+      ? []
+      : [...this.pluginsSettingsSync.entries()].map(([id, enabled]) => ({ id, enabled }));
+  }
+
+  /** Plugin ids whose settings-sync is explicitly OFF. */
   settingsSyncOff(): string[] {
     const out: string[] = [];
     if (this.pluginsSettingsSync !== null)
