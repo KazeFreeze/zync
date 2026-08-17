@@ -1,12 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import { YjsCrdtProvider } from "../../crdt-yjs/src/index.js";
 import { IndexDoc } from "./protocol/index-doc.js";
-import { sha256OfText } from "./hash.js";
+import { sha256OfBytes, sha256OfText } from "./hash.js";
 import { SyncEngine, type EngineConfig, type EnginePorts } from "./engine.js";
 import { INDEX_DOC_ID } from "./ports.js";
 import type {
   AttachedDoc,
   ConnStatus,
+  ConfigPort,
   CrdtDoc,
   DeviceId,
   DocId,
@@ -16,6 +17,7 @@ import type {
   Unsubscribe,
   VaultPath,
 } from "./ports.js";
+import type { ConfigEntry } from "./config/config-entry.js";
 import {
   FakeBlobStore,
   FakeClock,
@@ -196,6 +198,87 @@ describe("SyncEngine tracked promise cleanup", () => {
     } finally {
       process.off("unhandledRejection", unhandled);
     }
+  });
+});
+
+describe("SyncEngine config watcher generations", () => {
+  it("publishes the newest same-path plugin-data write without letting its in-flight predecessor manufacture a conflict", async () => {
+    const dataPath = path(".obsidian/plugins/omnisearch/data.json");
+    const firstBytes = bytes(`{"useCache":false}`);
+    const secondBytes = bytes(`{"useCache":true}`);
+    const firstSha = await sha256OfBytes(firstBytes);
+    const secondSha = await sha256OfBytes(secondBytes);
+    const listeners = new Set<(changed: VaultPath) => void>();
+    let disk: Uint8Array | null = null;
+    const configPort: ConfigPort = {
+      read: (requested) => Promise.resolve(requested === dataPath ? disk : null),
+      writeAtomic: (writtenPath, data) => {
+        if (writtenPath === dataPath) disk = data;
+        for (const listener of listeners) listener(writtenPath);
+        return Promise.resolve();
+      },
+      remove: () => Promise.resolve(),
+      list: () => Promise.resolve([]),
+      onChange: (listener) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+      rescan: () => Promise.resolve(),
+      close: () => undefined,
+    };
+    const externalWrite = (data: Uint8Array): void => {
+      disk = data;
+      for (const listener of listeners) listener(dataPath);
+    };
+    const vault = new FakeVault();
+    const ports = portsFor(vault, new InProcessBus().connect());
+    ports.config = configPort;
+    const engine = new SyncEngine(ports, {
+      ...config,
+      configCategories: {
+        themes: false,
+        snippets: false,
+        plugins: false,
+        "plugin-data": true,
+      },
+    });
+    await engine.start();
+    await engine.setPluginOptIn("omnisearch", true);
+
+    let releaseFirst = (): void => undefined;
+    const firstHeld = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let markFirstHeld = (): void => undefined;
+    const firstReachedAwait = new Promise<void>((resolve) => {
+      markFirstHeld = resolve;
+    });
+    const realHas = ports.blobs.has.bind(ports.blobs);
+    vi.spyOn(ports.blobs, "has").mockImplementation(async (sha) => {
+      if (sha === firstSha) {
+        markFirstHeld();
+        await firstHeld;
+      }
+      return realHas(sha);
+    });
+
+    externalWrite(firstBytes);
+    await firstReachedAwait;
+    externalWrite(secondBytes);
+    releaseFirst();
+    await engine.whenIdle();
+
+    const indexDoc = (engine as unknown as { indexDoc: CrdtDoc | null }).indexDoc;
+    const configMap = indexDoc?.getMap<ConfigEntry>("config");
+    await vi.waitFor(() => {
+      expect(configMap?.get(dataPath)).toBeDefined();
+    });
+    const entry = configMap?.get(dataPath);
+    expect(entry).toMatchObject({ sha256: secondSha, dataVersion: 2 });
+    expect(disk).toEqual(secondBytes);
+    expect((await vault.list()).filter(({ path: p }) => p.startsWith("_conflicts/"))).toEqual([]);
+
+    await engine.stop();
   });
 });
 

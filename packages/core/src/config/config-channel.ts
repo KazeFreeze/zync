@@ -57,6 +57,11 @@ export interface ConfigChannelDeps {
   now(): number;
 }
 
+interface PendingLocalChange {
+  generation: number;
+  attempts: number;
+}
+
 /**
  * Config-zone (themes/snippets) sync coordinator. Detection + IO happen through the ConfigPort
  * (the prose VaultPort is blind to `.obsidian/**`). Local changes -> publish; local deletes ->
@@ -73,9 +78,10 @@ export class ConfigChannel {
   private static readonly MAX_PENDING_UPLOADS = 1_024;
   private static readonly MAX_PENDING_CHANGES = 1_024;
   private static readonly MAX_CHANGE_ATTEMPTS = 4;
-  private readonly pendingLocalChanges = new Map<VaultPath, number>();
+  private readonly pendingLocalChanges = new Map<VaultPath, PendingLocalChange>();
   private readonly failedLocalChanges = new Set<VaultPath>();
   private readonly pendingRemoteChanges: string[][] = [];
+  private localChangeGeneration = 0;
   private changeDrainRunning = false;
   private changeRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private stopped = true;
@@ -213,11 +219,19 @@ export class ConfigChannel {
 
   /** Re-arm exhausted local-change work on a connectivity/heal tick. */
   retryPendingChanges(): void {
-    for (const path of this.pendingLocalChanges.keys()) this.pendingLocalChanges.set(path, 0);
+    for (const [path, pending] of this.pendingLocalChanges) {
+      this.pendingLocalChanges.set(path, { ...pending, attempts: 0 });
+    }
     this.scheduleChangeDrain();
   }
 
+  /** True while a watcher generation still owns current disk bytes that have not been delivered. */
+  hasPendingLocalChange(path: VaultPath): boolean {
+    return this.pendingLocalChanges.has(path);
+  }
+
   private enqueueLocalChange(path: VaultPath): void {
+    const generation = ++this.localChangeGeneration;
     if (!this.pendingLocalChanges.has(path)) {
       if (this.pendingLocalChanges.size >= ConfigChannel.MAX_PENDING_CHANGES) {
         // The queue must remain bounded under watcher storms; make the undelivered newest path
@@ -226,8 +240,10 @@ export class ConfigChannel {
         this.d.onChangeFailure?.([...this.failedLocalChanges]);
         return;
       }
-      this.pendingLocalChanges.set(path, 0);
     }
+    // Replacing the record gives every observation its own retry budget. An older in-flight
+    // attempt can neither delete this generation on success nor charge it for an earlier failure.
+    this.pendingLocalChanges.set(path, { generation, attempts: 0 });
     this.scheduleChangeDrain();
   }
 
@@ -260,17 +276,22 @@ export class ConfigChannel {
         if (keys !== undefined) await this.onRemoteChange(keys);
       }
       let needsRetry = false;
-      for (const [path, attempts] of [...this.pendingLocalChanges]) {
-        if (attempts >= ConfigChannel.MAX_CHANGE_ATTEMPTS) continue;
+      for (const [path, attempted] of [...this.pendingLocalChanges]) {
+        if (attempted.attempts >= ConfigChannel.MAX_CHANGE_ATTEMPTS) continue;
         try {
           await this.onLocalChange(path);
-          this.pendingLocalChanges.delete(path); // delivery, not observation, consumes the change
-          if (this.failedLocalChanges.delete(path)) {
-            this.d.onChangeFailure?.([...this.failedLocalChanges]);
+          const current = this.pendingLocalChanges.get(path);
+          if (current?.generation === attempted.generation) {
+            this.pendingLocalChanges.delete(path); // only delivery of THIS observation consumes it
+            if (this.failedLocalChanges.delete(path)) {
+              this.d.onChangeFailure?.([...this.failedLocalChanges]);
+            }
           }
         } catch {
-          const next = attempts + 1;
-          this.pendingLocalChanges.set(path, next);
+          const current = this.pendingLocalChanges.get(path);
+          if (current?.generation !== attempted.generation) continue;
+          const next = attempted.attempts + 1;
+          this.pendingLocalChanges.set(path, { ...attempted, attempts: next });
           if (next >= ConfigChannel.MAX_CHANGE_ATTEMPTS) {
             if (!this.failedLocalChanges.has(path)) {
               this.failedLocalChanges.add(path);
@@ -288,7 +309,7 @@ export class ConfigChannel {
       if (
         (this.pendingRemoteChanges.length > 0 ||
           [...this.pendingLocalChanges.values()].some(
-            (attempts) => attempts < ConfigChannel.MAX_CHANGE_ATTEMPTS,
+            ({ attempts }) => attempts < ConfigChannel.MAX_CHANGE_ATTEMPTS,
           )) &&
         this.changeRetryTimer === null
       ) {

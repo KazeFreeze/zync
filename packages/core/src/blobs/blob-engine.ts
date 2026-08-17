@@ -218,6 +218,9 @@ export class BlobEngine {
     if (onDisk !== null) {
       const onDiskSha = await (d.identitySha ?? ((_p, b) => sha256OfBytes(b)))(path, onDisk);
       if (onDiskSha === expectedSha) return "already";
+      // Hashing disk awaits. If a newer manifest generation landed meanwhile, invoking divergence
+      // for this stale entry could create a conflict artifact even though no stale write can follow.
+      if (d.manifest.get(path)?.sha256 !== expectedSha) return "superseded";
       if (d.onDivergence !== undefined) {
         const handled = await d.onDivergence(path, { localSha: onDiskSha, expectedSha });
         if (handled) return "conflict"; // config raised a conflict — do NOT overwrite

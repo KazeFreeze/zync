@@ -5823,8 +5823,18 @@ export class SyncEngine {
       const indexDoc = this.indexDoc;
       if (indexDoc === null) return false;
       const configMap = indexDoc.getMap<ConfigEntry>("config");
+      const remoteEntry = configMap.get(path);
+      if (
+        remoteEntry?.deviceId === this.ports.identity.deviceId() &&
+        this.configChannel?.hasPendingLocalChange(path) === true
+      ) {
+        // The map still exposes this device's older publish while the watcher owns newer disk
+        // bytes. Defer it: equal-version arbitration here would back up B and restore A before B
+        // receives its next dataVersion, manufacturing a conflict from two sequential local saves.
+        return true;
+      }
       const localVersion = await this.ports.engineState.getConfigLocalVersion(path);
-      const remoteVersion = configMap.get(path)?.dataVersion ?? 0;
+      const remoteVersion = remoteEntry?.dataVersion ?? 0;
       // Assert local into the config map (re-fire the peer's reconcile) + record base + version. The
       // map write is the ONLY thing that re-triggers config materialize on the losing peer.
       const assertLocal = async (): Promise<boolean> => {
