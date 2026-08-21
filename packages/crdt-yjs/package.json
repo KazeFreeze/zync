@@ -14,7 +14,7 @@
     "@zync/core": "workspace:*",
     "yjs": "^13.6.0",
     "y-protocols": "^1.0.6",
-    "@hocuspocus/provider": "^2.15.0",
+    "@hocuspocus/provider": "^4.2.0",
     "y-codemirror.next": "^0.3.5"
   },
   "devDependencies": {
