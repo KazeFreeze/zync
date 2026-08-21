@@ -23,6 +23,9 @@ describe("pluginSyncPolicy", () => {
     expect(policy.kind).toBe("sync-except");
     if (policy.kind !== "sync-except") throw new Error("expected sync-except policy");
     expect([...policy.volatileKeys]).toEqual(volatileKeys);
+    expect([...policy.deviceLocalKeys]).toEqual(
+      id === "tasknotes" ? ["enableGoogleCalendar", "enabledGoogleCalendars"] : [],
+    );
     expect(policy.reason).toMatch(/^[A-Z].+\.$/);
   });
 

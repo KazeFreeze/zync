@@ -284,6 +284,106 @@ describe("SyncEngine config watcher generations", () => {
   });
 });
 
+describe("SyncEngine device-local plugin data materialization", () => {
+  it("keeps TaskNotes device-local values, lands peer settings, and settles without conflicts", async () => {
+    const dataPath = path(".obsidian/plugins/tasknotes/data.json");
+    const localBytes = bytes(
+      JSON.stringify({
+        fieldMapping: { title: "local-title" },
+        enableGoogleCalendar: false,
+        enabledGoogleCalendars: [],
+      }),
+    );
+    const incomingBytes = bytes(
+      JSON.stringify({
+        fieldMapping: { title: "peer-title" },
+        enableGoogleCalendar: true,
+        enabledGoogleCalendars: ["peer-calendar"],
+      }),
+    );
+    let disk: Uint8Array | null = localBytes;
+    const writes: Uint8Array[] = [];
+    const configPort: ConfigPort = {
+      read: (requested) => Promise.resolve(requested === dataPath ? disk : null),
+      writeAtomic: (writtenPath, data) => {
+        if (writtenPath === dataPath) {
+          disk = data;
+          writes.push(data);
+        }
+        return Promise.resolve();
+      },
+      remove: () => Promise.resolve(),
+      list: () => Promise.resolve([]),
+      onChange: () => () => undefined,
+      rescan: () => Promise.resolve(),
+      close: () => undefined,
+    };
+    const vault = new FakeVault();
+    const ports = portsFor(vault, new InProcessBus().connect());
+    ports.config = configPort;
+    const engine = new SyncEngine(ports, {
+      ...config,
+      blobPolicy: "lazy",
+      configCategories: {
+        themes: false,
+        snippets: false,
+        plugins: false,
+        "plugin-data": true,
+      },
+    });
+    await engine.start();
+
+    const localSha = await sha256OfBytes(localBytes);
+    const incomingSha = await sha256OfBytes(incomingBytes);
+    await ports.engineState.setConfigBase(dataPath, localSha);
+    await ports.blobs.put(incomingSha, incomingBytes);
+    const indexDoc = (engine as unknown as { indexDoc: CrdtDoc | null }).indexDoc;
+    const configMap = indexDoc?.getMap<ConfigEntry>("config");
+    configMap?.set(dataPath, {
+      sha256: incomingSha,
+      size: incomingBytes.length,
+      category: "plugin-data",
+      deviceId: "peer" as DeviceId,
+      dataVersion: 1,
+    });
+    const divergence = engine as unknown as {
+      onConfigDivergence(
+        path: VaultPath,
+        info: { localSha: import("./ports.js").Sha256; expectedSha: import("./ports.js").Sha256 },
+      ): Promise<boolean | "materialized">;
+    };
+
+    expect(
+      await divergence.onConfigDivergence(dataPath, {
+        localSha,
+        expectedSha: incomingSha,
+      }),
+    ).toBe("materialized");
+    expect(JSON.parse(new TextDecoder().decode(disk))).toEqual({
+      enableGoogleCalendar: false,
+      enabledGoogleCalendars: [],
+      fieldMapping: { title: "peer-title" },
+    });
+    const mergedSha = await sha256OfBytes(disk);
+    expect(await ports.engineState.getConfigBase(dataPath)).toBe(incomingSha);
+    expect(await ports.engineState.getConfigNormalizedSha(dataPath)).toBe(mergedSha);
+    expect(engine.inbox.list().filter((entry) => entry.kind === "config-file")).toEqual([]);
+    expect((await vault.list()).filter(({ path: p }) => p.startsWith("_conflicts/"))).toEqual([]);
+
+    // A repeat drift check recognizes R and performs no second write: the path is settled.
+    expect(
+      await divergence.onConfigDivergence(dataPath, {
+        localSha: mergedSha,
+        expectedSha: incomingSha,
+      }),
+    ).toBe("materialized");
+    expect(writes).toHaveLength(1);
+    expect((await vault.list()).filter(({ path: p }) => p.startsWith("_conflicts/"))).toEqual([]);
+
+    await engine.stop();
+  });
+});
+
 describe("SyncEngine lifecycle serialization", () => {
   it("unsubscribes the vault work source before stop drains admitted work", async () => {
     const transport = new InProcessBus().connect();

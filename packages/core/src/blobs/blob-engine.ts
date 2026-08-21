@@ -61,7 +61,7 @@ export interface BlobEngineDeps {
   onDivergence?: (
     path: VaultPath,
     info: { localSha: Sha256; expectedSha: Sha256 },
-  ) => Promise<boolean>;
+  ) => Promise<boolean | "materialized">;
   /** Identity sha for the disk-vs-manifest comparison; canonical for plugin-data. Defaults to raw sha256. */
   identitySha?: (path: VaultPath, bytes: Uint8Array) => Promise<Sha256>;
   /** Called after a blob is successfully materialized (written to disk). The engine uses it to record
@@ -223,6 +223,7 @@ export class BlobEngine {
       if (d.manifest.get(path)?.sha256 !== expectedSha) return "superseded";
       if (d.onDivergence !== undefined) {
         const handled = await d.onDivergence(path, { localSha: onDiskSha, expectedSha });
+        if (handled === "materialized") return "normalized";
         if (handled) return "conflict"; // config raised a conflict — do NOT overwrite
       }
     }

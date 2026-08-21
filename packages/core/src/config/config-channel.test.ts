@@ -635,6 +635,30 @@ describe("ConfigChannel", () => {
       );
     });
 
+    it("plugin-data: applies a TaskNotes device-local toggle on disk without publishing it", async () => {
+      const path = dataPath("tasknotes");
+      const remote = enc(`{"fieldMapping":{"title":"title"},"enableGoogleCalendar":true}`);
+      const local = enc(`{"fieldMapping":{"title":"title"},"enableGoogleCalendar":false}`);
+      const state = normalizationState();
+      const { ch, configMap, blobStore } = makePluginDataChannel(null, local, state);
+      const remoteSha = await sha256OfBytes(canonicalJsonBytes(remote));
+      await blobStore.put(remoteSha, canonicalJsonBytes(remote));
+      configMap.set(path, {
+        sha256: remoteSha,
+        size: remote.length,
+        category: "plugin-data",
+        deviceId: "peer" as never,
+      });
+
+      await ch["onLocalChange"](path);
+
+      expect(configMap.get(path)?.sha256).toBe(remoteSha);
+      expect(state.setConfigNormalizedSha).toHaveBeenCalledWith(
+        path,
+        await sha256OfBytes(canonicalJsonBytes(local)),
+      );
+    });
+
     it("plugin-data: publishes a real TaskNotes setting change with volatile data intact", async () => {
       const path = dataPath("tasknotes");
       const remote = enc(`{"fieldMapping":{"title":"title"},"googleCalendarEventIndex":{"a":1}}`);

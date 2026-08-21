@@ -40,6 +40,7 @@ import {
 } from "./config/config-entry.js";
 import { PluginGate, type PluginMeta } from "./config/plugin-maps.js";
 import { pluginSettingsSyncEnabled } from "./config/plugin-sync-policy.js";
+import { mergeDeviceLocalPluginData } from "./config/device-local-plugin-data.js";
 import { groupKeyOf, groupMembers } from "./config/config-group.js";
 import type { Route } from "./classify/classify.js";
 import { classify, type Caps } from "./classify/classify.js";
@@ -5812,10 +5813,10 @@ export class SyncEngine {
   private async onConfigDivergence(
     path: VaultPath,
     info: { localSha: Sha256; expectedSha: Sha256 },
-  ): Promise<boolean> {
+  ): Promise<boolean | "materialized"> {
     if (configCategoryOf(path) === undefined || this.ports.config === undefined) return false;
+    const configPort = this.ports.config;
     const base = await this.ports.engineState.getConfigBase(path);
-    if (base !== null && info.localSha === base) return false; // clean fast-forward: disk unchanged since last agreed -> adopt remote
     // plugin-data version-aware convergence (LEAN, 2026-07-11, supersedes the sha-only tie-break).
     // Order a diverged (or base-null) plugin-data value against the peer by a per-path numeric edit
     // VERSION (recency) first, canonical-sha only for a true (equal-version) tie. This fixes the
@@ -5828,13 +5829,42 @@ export class SyncEngine {
       const content = configStoredBytes(path, localBytes);
       const localCanonicalSha = await sha256OfBytes(content);
       if (localCanonicalSha === info.expectedSha) return false; // canonical no-op -> accept remote (also stops self-echo of an assert)
+      const materializeMergedRemote = async (): Promise<boolean | "materialized"> => {
+        const id = pluginIdOf(path);
+        if (id === undefined) return false;
+        const incoming = await this.ports.blobs.get(info.expectedSha);
+        if ((await sha256OfBytes(incoming)) !== info.expectedSha) return false;
+        const merged = mergeDeviceLocalPluginData(id, incoming, localBytes);
+        if (merged === null) return false;
+        const indexDoc = this.indexDoc;
+        if (indexDoc === null) return false;
+        const remoteEntry = indexDoc.getMap<ConfigEntry>("config").get(path);
+        // Fetching and hashing await; never let an obsolete generation write after the map moved.
+        if (remoteEntry?.deleted === true || remoteEntry?.sha256 !== info.expectedSha) return true;
+        const mergedSha = await configIdentitySha(path, merged);
+
+        // This is one logical materialization. The echo is recorded for the bytes actually written,
+        // while base continues to name the remote map generation and R names the intentional local
+        // representation. Set R after setConfigBase because the latter deliberately clears stale R.
+        this.echo.recordWrite(path, mergedSha);
+        await configPort.writeAtomic(path, merged);
+        await this.ports.engineState.setConfigBase(path, info.expectedSha);
+        await this.ports.engineState.setConfigNormalizedSha(path, mergedSha);
+        await this.ports.engineState.setConfigLocalVersion(path, remoteEntry.dataVersion ?? 0);
+        this.firePluginDataReload(path);
+        this.armConfigReconcile();
+        return "materialized";
+      };
       const normalizedSha = await this.ports.engineState.getConfigNormalizedSha(path);
       if (localCanonicalSha === normalizedSha) {
         // H3: disk holds a known hook-owned normalization (R). If the map still agrees with `base`, the
         // reconcile drift-scan is just re-checking it — keep disk, write NOTHING (no re-materialize, no
         // hook refire). Otherwise the remote genuinely moved on -> adopt it cleanly (R is stale noise).
-        if (info.expectedSha === base) return true;
-        return false;
+        if (info.expectedSha === base) return "materialized";
+        return await materializeMergedRemote();
+      }
+      if (base !== null && localCanonicalSha === base) {
+        return await materializeMergedRemote();
       }
       const indexDoc = this.indexDoc;
       if (indexDoc === null) return false;
@@ -5890,7 +5920,7 @@ export class SyncEngine {
           console.warn(
             `[zync] plugin-data convergence: backed up local settings ${path} -> ${backup} before adopting remote (equal-version tie)`,
           );
-          return false; // let it materialize the (higher-sha) winner
+          return await materializeMergedRemote();
         }
         return assertLocal(); // LOCAL wins the tie -> keep local; loser peer backs up on its side
       }
@@ -5901,10 +5931,11 @@ export class SyncEngine {
       // up on every normal sequential supersede (harness config-plugin-data proved it). The echo-gate
       // already prevents the hook-rewrite clobber-loop at source, so this backup is unneeded. Genuine
       // simultaneous (equal-version) conflicts are still recovered by the tie-break backup above.
-      if (remoteVersion > localVersion) return false;
+      if (remoteVersion > localVersion) return await materializeMergedRemote();
       // authority: local is a strictly newer edit -> assert it. NO backup (we keep local).
       return assertLocal();
     }
+    if (base !== null && info.localSha === base) return false; // clean fast-forward: disk unchanged since last agreed -> adopt remote
     const localBytes = await this.ports.config.read(path);
     if (localBytes === null) return false; // nothing local to preserve -> let it materialize
     // m4: re-hash the re-read bytes; don't trust the caller's (possibly stale) sha.

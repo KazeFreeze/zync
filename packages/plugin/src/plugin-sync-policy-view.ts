@@ -31,7 +31,11 @@ export function pluginSyncPolicyViewForPolicy(
       ? "Settings sync — you changed the default"
       : "Settings not synced — you changed the default";
   else if (policy.kind === "device-local") summary = "Settings not synced by default";
-  else if (policy.kind === "sync-except") summary = "Settings sync; device-local data is skipped";
+  else if (policy.kind === "sync-except")
+    summary =
+      policy.deviceLocalKeys.size > 0
+        ? "Settings sync; some values stay on this device"
+        : "Settings sync; volatile-only changes are not sent";
   else summary = "Settings sync by default";
 
   return { enabled, overridden, summary, reason: policy.reason };

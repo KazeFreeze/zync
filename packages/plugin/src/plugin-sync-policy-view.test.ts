@@ -11,11 +11,11 @@ describe("pluginSyncPolicyView", () => {
     });
   });
 
-  it("explains sync-except without implying that volatile keys are stripped", () => {
+  it("explains when a plugin has values that stay on this device", () => {
     expect(pluginSyncPolicyView("tasknotes", undefined)).toMatchObject({
       enabled: true,
       overridden: false,
-      summary: "Settings sync; device-local data is skipped",
+      summary: "Settings sync; some values stay on this device",
     });
   });
 
@@ -31,7 +31,7 @@ describe("pluginSyncPolicyView", () => {
     expect(pluginSyncPolicyView("omnisearch", true)).toMatchObject({
       enabled: true,
       overridden: false,
-      summary: "Settings sync; device-local data is skipped",
+      summary: "Settings sync; volatile-only changes are not sent",
     });
   });
 

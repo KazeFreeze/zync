@@ -1,7 +1,12 @@
 export type PluginSyncPolicy =
   | { kind: "sync"; reason: string }
   | { kind: "device-local"; reason: string }
-  | { kind: "sync-except"; volatileKeys: ReadonlySet<string>; reason: string };
+  | {
+      kind: "sync-except";
+      volatileKeys: ReadonlySet<string>;
+      deviceLocalKeys: ReadonlySet<string>;
+      reason: string;
+    };
 
 const DEFAULT_POLICY: PluginSyncPolicy = {
   kind: "sync",
@@ -12,6 +17,7 @@ const POLICIES: Readonly<Record<string, PluginSyncPolicy>> = {
   omnisearch: {
     kind: "sync-except",
     volatileKeys: new Set(["useCache", "DANGER_forceSaveCache", "DANGER_httpHost"]),
+    deviceLocalKeys: new Set(),
     reason: "Stores shared search preferences alongside device-local cache and service settings.",
   },
   tasknotes: {
@@ -22,12 +28,14 @@ const POLICIES: Readonly<Record<string, PluginSyncPolicy>> = {
       "googleCalendarSyncTokens",
       "taskOrgFiltersCollapsed",
     ]),
+    deviceLocalKeys: new Set(["enableGoogleCalendar", "enabledGoogleCalendars"]),
     reason:
       "Stores shared task preferences alongside device-local calendar cache and interface state.",
   },
   "periodic-notes": {
     kind: "sync-except",
     volatileKeys: new Set(["hasMigratedDailyNoteSettings", "hasMigratedWeeklyNoteSettings"]),
+    deviceLocalKeys: new Set(),
     reason: "Stores shared note schedules alongside device-local migration state.",
   },
 };

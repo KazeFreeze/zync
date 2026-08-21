@@ -393,7 +393,7 @@ export class ConfigChannel {
       const policy = id === undefined ? undefined : pluginSyncPolicy(id);
       const noisyKeys =
         policy?.kind === "sync-except"
-          ? new Set([...NOISY_DATA_KEYS, ...policy.volatileKeys])
+          ? new Set([...NOISY_DATA_KEYS, ...policy.volatileKeys, ...policy.deviceLocalKeys])
           : NOISY_DATA_KEYS;
       const decision: EchoDecision = classifyPluginDataChange({
         s: sha256,
