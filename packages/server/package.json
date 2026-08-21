@@ -14,7 +14,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.806.0",
-    "@hocuspocus/extension-logger": "^2.15.0",
+    "@hocuspocus/extension-logger": "^4.2.0",
     "@hocuspocus/provider": "^2.15.3",
     "@hocuspocus/server": "^2.15.0",
     "ws": "^8.21.0",
