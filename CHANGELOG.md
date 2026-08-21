@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.0](https://github.com/KazeFreeze/zync/compare/zync-v0.13.0...zync-v0.14.0) (2026-08-21)
+
+
+### Features
+
+* **config:** let a plugin setting stay device-local ([2fdcde2](https://github.com/KazeFreeze/zync/commit/2fdcde2a89c92f8bfa863222282776c7c16a3718))
+
 ## [0.13.0](https://github.com/KazeFreeze/zync/compare/zync-v0.12.3...zync-v0.13.0) (2026-08-17)
 
 
